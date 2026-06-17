@@ -18,6 +18,7 @@ from ..context_assembler import ContextAssembler
 from ..pipeline.audio_play_queue import AudioPlayQueue
 from ..pipeline.stimulus import Stimulus
 from .splitter import JapaneseSentenceSplitter
+from .style import SPEECH_STYLE, sanitize_for_speech
 
 StreamFn = Callable[[list[dict]], AsyncIterator[str]]  # messages -> 文字列デルタの async iter
 TtsFn = Callable[[str], Awaitable[Optional[bytes]]]  # 文 -> 音声バイト(or None)
@@ -35,7 +36,7 @@ class ResponseOrchestrator:
         self._audio = audio
         self._stream_fn = stream_fn
         self._tts_fn = tts_fn
-        self._ctx = context_assembler or ContextAssembler()
+        self._ctx = context_assembler or ContextAssembler(system_prompt=SPEECH_STYLE)
         self._tts_concurrency = tts_concurrency
         self.last_response = ""  # 自然さの目視・テスト用
 
@@ -64,9 +65,12 @@ class ResponseOrchestrator:
                 self._audio.enqueue(gen, seq, wav)
 
         def _emit(sentence: str) -> None:
-            parts.append(sentence)
+            spoken = sanitize_for_speech(sentence)  # 残留マークダウン除去（コードゲート）
+            if not spoken:
+                return  # 記号だけの行は読み上げない
+            parts.append(spoken)
             seq = self._audio.reserve_seq(gen)  # stream 順に予約（再生は seq 昇順）
-            tasks.append(asyncio.create_task(_tts_and_enqueue(seq, sentence)))
+            tasks.append(asyncio.create_task(_tts_and_enqueue(seq, spoken)))
 
         async for delta in self._stream_fn(messages):
             if self._audio.current_generation() != gen:

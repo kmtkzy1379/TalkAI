@@ -3,6 +3,7 @@ from .input_source import InputSource, TextInputSource
 from .orchestrator import ResponseOrchestrator
 from .player import RealAudioPlayer
 from .splitter import JapaneseSentenceSplitter
+from .style import SPEECH_STYLE, sanitize_for_speech
 from .tts import VoicevoxTTS
 
 __all__ = [
@@ -12,4 +13,6 @@ __all__ = [
     "RealAudioPlayer",
     "InputSource",
     "TextInputSource",
+    "SPEECH_STYLE",
+    "sanitize_for_speech",
 ]
