@@ -1,0 +1,3 @@
+# F0 基盤。機能追加に応じて段階的に増やす。
+litellm
+python-dotenv
