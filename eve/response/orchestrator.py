@@ -1,0 +1,83 @@
+"""ResponseOrchestrator — 応答の背骨（pipeline.Orchestrator Protocol を実装）。
+
+刺激 → ContextAssembler で messages → stream_fn で token stream → SentenceSplitter で文 →
+文ごとに seq 予約 + TTS(並行,上限) → AudioPlayQueue へ enqueue（seq 再整列）。
+PipelineRunner には StubOrchestrator の代わりにこれを注入する。
+
+barge-in（応答側）: stream 中に世代が変わったら生成停止。TTS 完了時にも世代を確認して
+古い世代の音声は enqueue しない（AudioPlayQueue 側でも世代で破棄される＝二重の安全）。
+
+依存性注入（stream_fn / tts_fn）で実 API とテスト用フェイクを切替（Tier-1 は実依存ゼロ）。
+"""
+from __future__ import annotations
+
+import asyncio
+from typing import AsyncIterator, Awaitable, Callable, Optional
+
+from ..context_assembler import ContextAssembler
+from ..pipeline.audio_play_queue import AudioPlayQueue
+from ..pipeline.stimulus import Stimulus
+from .splitter import JapaneseSentenceSplitter
+
+StreamFn = Callable[[list[dict]], AsyncIterator[str]]  # messages -> 文字列デルタの async iter
+TtsFn = Callable[[str], Awaitable[Optional[bytes]]]  # 文 -> 音声バイト(or None)
+
+
+class ResponseOrchestrator:
+    def __init__(
+        self,
+        audio: AudioPlayQueue,
+        stream_fn: StreamFn,
+        tts_fn: TtsFn,
+        context_assembler: Optional[ContextAssembler] = None,
+        tts_concurrency: int = 3,
+    ) -> None:
+        self._audio = audio
+        self._stream_fn = stream_fn
+        self._tts_fn = tts_fn
+        self._ctx = context_assembler or ContextAssembler()
+        self._tts_concurrency = tts_concurrency
+        self.last_response = ""  # 自然さの目視・テスト用
+
+    def _build_messages(self, stimulus: Stimulus) -> list[dict]:
+        ctx = self._ctx.assemble(user_text=str(stimulus.payload))
+        messages: list[dict] = []
+        if ctx.system:
+            messages.append({"role": "system", "content": ctx.system})
+        messages.append({"role": "user", "content": ctx.render()})
+        return messages
+
+    async def handle(self, stimulus: Stimulus) -> None:
+        gen = self._audio.current_generation()
+        messages = self._build_messages(stimulus)
+        splitter = JapaneseSentenceSplitter()
+        sem = asyncio.Semaphore(self._tts_concurrency)
+        tasks: list[asyncio.Task] = []
+        parts: list[str] = []
+
+        async def _tts_and_enqueue(seq: int, sentence: str) -> None:
+            async with sem:
+                if self._audio.current_generation() != gen:
+                    return  # barge-in 済み: TTS を起こさない
+                wav = await self._tts_fn(sentence)
+            if wav is not None and self._audio.current_generation() == gen:
+                self._audio.enqueue(gen, seq, wav)
+
+        def _emit(sentence: str) -> None:
+            parts.append(sentence)
+            seq = self._audio.reserve_seq(gen)  # stream 順に予約（再生は seq 昇順）
+            tasks.append(asyncio.create_task(_tts_and_enqueue(seq, sentence)))
+
+        async for delta in self._stream_fn(messages):
+            if self._audio.current_generation() != gen:
+                break  # barge-in: 生成停止（残りの文は出さない）
+            for sentence in splitter.feed(delta):
+                _emit(sentence)
+        else:
+            # 正常終了時のみ末尾を flush（barge-in 中断時は出さない）
+            for sentence in splitter.flush():
+                _emit(sentence)
+
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.last_response = "".join(parts)

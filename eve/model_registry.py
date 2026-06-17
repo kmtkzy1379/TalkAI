@@ -10,7 +10,7 @@
 from __future__ import annotations
 
 import os
-from typing import Awaitable, Callable, Optional
+from typing import AsyncIterator, Awaitable, Callable, Optional
 
 # role -> (env キー, 既定モデルID)。既定は Claude 停止中の暫定代用値。
 ROLE_ENV: dict[str, tuple[str, str]] = {
@@ -24,6 +24,7 @@ ROLE_ENV: dict[str, tuple[str, str]] = {
 }
 
 CompletionFn = Callable[..., Awaitable[object]]
+StreamFn = Callable[..., AsyncIterator[str]]  # (model=, messages=, **kw) -> 文字列デルタの async iter
 
 
 class ModelRegistry:
@@ -33,9 +34,11 @@ class ModelRegistry:
         self,
         overrides: Optional[dict[str, str]] = None,
         completion_fn: Optional[CompletionFn] = None,
+        stream_fn: Optional[StreamFn] = None,
     ) -> None:
         self._overrides: dict[str, str] = dict(overrides or {})
         self._completion_fn = completion_fn  # None なら litellm.acompletion を遅延使用
+        self._stream_fn = stream_fn  # None なら litellm.acompletion(stream=True) を遅延使用
 
     def resolve(self, role: str) -> str:
         """役割→モデルID。優先順: ランタイム override > .env > 既定。"""
@@ -64,3 +67,21 @@ class ModelRegistry:
 
             fn = acompletion
         return await fn(model=model, messages=messages, **kwargs)
+
+    async def stream(self, role: str, messages: list[dict], **kwargs) -> AsyncIterator[str]:
+        """解決済みモデルへストリーミング要求。文字列デルタを逐次 yield する。"""
+        model = self.resolve(role)
+        if self._stream_fn is not None:
+            async for piece in self._stream_fn(model=model, messages=messages, **kwargs):
+                yield piece
+            return
+        from litellm import acompletion  # 遅延 import（テストは不要）
+
+        resp = await acompletion(model=model, messages=messages, stream=True, **kwargs)
+        async for chunk in resp:
+            try:
+                delta = chunk.choices[0].delta.content
+            except (AttributeError, IndexError, KeyError, TypeError):
+                delta = None
+            if delta:
+                yield delta

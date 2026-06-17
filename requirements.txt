@@ -1,3 +1,8 @@
 # F0 基盤。機能追加に応じて段階的に増やす。
 litellm
 python-dotenv
+# F2 応答背骨。Tier-1 決定論テストには不要（実 API/再生でのみ使用・遅延 import）。
+aiohttp
+soundfile
+numpy
+pyaudio

@@ -45,6 +45,11 @@ class Config:
     VTS_PATH = os.getenv("VTS_PATH", "")
     VOICEVOX_PATH = os.getenv("VOICEVOX_PATH", "")
 
+    # VOICEVOX 合成パラメータ
+    VV_SPEAKER = int(os.getenv("VV_SPEAKER", "1"))
+    VV_SPEED = float(os.getenv("VV_SPEED", "1.0"))
+    VV_PITCH = float(os.getenv("VV_PITCH", "0.0"))
+
     @classmethod
     def validate(cls) -> list[str]:
         """不足している必須設定を列挙。空リストなら起動可（Start ゲートで使う）。"""
