@@ -101,7 +101,7 @@ claw-code 一次調査の結論: tasks は **inert なメタデータ記録**で
 
 ユーザ裁定: deadline は**別概念にせず通常タスクに統合**する。v1 が壊れたのは「時刻をタスクに乗せたこと」ではなく「完了所有権の二転三転 + fact-store/audit との癒着」。その規律さえ守れば人間的な予約タスクは安全に作れる。
 
-- **タスク記録(memo)のフィールド**: `task_id` / `what`(やること=自然言語意図 or 能力呼出) / `when`(予約時刻 `scheduled_at`。null=応答後すぐ、「5分後」=now+300s) / `order`(複数時の順序) / `status` / `result` / `attempts` / `created_at`/`updated_at` / `parent_id`(再計画の親リンク)。
+- **タスク記録(memo)のフィールド**: `task_id` / `what`(やること) / **`success_criterion`(合格条件＝何を満たせば成功か)** / **`verdict_kind: deterministic|judged`(②判定をコードでやるかLLM審判か)** / `when`(予約時刻。null=応答後すぐ、「5分後」=now+300s) / `order` / **`depends_on:[id]` / `input_from:id`(P3 依存・親結果バインド)** / `status` / `result` / `attempts` / **`reflection`(失敗分析＝次の別アプローチの根拠, 親から持ち越す)** / `created_at`/`updated_at` / `parent_id`(再計画の親リンク)。
 - **status**: `Pending → Running → (Done | Failed | Cancelled)`。terminal は**再遷移禁止をコードゲート**で（v1「完了所有権が二転三転」の直接修復）。**遷移は executor のみが所有**、LLM は create/cancel を*要求*するだけで `Done` を主張できない。
 - **人間的ループ(ユーザの記述どおり)**:
   1. **列挙**: やることを順にタスク記録化（memo を書く）。各に任意で `when`。
@@ -111,7 +111,13 @@ claw-code 一次調査の結論: tasks は **inert なメタデータ記録**で
   5. **失敗時の再計画**: 失敗→`Failed`(理由つき、terminal のまま固定)→ LLM が「なぜ失敗/次どうするか」を考え、**新しいフォローアップタスクを作る**(`parent_id` でリンク)。terminal-stays-terminal を守りつつユーザの「タスクを振り直す」を実現（復活させない＝v1 修復）。
 - **永続化**: JSONL(async write queue)。起動時 reconcile で orphan な Running を age out。**dedup/dispatch ガード**で重複タスク→重複刺激を防ぐ。
 - **捨てる**: in-memory only / subprocess 枠組み / task_packet・team・lane-board / DAG プランナ(CLAUDE.md 禁止) / messages インボックス。
-- **実行係(executor)の定義**: **LLM ではなくコード**(async関数)。due タスクを拾い→能力層を呼び→**実際の実行結果で** status を確定→結果を StimulusQueue へ。LLM は道具として呼ぶだけ(タスク化判断/検索クエリ/要約/失敗時の再計画推論/P2のjudged verdict)。= 「制御フロー=コード、中身の判断=LLM」(OpenAI Agents SDK / LangGraph の主流)。
+- **役割を3つに厳密分離（誤解防止・最重要）**: 「完了判定=コード」は不正確。下記3つを混同しない（v1 はこれを混同して破綻）。
+  - **① 状態の記録・所有権** = **常にコード**。status を書くのは executor だけ＝v1「完了が二転三転」の修復。これは"判定"ではなく"権限の一本化"。
+  - **② 完了/失敗の判定（審判）** = **タスク種別で分岐**。機械的(DL成功/ファイル存在/exit0)=コードが照合。曖昧(検索が役立つ結果か/要約十分か)=**LLM審判**が結果を読み `{outcome: ok|weak|fail, reason}` を返す。どちらでも最後に①(コード)が status を書く。
+  - **③ 失敗時に次どうするか（再計画）** = **常にLLM**。問題を分析し別アプローチを立案。コード単独では不可能（ユーザ指摘の通り）。
+  - 汎用性の担保: タスク作成時に**合格条件(success criterion)も一緒に宣言**(CrewAI `expected_output` 相当)。条件がコードで測れれば②=コード、意味的なら②=LLM審判。「コードが万能判定」はしない。
+- **「同じことを繰り返す」(v1失敗)の修復 = Reflexion パターン**: ループの原因は「失敗分析を次試行に渡さなかった」こと。修復: (1)失敗を**理由つきで具体記録**(timeout/結果なし/権限/本文取れず)、(2)LLMに**失敗理由つきで「別アプローチ」を反省立案**させ、(3)その反省を**新タスクに同梱して持ち越す**(コピーではない)、(4)新アプローチが前回と実質同一(同 what)なら**コードが却下**、(5)深さ上限/non-retryable で止める。→ 無限ループせず毎回違う手を打つ。
+- **executor の正体**: コード(async関数)。due タスクを拾い→能力層を呼び→②の審判結果で①status確定→結果を StimulusQueue へ。コードは「記録係＋笛(停止条件・重複却下・非ブロッキング強制)＋機械的判定」、LLMは「曖昧判定＋失敗分析＋別アプローチ立案」。= 「制御フロー=コード、中身の判断=LLM」(OpenAI Agents SDK / LangGraph の主流)。
 - **検証で判明した必須パッチ（GitHub 一次調査 2026-06-17・実例裏取り済）**:
   1. **P1 再計画の暴走停止(最優先)**: `parent` フォローアップは無限増殖しうる(opencode #17169 で $100+ 実損害, AutoGPT 成功率24%)。→ **チェーン深さ上限(~3)** + **non-retryable 分類**(認証なし/URL不正/未対応は再試行せず即 Failed, Temporal式) + **重複検出**(親と同 what/when の子は作らない) + per-goal の **step/token 予算**。上限到達は terminal Failed + 「諦め」を刺激化。
   2. **P2 完了判定の二層化**: タスクに `verdict_kind: deterministic | judged`。`deterministic`(DL/ファイル/screen-op)はコードが status 単独所有(現方針)。`judged`(検索品質・要約十分性など曖昧な成功)は**コードが Running→「結果確定」まで所有し、最終 status だけ LLM の構造化 verdict `{outcome: ok|weak|fail, reason}`** で決める。レイテンシは judged のみに限定し即応経路を汚さない(arxiv 2508.16671)。
