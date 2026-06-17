@@ -21,6 +21,7 @@
 
 ## B. StimulusQueue（応答起動の単一窓口）【確定】
 - **挙動**: 「次に応答LLMを起動する刺激」を1本化。priority(user > callfunction_result > autonomous_speech > vision) + merge(vision/feedback 複数は畳む) + 逐次(CallFunction 複数) で drain。busy 中は保持、barge-in は別経路。
+- **P4 starvation 対策**: surprise/VLM 連発時に低優先(タスク結果報告)が永久に出ない優先度逆転を防ぐため、各itemに enqueue 時刻を持たせ**控えめな bounded aging**(待機が閾値~30s超で優先度を1段昇格)。aging は強すぎると優先度の意味を失うので控えめに。
 - **関わり**: 全入力源の合流点 / ResponseOrchestrator(下流) / SurpriseBus(drain 優先度の補正)。
 
 ---
@@ -110,7 +111,15 @@ claw-code 一次調査の結論: tasks は **inert なメタデータ記録**で
   5. **失敗時の再計画**: 失敗→`Failed`(理由つき、terminal のまま固定)→ LLM が「なぜ失敗/次どうするか」を考え、**新しいフォローアップタスクを作る**(`parent_id` でリンク)。terminal-stays-terminal を守りつつユーザの「タスクを振り直す」を実現（復活させない＝v1 修復）。
 - **永続化**: JSONL(async write queue)。起動時 reconcile で orphan な Running を age out。**dedup/dispatch ガード**で重複タスク→重複刺激を防ぐ。
 - **捨てる**: in-memory only / subprocess 枠組み / task_packet・team・lane-board / DAG プランナ(CLAUDE.md 禁止) / messages インボックス。
-- **関わり**: 応答LLM(要求) / executor(遷移所有・能力呼出) / スケジューラ(時計) / J-0能力層 / StimulusQueue(結果再投入) / JSONL / UI(読取専用リスト) / surprise(stale Running・失敗→自己懐疑)。
+- **実行係(executor)の定義**: **LLM ではなくコード**(async関数)。due タスクを拾い→能力層を呼び→**実際の実行結果で** status を確定→結果を StimulusQueue へ。LLM は道具として呼ぶだけ(タスク化判断/検索クエリ/要約/失敗時の再計画推論/P2のjudged verdict)。= 「制御フロー=コード、中身の判断=LLM」(OpenAI Agents SDK / LangGraph の主流)。
+- **検証で判明した必須パッチ（GitHub 一次調査 2026-06-17・実例裏取り済）**:
+  1. **P1 再計画の暴走停止(最優先)**: `parent` フォローアップは無限増殖しうる(opencode #17169 で $100+ 実損害, AutoGPT 成功率24%)。→ **チェーン深さ上限(~3)** + **non-retryable 分類**(認証なし/URL不正/未対応は再試行せず即 Failed, Temporal式) + **重複検出**(親と同 what/when の子は作らない) + per-goal の **step/token 予算**。上限到達は terminal Failed + 「諦め」を刺激化。
+  2. **P2 完了判定の二層化**: タスクに `verdict_kind: deterministic | judged`。`deterministic`(DL/ファイル/screen-op)はコードが status 単独所有(現方針)。`judged`(検索品質・要約十分性など曖昧な成功)は**コードが Running→「結果確定」まで所有し、最終 status だけ LLM の構造化 verdict `{outcome: ok|weak|fail, reason}`** で決める。レイテンシは judged のみに限定し即応経路を汚さない(arxiv 2508.16671)。
+  3. **P3 依存リンク追加**(DAGプランナではない): `depends_on:[task_id]` + `input_from:task_id`(親結果のバインド)を1フィールド追加し「検索→結果でDL→報告」の動的1段chainを明示化(BabyAGI 自身がフラット→グラフ移行した教訓)。事前グラフ構築はしない。
+  4. **時刻パスの締め**: 期間は **monotonic clock**、`Pending→Running` は **atomic**(次tickの二重発火防止)、沈黙/ダウン中に過ぎた予約は **misfire grace** で1回だけ発火 or 意図的に破棄(古い nudge は捨てる)。`when` は UTC で JSONL 永続。
+  5. **非ブロッキング不変条件**: 即時Call-Function経路から呼べる能力は必ず非ブロッキング(長時間opは即タスク化して即return)。即時/タスクの振り分けは**コードで固定、LLMに判断させない**。
+- **参考実装**: `steveyegge/beads`(JSONL+キャッシュ+依存グラフ+ready検出+git-merge)が Eve のタスクストアに酷似。スキーマ確定前に一読(依存にはしない=Go CLI)。`tenacity`(機械的リトライ), `APScheduler`(任意, 自前1秒ループでも可)。
+- **関わり**: 応答LLM(要求) / executor(コード・遷移所有・能力呼出) / スケジューラ(時計) / J-0能力層 / StimulusQueue(結果再投入) / JSONL / UI(読取専用リスト) / surprise(stale Running・失敗→自己懐疑, P6は操作的に=surprise反転で下流挙動が変わることをTier-3計測)。
 
 ### J-2. search（検索）— Scrapling 調査 + ユーザ裁定 = ddgs + Scrapling 【確定】
 Scrapling 一次調査の結論: Scrapling は「**取得+パース+Markdown抽出**」層で、**検索エンジン機能を持たない**。async/ステルス/robots対応あり(BSD-3)。→ 検索エンジン層が別途必要。**ユーザ裁定: ddgs(無料・キー不要メタ検索) + Scrapling(取得・抽出)** を採用（コスト0・依存最小・ローカル常駐 Eve と相性）。
@@ -184,5 +193,8 @@ Scrapling 一次調査の結論: Scrapling は「**取得+パース+Markdown抽�
 2. **search = ddgs + Scrapling 確定**。要約モデルのサイズ/ローカルvsクラウドは実装時に検証(Qwen14B/Ollama 関心)。
 3. **deadline = 通常 task に統合確定**(`when` + 再計画ループ)。
 
-## 残う確認したい点（次の議論）
-- 上記「人間的タスク・ループ」(J-1)がユーザの想定と一致するか（一致すれば deadline/screen-op の最終確定 → 優先順位へ）。
+## 検証の到達点（2026-06-17）
+- **task モデルは GitHub 一次調査(エージェント基盤横断 + 実装パターン + レッドチーム)で検証済**: 骨格4本柱は業界定石と一致、全面作り直し不要。必須パッチ P1〜P3 + 時刻締め + 非ブロッキング不変条件 + P4 aging を反映済。
+- **実行係=コード / 完了→StimulusQueue 経由** をユーザ質問に回答し確定。
+- **deadline=通常タスク統合 / search=ddgs+Scrapling** 確定。**screen-op=仮決定C拡張**(実装時に task/search と合わせ再議論=ユーザ明言)。
+- 「その他機能はおおむね同意・実装時に詰める」(ユーザ) → **ステップ③(実装優先順位)へ進める状態**。
