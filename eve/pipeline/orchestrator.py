@@ -6,11 +6,14 @@ F1 はスタブで「刺激→文→音声キュー」の配線だけを通す�
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Protocol, runtime_checkable
 
 from .audio_play_queue import AudioPlayQueue
 from .stimulus import Stimulus, StimulusKind
 from .stimulus_queue import StimulusQueue
+
+logger = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -43,10 +46,17 @@ class StubOrchestrator:
 class PipelineRunner:
     """StimulusQueue から1件ずつ drain して orchestrator に渡す単一 consumer。"""
 
-    def __init__(self, queue: StimulusQueue, orchestrator: Orchestrator, audio: AudioPlayQueue) -> None:
+    def __init__(
+        self,
+        queue: StimulusQueue,
+        orchestrator: Orchestrator,
+        audio: AudioPlayQueue,
+        max_consecutive_errors: int = 3,
+    ) -> None:
         self._queue = queue
         self._orch = orchestrator
         self._audio = audio
+        self._max_consecutive_errors = max_consecutive_errors
         self.processed = 0
 
     async def run_once(self) -> Stimulus:
@@ -60,8 +70,18 @@ class PipelineRunner:
         return s
 
     async def run(self) -> None:
+        # A2: 1刺激の失敗で単一 consumer を殺さない。例外は traceback 付きでログし継続。
+        # ただし連続失敗（想定外が頻発）は無理に回さず停止＝循環ブレーカ。
+        consecutive = 0
         while True:
             try:
                 await self.run_once()
+                consecutive = 0
             except asyncio.CancelledError:
                 break
+            except Exception:
+                consecutive += 1
+                logger.exception("刺激処理に失敗（%d 回連続）", consecutive)
+                if consecutive >= self._max_consecutive_errors:
+                    logger.error("連続失敗が上限(%d)に達したため停止", self._max_consecutive_errors)
+                    raise

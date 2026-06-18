@@ -12,6 +12,7 @@ barge-in（応答側）: stream 中に世代が変わったら生成停止。TTS
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import AsyncIterator, Awaitable, Callable, Optional
 
 from ..context_assembler import ContextAssembler
@@ -19,6 +20,8 @@ from ..pipeline.audio_play_queue import AudioPlayQueue
 from ..pipeline.stimulus import Stimulus
 from .splitter import JapaneseSentenceSplitter
 from .style import SPEECH_STYLE, sanitize_for_speech
+
+logger = logging.getLogger(__name__)
 
 StreamFn = Callable[[list[dict]], AsyncIterator[str]]  # messages -> 文字列デルタの async iter
 TtsFn = Callable[[str], Awaitable[Optional[bytes]]]  # 文 -> 音声バイト(or None)
@@ -57,12 +60,22 @@ class ResponseOrchestrator:
         parts: list[str] = []
 
         async def _tts_and_enqueue(seq: int, sentence: str) -> None:
-            async with sem:
-                if self._audio.current_generation() != gen:
-                    return  # barge-in 済み: TTS を起こさない
-                wav = await self._tts_fn(sentence)
-            if wav is not None and self._audio.current_generation() == gen:
-                self._audio.enqueue(gen, seq, wav)
+            # A1: 同一世代である限り、TTS が None/例外でも **必ず seq を埋める**。
+            # 埋めないと AudioPlayQueue._drain_buffer が連続 seq で永久停止
+            # （= head-of-line デッドロック / 1文目失敗でターン丸ごと無音）。
+            wav = None
+            try:
+                async with sem:
+                    if self._audio.current_generation() != gen:
+                        return  # barge-in 済み: 起こさない（古い世代は破棄される）
+                    wav = await self._tts_fn(sentence)
+            except Exception:
+                logger.exception("TTS 失敗（文をスキップして継続）: %.20s", sentence)
+                wav = None
+            if wav is None:
+                logger.warning("TTS が音声を返さず（文をスキップ）: %.20s", sentence)
+            if self._audio.current_generation() == gen:
+                self._audio.enqueue(gen, seq, wav)  # wav=None は番兵（再生時スキップ）
 
         def _emit(sentence: str) -> None:
             spoken = sanitize_for_speech(sentence)  # 残留マークダウン除去（コードゲート）
@@ -72,15 +85,19 @@ class ResponseOrchestrator:
             seq = self._audio.reserve_seq(gen)  # stream 順に予約（再生は seq 昇順）
             tasks.append(asyncio.create_task(_tts_and_enqueue(seq, spoken)))
 
-        async for delta in self._stream_fn(messages):
-            if self._audio.current_generation() != gen:
-                break  # barge-in: 生成停止（残りの文は出さない）
-            for sentence in splitter.feed(delta):
-                _emit(sentence)
-        else:
-            # 正常終了時のみ末尾を flush（barge-in 中断時は出さない）
-            for sentence in splitter.flush():
-                _emit(sentence)
+        try:
+            async for delta in self._stream_fn(messages):
+                if self._audio.current_generation() != gen:
+                    break  # barge-in: 生成停止（残りの文は出さない）
+                for sentence in splitter.feed(delta):
+                    _emit(sentence)
+            else:
+                # 正常終了時のみ末尾を flush（barge-in/エラー中断時は出さない）
+                for sentence in splitter.flush():
+                    _emit(sentence)
+        except Exception:
+            # A3: LLM/stream の一時エラーは起こりやすい → ログして途中までで打ち切り、継続。
+            logger.exception("応答生成中にエラー（途中までで打ち切り）")
 
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)

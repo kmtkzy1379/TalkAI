@@ -5,9 +5,12 @@ audio_query → synthesis の2段。ClientSession を使い回す。aiohttp は�
 """
 from __future__ import annotations
 
+import logging
 from typing import Optional
 
 from ..config import Config
+
+logger = logging.getLogger(__name__)
 
 
 class VoicevoxTTS:
@@ -50,8 +53,8 @@ class VoicevoxTTS:
                 if resp.status != 200:
                     return None
                 return await resp.read()
-        except Exception as e:  # 落とさない（CLAUDE.md）
-            print(f"TTS Error: {e}")
+        except Exception as e:  # 起こりやすい一時失敗 → ログして None（呼び出し側が文をスキップ）
+            logger.warning("TTS 失敗（None を返す）: %s", e)
             return None
 
     async def close(self) -> None:

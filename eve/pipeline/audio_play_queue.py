@@ -18,8 +18,11 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -104,8 +107,8 @@ class AudioPlayQueue:
                     self._queue.task_done()
             except asyncio.CancelledError:
                 break
-            except Exception as e:  # 落とさない（CLAUDE.md）
-                print(f"AudioPlayQueue Error: {e}")
+            except Exception:  # 再生1件の失敗で worker を止めない（起こりやすい・軽微）
+                logger.exception("AudioPlayQueue 再生エラー（この項目を飛ばして継続）")
 
     async def _drain_buffer(self) -> None:
         # seq が現在の next_seq から contiguous な間だけ順に再生する
@@ -115,6 +118,8 @@ class AudioPlayQueue:
             await self._play(it.audio)
 
     async def _play(self, audio: Any) -> None:
+        if audio is None:
+            return  # A1: スキップ文の番兵（TTS 失敗等）。seq 連続性のため枠だけ消費
         if self._play_fn is None:
             raise NotImplementedError("実再生は F2 で実装。F1 は play_fn を注入する。")
         await self._play_fn(audio)
