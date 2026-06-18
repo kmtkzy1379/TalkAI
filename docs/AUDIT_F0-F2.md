@@ -18,7 +18,7 @@
 
 | # | 問題 | 確認 | 対応（F2.5） |
 |---|---|---|---|
-| **B0** | **STT 幻聴＝v1 の本丸**。Whisper 系が無音/クリック音を「ご視聴ありがとうございました」等の汎用句に誤認（字幕学習由来） | ユーザ実機証言 | **入口で潰す**: ①VADで「人が喋った区間」だけ STT に渡す（最重要）②`no_speech_prob`/`avg_logprob` で足切り ③幻聴句ブラックリスト ④最小長/エネルギー閾値。**STT精度を F2.5 最優先**、partial投機は精度を下げうるので当面やらない |
+| **B0** | **STT 幻聴＝v1 の本丸**。Whisper 系が無音/クリック音を「ご視聴ありがとうございました」等の**危険な定型句**に誤認（字幕学習由来）。**実測(2026-06-18)**: 無音→ Groq whisper-large-v3 と OpenAI whisper-1 は確実に「ご視聴ありがとうございました」、**gpt-4o-transcribe は出さない（`Great.`/`567`/`.` 等のゴミ）**。＝**どのエンジンも非音声で完全には黙らないが、gpt-4o-transcribe は危険な定型句を出さず捨てやすい** | 🟠実測+本人 | **2点に簡素化**（Whisper固有の松葉杖=no_speech_prob閾値/幻聴ブラックリストは廃止）: ①**エンジンを gpt-4o-transcribe に交換**（OPENAIキー保有・定型句を出さない・`prompt`で固有語注入）②**silero-VAD を endpointing＋"非音声をSTTに渡さない源ゲート"に**（"ユーザー声判別"ではなく"音声活動の有無"の簡単な仕事）＋最小長0.3s。partial投機はやらない（精度優先）。実機A/Bで最終確認 |
 | ~~**B1**~~ | ~~自己エコー(AEC)~~ → **ユーザ裁定(2026-06-18): ソフトAECは作らない**。**イヤホン前提（AIの声がmicに入らない）＋常時リッスン**（mic を塞がない＝発話中もユーザーを聞く）。ソフトで声を聞き分けるAECは複雑/危険で不採用、イヤホンが古典的だがきれい・安全 | ユーザ裁定 | barge-in は「ユーザーが本当に話し出したら Eve が今の発話を止め譲る」だけ実装。**割り込み位置のメタ情報はLLMに注入しない**（毎回割り込みの話をする副作用回避）。将来スピーカ運用に戻すならソフトAECを再検討 |
 | **B2** | **StimulusQueue が別スレッドから put 不可**（asyncio.Condition束縛）。mic/VAD は別スレッド。`AudioPlayQueue` は `set_loop`/cross-thread 済だが Queue は非対称 | 🔴2+本人 | `set_loop()` + `run_coroutine_threadsafe(queue.put(s), loop)` 経路を追加（MicSttInputSource 側で吸収） |
 | **B3** | **mid-sentence barge-in 不可**（今鳴ってる文は鳴り切る）。`player.py` が世代を見ない（docstring で F2.5 明記済の意図的スコープ） | 🔴2+本人 | `play_fn` のチャンクループに `if gen != current: break` を1行（停止粒度~数十ms）。`_play` に generation を渡す配線 |
@@ -53,9 +53,9 @@
 - **直近ターン数 5 vs 100 の食い違いは矛盾でない**: **ConversationCache は ~100件保持、応答LLM へは直近5ターンを供給**。COMPONENT_LOGIC に両方を明記。
 - **T2/T4/T6 と SurpriseBus は未実装**であることを docs に明示（「F2 緑＝中核原理 enforced」ではない）。
 - PIPELINE_DESIGN §3 に cold-start 行、§10 に warmup ステップ（B4）。§6 ROLE_DEFAULTS に `summarize` 追記（実装先行分）。
-- **F2.5 プランに織り込む**: A1/A2/A3（堅牢化・最小・済）, **B0 STT幻聴ガード(最優先)**, B2 thread-safe put, B3 mid-sentence（=割り込み時にEveが譲る）, B4 warmup, C1 文脈配線, D3 E2E テスト。**B1 ソフトAECは不採用（イヤホン前提＋常時リッスン）**。STT は「**VAD区間→final→刺激（投機なし・幻聴ガード付き）**」で精度優先、partial 投機はやらない。
+- **F2.5 プランに織り込む**: A1/A2/A3（堅牢化・最小・済）, **B0 STT交換(gpt-4o-transcribe)＋VAD源ゲート(最優先)**, B2 thread-safe put, B3 mid-sentence（=割り込み時にEveが譲る）, B4 warmup, C1 文脈配線, D3 E2E テスト。**B1 ソフトAECは不採用（イヤホン前提＋常時リッスン）**。STT は「**silero-VAD区間→gpt-4o-transcribe→final→刺激（投機なし）**」で精度優先、partial 投機はやらない。STTは `Stt` 抽象で差し替え可能に（実機A/Bで最終モデル確定）。
 
 ## F2.5 着手前に直すと最も安い Top3（構造）
 1. **C1**: ResponseOrchestrator の kind 分岐 + 文脈源の注入（F2.5/F3 がここに集中する前に開く）。
 2. **A1 + A2 + A3**: 応答経路の「黙る/固まる」3欠陥を最小修正（ロジック修正 + 2つの load-bearing try/except のみ。防御過多にしない）。
-3. **B0 STT幻聴ガード（VADゲート中心）**: v1 の最大の不満点。mic を繋ぐ前にこれを設計の中心に。ソフトAECは不採用（イヤホンで物理解決）。
+3. **B0 STT交換(gpt-4o-transcribe)＋VAD源ゲート**: v1 の最大の不満点。実測でエンジン交換だけでは非音声ゴミが残るが gpt-4o-transcribe は危険な定型句を出さない→VADで源を断てば実用十分。ソフトAECは不採用（イヤホンで物理解決）。
