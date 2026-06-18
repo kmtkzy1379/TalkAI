@@ -1,5 +1,5 @@
 """Eve v2 応答背骨（stream → 文分割 → TTS → 再生）。"""
-from .input_source import InputSource, TextInputSource
+from .input_source import InputSource, MicSttInputSource, TextInputSource
 from .orchestrator import ResponseOrchestrator
 from .player import RealAudioPlayer
 from .splitter import JapaneseSentenceSplitter
@@ -13,6 +13,7 @@ __all__ = [
     "RealAudioPlayer",
     "InputSource",
     "TextInputSource",
+    "MicSttInputSource",
     "SPEECH_STYLE",
     "sanitize_for_speech",
 ]
