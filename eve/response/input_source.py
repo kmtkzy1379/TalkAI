@@ -69,6 +69,7 @@ class MicSttInputSource(InputSource):
                 logger.exception("STT 失敗（この発話を捨てて継続）")
                 continue
             if text:
+                logger.info("🧑 %s", text)
                 await self._queue.put(Stimulus(StimulusKind.USER_UTTERANCE, payload=text))
 
     def stop(self) -> None:

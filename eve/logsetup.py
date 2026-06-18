@@ -18,3 +18,6 @@ def configure(level: int = logging.INFO) -> None:
         level=level,
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
+    # 外部ライブラリの INFO ノイズを抑制（会話ログ 🧑/🤖/⏸ を見やすくする）
+    for noisy in ("httpx", "LiteLLM", "litellm", "openai", "urllib3"):
+        logging.getLogger(noisy).setLevel(logging.WARNING)

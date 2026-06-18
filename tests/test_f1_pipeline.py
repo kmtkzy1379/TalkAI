@@ -137,6 +137,30 @@ async def t3_generation_drop() -> bool:
     return played == ["old0", "new0", "new1"]  # old2 と stale は流れない
 
 
+async def t3_midsentence_stop() -> bool:
+    """B3: 再生中に世代が変わったら文の途中でも停止する（should_stop）。"""
+    chunks: list = []
+    started = asyncio.Event()
+
+    async def play_fn(audio, should_stop):  # 2引数=should_stop を受ける
+        for i in range(100):  # 長い文を模擬（100チャンク）
+            if should_stop():
+                break
+            chunks.append(i)
+            if i == 0:
+                started.set()
+            await asyncio.sleep(0.001)
+
+    audio = AudioPlayQueue(play_fn=play_fn)
+    worker = asyncio.create_task(audio.play_worker())
+    audio.enqueue(audio.current_generation(), 0, "S")
+    await started.wait()  # 再生中
+    audio.bump_generation()  # barge-in（世代を進める）
+    await asyncio.sleep(0.05)
+    worker.cancel()
+    return 0 < len(chunks) < 100  # 全チャンクは鳴らない＝途中で停止した
+
+
 # ---------- T7 E2E パイプライン破綻なし ----------
 async def t7_e2e() -> dict:
     played, play_fn = _recorder()
@@ -188,6 +212,7 @@ async def main() -> None:
 
     check("T3 seq 順再生", await t3_seq_order())
     check("T3 世代で古い音声を破棄", await t3_generation_drop())
+    check("T3 barge-inで文の途中でも停止", await t3_midsentence_stop())
 
     r = await t7_e2e()
     check("T7 例外なし", r["raised"] is None)

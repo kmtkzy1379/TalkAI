@@ -33,9 +33,21 @@ class _Item:
 
 
 class AudioPlayQueue:
-    def __init__(self, play_fn: Optional[Callable[[Any], Awaitable[None]]] = None) -> None:
+    def __init__(self, play_fn: Optional[Callable[..., Awaitable[None]]] = None) -> None:
         # play_fn 注入: F1 はフェイク（順序記録）、F2 で実 TTS 再生に差替（将来互換）。
         self._play_fn = play_fn
+        # play_fn が should_stop（mid-sentence barge-in 用）を受け取れるか自動判定
+        self._play_takes_stop = False
+        if play_fn is not None:
+            try:
+                import inspect
+
+                params = inspect.signature(play_fn).parameters.values()
+                self._play_takes_stop = len(params) >= 2 or any(
+                    p.kind == p.VAR_POSITIONAL for p in params
+                )
+            except (TypeError, ValueError):
+                self._play_takes_stop = False
         self._queue: "asyncio.Queue[_Item]" = asyncio.Queue()
         self._generation = 0
         self._next_seq = 0  # 現 generation で次に再生すべき seq
@@ -115,14 +127,18 @@ class AudioPlayQueue:
         while self._next_seq in self._buffer:
             it = self._buffer.pop(self._next_seq)
             self._next_seq += 1
-            await self._play(it.audio)
+            await self._play(it.audio, it.generation)
 
-    async def _play(self, audio: Any) -> None:
+    async def _play(self, audio: Any, generation: int) -> None:
         if audio is None:
             return  # A1: スキップ文の番兵（TTS 失敗等）。seq 連続性のため枠だけ消費
         if self._play_fn is None:
             raise NotImplementedError("実再生は F2 で実装。F1 は play_fn を注入する。")
-        await self._play_fn(audio)
+        if self._play_takes_stop:
+            # B3: 再生中に世代が変わったら（barge-in）文の途中でも止める
+            await self._play_fn(audio, lambda: generation != self._generation)
+        else:
+            await self._play_fn(audio)
 
     async def join(self) -> None:
         """投入済みの全項目が処理されるまで待つ（テスト用）。"""

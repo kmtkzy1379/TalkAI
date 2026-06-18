@@ -45,6 +45,7 @@ class VoiceLoop:
 
     def _barge_in(self) -> None:
         """発話開始の瞬間: 音声停止＋進行中応答キャンセル（Eve が即譲る）。"""
+        logger.info("⏸ 発話検知（割り込み）")
         self.audio.interrupt()
         self.runner.interrupt()
 

@@ -102,6 +102,8 @@ class ResponseOrchestrator:
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             self.last_response = "".join(parts)
+            if self.last_response:
+                logger.info("🤖 %s", self.last_response)
         except asyncio.CancelledError:
             # barge-in でキャンセルされた: 進行中の TTS タスクも片付ける（孤児化防止）
             for t in tasks:

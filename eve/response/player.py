@@ -25,7 +25,7 @@ class RealAudioPlayer:
             self._pa = pyaudio.PyAudio()
         return self._pa
 
-    async def play_fn(self, audio: Optional[bytes]) -> None:
+    async def play_fn(self, audio: Optional[bytes], should_stop=None) -> None:
         if not audio:
             return
         import pyaudio
@@ -41,6 +41,8 @@ class RealAudioPlayer:
         chunk = 1024
         try:
             for i in range(0, len(data), chunk):
+                if should_stop is not None and should_stop():
+                    break  # B3: barge-in → 文の途中でも即停止（チャンク粒度で数十ms以内）
                 buf = data[i : i + chunk].tobytes()
                 await loop.run_in_executor(None, stream.write, buf)
         finally:
