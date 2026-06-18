@@ -12,7 +12,6 @@ import asyncio
 import logging
 from abc import ABC, abstractmethod
 
-from ..pipeline.audio_play_queue import AudioPlayQueue
 from ..pipeline.stimulus import Stimulus, StimulusKind
 from ..pipeline.stimulus_queue import StimulusQueue
 from ..stt import Stt
@@ -39,12 +38,16 @@ class TextInputSource(InputSource):
 
 
 class MicSttInputSource(InputSource):
-    """mic → VAD → STT → 刺激。発話開始で AudioPlayQueue.interrupt()（barge-in＝Eveが譲る）。"""
+    """mic → VAD → STT → 刺激。発話開始で on_speech_start（barge-in＝Eveが即譲る）を呼ぶ。
 
-    def __init__(self, queue: StimulusQueue, stt: Stt, audio: AudioPlayQueue) -> None:
+    on_speech_start には「音声停止＋進行中応答キャンセル」をまとめた barge-in を渡す
+    （VoiceLoop が audio.interrupt + runner.interrupt を束ねて渡す）。
+    """
+
+    def __init__(self, queue: StimulusQueue, stt: Stt, on_speech_start=None) -> None:
         super().__init__(queue)
         self._stt = stt
-        self._audio = audio
+        self._on_speech_start = on_speech_start
         self._ai = None
         self._task = None
 
@@ -52,7 +55,7 @@ class MicSttInputSource(InputSource):
         from ..audio_input import AudioInput  # torch/pyaudio を要する→遅延 import
 
         # 発話開始の瞬間に barge-in（STT 完了を待たず即停止＝自然な割り込み）
-        self._ai = AudioInput(callback_on_speech_start=self._audio.interrupt)
+        self._ai = AudioInput(callback_on_speech_start=self._on_speech_start)
         self._ai.start()
         self._task = asyncio.create_task(self._consume())
 

@@ -40,8 +40,13 @@ class VoiceLoop:
 
         self.orchestrator = ResponseOrchestrator(self.audio, stream_fn, self.tts.generate, ContextAssembler())
         self.runner = PipelineRunner(self.queue, self.orchestrator, self.audio)
-        self.input = MicSttInputSource(self.queue, self.stt, self.audio)
+        self.input = MicSttInputSource(self.queue, self.stt, on_speech_start=self._barge_in)
         self._tasks: list[asyncio.Task] = []
+
+    def _barge_in(self) -> None:
+        """発話開始の瞬間: 音声停止＋進行中応答キャンセル（Eve が即譲る）。"""
+        self.audio.interrupt()
+        self.runner.interrupt()
 
     async def warmup(self) -> None:
         """STT/LLM/TTS を1回空打ちして cold-start（初回の数秒遅延）を消す。"""

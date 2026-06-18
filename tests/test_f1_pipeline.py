@@ -147,8 +147,9 @@ async def t7_e2e() -> dict:
     worker = asyncio.create_task(audio.play_worker())
 
     raised = None
+    qsize_after_puts = 0
     try:
-        # 台本: USER → VISION×3(merge) → CALLFUNCTION×2(dedup) → USER(barge-in)
+        # 台本: USER → VISION×3(merge) → CALLFUNCTION×2(dedup) → USER（coalesce 対象）
         await q.put(Stimulus(StimulusKind.USER_UTTERANCE, "u1"))
         await q.put(Stimulus(StimulusKind.VISION_UPDATE, "v1", merge_key="vision"))
         await q.put(Stimulus(StimulusKind.VISION_UPDATE, "v2", merge_key="vision"))
@@ -156,23 +157,25 @@ async def t7_e2e() -> dict:
         await q.put(Stimulus(StimulusKind.CALLFUNCTION_RESULT, "r1", dedup_key="r1"))
         await q.put(Stimulus(StimulusKind.CALLFUNCTION_RESULT, "r1", dedup_key="r1"))
         await q.put(Stimulus(StimulusKind.USER_UTTERANCE, "u2"))
-        qsize_after_puts = q.qsize()  # merge/dedup 後の件数
-        for _ in range(qsize_after_puts):
+        qsize_after_puts = q.qsize()  # merge/dedup 後の件数（USER2 はまだ別々）
+        while q.qsize() > 0:  # coalesce で USER は1回に畳まれるので件数固定でなく空まで
             await runner.run_once()
-            await audio.join()  # 各刺激の音声を流し切ってから次へ（決定論化）
+            await audio.join()
     except Exception as e:  # 破綻=例外を捕捉して報告
         raised = repr(e)
     finally:
         worker.cancel()
 
     kinds = [s.kind for s in orch.handled]
+    user_payloads = [str(s.payload) for s in orch.handled if s.kind == StimulusKind.USER_UTTERANCE]
     return {
         "raised": raised,
         "qsize_after_puts": qsize_after_puts,
         "qsize_end": q.qsize(),
         "vision_count": kinds.count(StimulusKind.VISION_UPDATE),
         "cf_count": kinds.count(StimulusKind.CALLFUNCTION_RESULT),
-        "generation": audio.current_generation(),
+        "user_count": kinds.count(StimulusKind.USER_UTTERANCE),
+        "user_merged": user_payloads[0] if user_payloads else "",
         "played_count": len(played),
     }
 
@@ -190,10 +193,11 @@ async def main() -> None:
     check("T7 例外なし", r["raised"] is None)
     check("T7 vision は1件に畳まれる", r["vision_count"] == 1)
     check("T7 callfunction は dedup される", r["cf_count"] == 1)
+    check("T7 USER は coalesce で1件に", r["user_count"] == 1)
+    check("T7 USER は u1+u2 を結合", "u1" in r["user_merged"] and "u2" in r["user_merged"])
     check("T7 put 後の件数 = 4(USER2+VISION1+CF1)", r["qsize_after_puts"] == 4)
     check("T7 最終キューは空", r["qsize_end"] == 0)
-    check("T7 barge-in で世代2まで進む", r["generation"] == 2)
-    check("T7 全文が再生される(4)", r["played_count"] == 4)
+    check("T7 再生は3件(USER結合+CF+VISION)", r["played_count"] == 3)
 
 
 asyncio.run(main())

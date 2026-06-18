@@ -17,7 +17,7 @@ import math
 from typing import Callable
 
 from .. import clock
-from .stimulus import Stimulus
+from .stimulus import Stimulus, StimulusKind
 
 
 class StimulusQueue:
@@ -78,3 +78,12 @@ class StimulusQueue:
     def snapshot(self) -> list[Stimulus]:
         """テスト/デバッグ用。待機中の刺激（順序保証なし）。"""
         return [s for _, s in self._items]
+
+    def drain_user_texts(self) -> list[str]:
+        """待機中の USER_UTTERANCE を全て取り出しテキストを返す（coalesce 用・同期）。
+
+        単一 consumer がドレイン直後に呼ぶ前提（await を挟まないので atomic）。
+        """
+        texts = [str(s.payload) for _, s in self._items if s.kind == StimulusKind.USER_UTTERANCE]
+        self._items = [(e, s) for (e, s) in self._items if s.kind != StimulusKind.USER_UTTERANCE]
+        return texts

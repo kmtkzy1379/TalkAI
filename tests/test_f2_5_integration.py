@@ -109,9 +109,83 @@ async def t_two_turns() -> bool:
     return runner.processed == 2 and played == ["[おう。]", "[おう。]"]
 
 
+async def t_coalesce() -> bool:
+    """入力前に溜まった USER 発話は1つに結合され、応答は1回（pileup防止）。"""
+    played: list = []
+
+    async def play_fn(a):
+        played.append(a)
+
+    audio = AudioPlayQueue(play_fn=play_fn)
+    q = StimulusQueue()
+    seen: list = []
+
+    async def stream_fn(messages):
+        seen.append(messages[-1]["content"])  # user 内容
+        yield "了解。"
+
+    async def tts_fn(s):
+        return f"[{s}]"
+
+    orch = ResponseOrchestrator(audio, stream_fn, tts_fn)
+    runner = PipelineRunner(q, orch, audio)
+    # 2発話を drain 前に両方 queue へ入れてから runner を起動（確実に coalesce 対象に）
+    await q.put(Stimulus(StimulusKind.USER_UTTERANCE, "今日は"))
+    await q.put(Stimulus(StimulusKind.USER_UTTERANCE, "いい天気"))
+    worker = asyncio.create_task(audio.play_worker())
+    runner_task = asyncio.create_task(runner.run())
+
+    await _drain_until(lambda: runner.processed >= 1)
+    await audio.join()
+    runner_task.cancel()
+    worker.cancel()
+
+    merged_ok = any(("今日は" in m and "いい天気" in m) for m in seen)
+    return runner.processed == 1 and merged_ok and played == ["[了解。]"]
+
+
+async def t_barge_in_cancel() -> bool:
+    """barge-in（interrupt）で進行中の応答生成が即キャンセルされる（続きが出ない）。"""
+    played: list = []
+
+    async def play_fn(a):
+        played.append(a)
+
+    audio = AudioPlayQueue(play_fn=play_fn)
+    q = StimulusQueue()
+    started = asyncio.Event()
+
+    async def stream_fn(messages):
+        started.set()
+        yield "えーと。"
+        await asyncio.sleep(5)  # 長い生成 → barge-in でキャンセルされるべき
+        yield "つづき。"
+
+    async def tts_fn(s):
+        return f"[{s}]"
+
+    orch = ResponseOrchestrator(audio, stream_fn, tts_fn)
+    runner = PipelineRunner(q, orch, audio)
+    worker = asyncio.create_task(audio.play_worker())
+    runner_task = asyncio.create_task(runner.run())
+
+    await q.put(Stimulus(StimulusKind.USER_UTTERANCE, "ねえ"))
+    await started.wait()
+    await asyncio.sleep(0)
+    runner.interrupt()  # barge-in
+    await _drain_until(lambda: runner.processed >= 1)
+    await asyncio.sleep(0)
+    runner_task.cancel()
+    worker.cancel()
+
+    return runner.processed == 1 and "[つづき。]" not in played
+
+
 async def main() -> None:
     check("フルループ: USER→runner→実orchestrator→順次再生", await t_full_loop())
     check("連続2ターンを順に処理", await t_two_turns())
+    check("coalesce: 溜まったUSERを1応答に結合", await t_coalesce())
+    check("barge-in: interrupt で進行中応答を即キャンセル", await t_barge_in_cancel())
 
 
 asyncio.run(main())

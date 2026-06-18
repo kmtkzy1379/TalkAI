@@ -86,19 +86,25 @@ class ResponseOrchestrator:
             tasks.append(asyncio.create_task(_tts_and_enqueue(seq, spoken)))
 
         try:
-            async for delta in self._stream_fn(messages):
-                if self._audio.current_generation() != gen:
-                    break  # barge-in: 生成停止（残りの文は出さない）
-                for sentence in splitter.feed(delta):
-                    _emit(sentence)
-            else:
-                # 正常終了時のみ末尾を flush（barge-in/エラー中断時は出さない）
-                for sentence in splitter.flush():
-                    _emit(sentence)
-        except Exception:
-            # A3: LLM/stream の一時エラーは起こりやすい → ログして途中までで打ち切り、継続。
-            logger.exception("応答生成中にエラー（途中までで打ち切り）")
-
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self.last_response = "".join(parts)
+            try:
+                async for delta in self._stream_fn(messages):
+                    if self._audio.current_generation() != gen:
+                        break  # barge-in(世代変化): 生成停止（残りの文は出さない）
+                    for sentence in splitter.feed(delta):
+                        _emit(sentence)
+                else:
+                    # 正常終了時のみ末尾を flush（barge-in/エラー中断時は出さない）
+                    for sentence in splitter.flush():
+                        _emit(sentence)
+            except Exception:
+                # A3: LLM/stream の一時エラーは起こりうる → ログして途中までで打ち切り、継続。
+                logger.exception("応答生成中にエラー（途中までで打ち切り）")
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            self.last_response = "".join(parts)
+        except asyncio.CancelledError:
+            # barge-in でキャンセルされた: 進行中の TTS タスクも片付ける（孤児化防止）
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            raise

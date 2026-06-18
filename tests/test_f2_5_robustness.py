@@ -126,9 +126,15 @@ async def t_a2_recovers() -> bool:
     orch = _FlakyOrch(fail_first=1)  # 1回失敗→以降成功
     runner = PipelineRunner(q, orch, audio)
     task = asyncio.create_task(runner.run())
+    # 1件目が drain されてから2件目を入れる（USER coalesce を避けて別ターンにする）
     await q.put(Stimulus(StimulusKind.USER_UTTERANCE, "a"))
+    for _ in range(200):
+        await asyncio.sleep(0)
+        if orch.calls >= 1:
+            break
+    await asyncio.sleep(0.02)
     await q.put(Stimulus(StimulusKind.USER_UTTERANCE, "b"))
-    for _ in range(50):
+    for _ in range(200):
         await asyncio.sleep(0)
         if orch.handled >= 1:
             break
@@ -143,8 +149,10 @@ async def t_a2_breaker_stops() -> bool:
     audio = AudioPlayQueue(play_fn=play_fn)
     orch = _FlakyOrch(fail_first=999)  # 常に失敗
     runner = PipelineRunner(q, orch, audio, max_consecutive_errors=3)
-    for i in range(5):
-        await q.put(Stimulus(StimulusKind.USER_UTTERANCE, str(i)))
+    # coalesce されない別種3つ（USERは1つだけ）で3連続失敗させる
+    await q.put(Stimulus(StimulusKind.USER_UTTERANCE, "x"))
+    await q.put(Stimulus(StimulusKind.VISION_UPDATE, "y"))
+    await q.put(Stimulus(StimulusKind.CALLFUNCTION_RESULT, "z"))
     stopped = False
     try:
         await asyncio.wait_for(runner.run(), timeout=1.0)

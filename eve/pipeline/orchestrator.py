@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Protocol, runtime_checkable
+from typing import Optional, Protocol, runtime_checkable
 
 from .audio_play_queue import AudioPlayQueue
 from .stimulus import Stimulus, StimulusKind
@@ -58,26 +58,46 @@ class PipelineRunner:
         self._audio = audio
         self._max_consecutive_errors = max_consecutive_errors
         self.processed = 0
+        self._active: Optional[asyncio.Task] = None
+
+    async def _next(self) -> Stimulus:
+        s = await self._queue.get()
+        if s.kind == StimulusKind.USER_UTTERANCE:
+            # coalesce: 入力前に溜まったユーザ発話を1つに繋げる（pileup防止・「繋げて入れる」）
+            extra = self._queue.drain_user_texts()
+            if extra:
+                merged = " ".join([str(s.payload), *extra])
+                s = Stimulus(StimulusKind.USER_UTTERANCE, payload=merged)
+        return s
 
     async def run_once(self) -> Stimulus:
-        s = await self._queue.get()
-        # barge-in 配線: ユーザ発話は言いかけを止める（世代を進める）。
-        # 実トリガ（発話中検知）は F2/F4 で接続。ここは機構の発火点。
-        if s.kind == StimulusKind.USER_UTTERANCE:
-            self._audio.bump_generation()
-        await self._orch.handle(s)
+        s = await self._next()
+        # handle はキャンセル可能なタスクで走らせる（barge-in で中断するため）
+        self._active = asyncio.create_task(self._orch.handle(s))
+        await asyncio.wait({self._active})  # 完了 or barge-in キャンセルで戻る
+        task = self._active
+        self._active = None
         self.processed += 1
+        if not task.cancelled() and task.exception() is not None:
+            raise task.exception()  # handle 内未捕捉の例外 → A2 循環ブレーカへ
         return s
+
+    def interrupt(self) -> None:
+        """barge-in: 進行中の応答生成を即キャンセル（Eve が止まる）。発話開始の瞬間に呼ぶ。"""
+        if self._active and not self._active.done():
+            self._active.cancel()
 
     async def run(self) -> None:
         # A2: 1刺激の失敗で単一 consumer を殺さない。例外は traceback 付きでログし継続。
-        # ただし連続失敗（想定外が頻発）は無理に回さず停止＝循環ブレーカ。
+        # 連続失敗（想定外が頻発）は無理に回さず停止＝循環ブレーカ。
         consecutive = 0
         while True:
             try:
                 await self.run_once()
                 consecutive = 0
             except asyncio.CancelledError:
+                if self._active and not self._active.done():
+                    self._active.cancel()  # シャットダウン時は進行中も片付ける
                 break
             except Exception:
                 consecutive += 1
