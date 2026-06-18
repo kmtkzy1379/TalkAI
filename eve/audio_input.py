@@ -101,6 +101,9 @@ class AudioInput:
         # pre-roll: 発話検知の直前チャンクを溜め、開始時に先頭へ継ぎ足す（頭欠け防止）
         preroll_chunks = max(1, int(Config.PREROLL_SEC * self.rate / self.chunk))
         preroll: "deque[bytes]" = deque(maxlen=preroll_chunks)
+        # onset 確認: これだけ連続して発話が続いてから「発話開始」とする（単発スパイク無視）
+        onset_chunks = max(1, int(Config.VAD_ONSET_SEC * self.rate / self.chunk))
+        speech_run = 0
         loop = asyncio.get_running_loop()
 
         while self.running:
@@ -117,30 +120,38 @@ class AudioInput:
             speech_prob = self.model(torch.from_numpy(audio_f32), self.rate).item()
 
             if speech_prob > Config.VAD_THRESHOLD:
-                if not is_speaking:
-                    is_speaking = True
-                    logger.debug("発話開始を検知")
-                    audio_buffer = list(preroll)  # 直前 ~PREROLL_SEC を先頭に（頭欠け防止）
-                    preroll.clear()
-                    cb = self.callback_on_speech_start
-                    if cb:
-                        if asyncio.iscoroutinefunction(cb):
-                            asyncio.create_task(cb())
-                        else:
-                            cb()
-                silence_start = None
-                audio_buffer.append(data)
-            elif is_speaking:
-                audio_buffer.append(data)
-                if silence_start is None:
-                    silence_start = time.time()
-                if time.time() - silence_start > Config.SILENCE_LIMIT:
-                    is_speaking = False
-                    full_audio = b"".join(audio_buffer)
-                    audio_buffer = []
-                    if len(full_audio) > self.rate * 2 * 0.3:  # 最小0.3秒ゲート
-                        self.speech_queue.put_nowait(full_audio)
+                speech_run += 1
+                if is_speaking:
+                    silence_start = None
+                    audio_buffer.append(data)
+                else:
+                    preroll.append(data)  # 確定前は pre-roll に溜める
+                    # 単発スパイク(クリック/打鍵)を無視: 連続して発話が続いた時だけ開始
+                    if speech_run >= onset_chunks:
+                        is_speaking = True
+                        logger.debug("発話開始を確定")
+                        audio_buffer = list(preroll)  # 確認チャンク+直前を先頭に（頭欠け防止）
+                        preroll.clear()
+                        silence_start = None
+                        cb = self.callback_on_speech_start
+                        if cb:
+                            if asyncio.iscoroutinefunction(cb):
+                                asyncio.create_task(cb())
+                            else:
+                                cb()
             else:
-                preroll.append(data)  # 非発話中は直近を pre-roll に溜める
+                speech_run = 0
+                if is_speaking:
+                    audio_buffer.append(data)
+                    if silence_start is None:
+                        silence_start = time.time()
+                    if time.time() - silence_start > Config.SILENCE_LIMIT:
+                        is_speaking = False
+                        full_audio = b"".join(audio_buffer)
+                        audio_buffer = []
+                        if len(full_audio) > self.rate * 2 * 0.3:  # 最小0.3秒ゲート
+                            self.speech_queue.put_nowait(full_audio)
+                else:
+                    preroll.append(data)  # 非発話中は直近を pre-roll に溜める
 
             await asyncio.sleep(0)

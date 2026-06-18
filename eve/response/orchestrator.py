@@ -81,6 +81,7 @@ class ResponseOrchestrator:
             spoken = sanitize_for_speech(sentence)  # 残留マークダウン除去（コードゲート）
             if not spoken:
                 return  # 記号だけの行は読み上げない
+            logger.info("🤖 %s", spoken)  # 文ごとに表示（ストリーミング表示・喋った分だけ出る）
             parts.append(spoken)
             seq = self._audio.reserve_seq(gen)  # stream 順に予約（再生は seq 昇順）
             tasks.append(asyncio.create_task(_tts_and_enqueue(seq, spoken)))
@@ -102,8 +103,6 @@ class ResponseOrchestrator:
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             self.last_response = "".join(parts)
-            if self.last_response:
-                logger.info("🤖 %s", self.last_response)
         except asyncio.CancelledError:
             # barge-in でキャンセルされた: 進行中の TTS タスクも片付ける（孤児化防止）
             for t in tasks:

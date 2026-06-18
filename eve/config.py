@@ -57,6 +57,9 @@ class Config:
     SILENCE_LIMIT = float(os.getenv("SILENCE_LIMIT", "0.5"))
     # 発話開始検知の直前を継ぎ足す pre-roll（頭欠け防止。検知は喋り始めより遅れるため）
     PREROLL_SEC = float(os.getenv("PREROLL_SEC", "0.4"))
+    # 発話開始の確認窓: これだけ連続して発話が続いて初めて「発話開始」とする
+    # （クリック/打鍵の単発スパイクで誤って割り込み発火しないように）
+    VAD_ONSET_SEC = float(os.getenv("VAD_ONSET_SEC", "0.12"))
 
     # STT バックエンド（既定 = gpt-4o-transcribe。groq は幻聴多く非推奨=ロールバック用）
     STT_BACKEND = os.getenv("STT_BACKEND", "openai")  # openai | groq
