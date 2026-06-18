@@ -50,6 +50,16 @@ class Config:
     VV_SPEED = float(os.getenv("VV_SPEED", "1.0"))
     VV_PITCH = float(os.getenv("VV_PITCH", "0.0"))
 
+    # 音声入力 / VAD（値は v1 実績設定を踏襲）
+    SAMPLE_RATE = int(os.getenv("SAMPLE_RATE", "16000"))
+    CHANNELS = int(os.getenv("CHANNELS", "1"))
+    VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.5"))
+    SILENCE_LIMIT = float(os.getenv("SILENCE_LIMIT", "0.5"))
+
+    # STT バックエンド（既定 = gpt-4o-transcribe。groq は幻聴多く非推奨=ロールバック用）
+    STT_BACKEND = os.getenv("STT_BACKEND", "openai")  # openai | groq
+    STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-transcribe")
+
     @classmethod
     def validate(cls) -> list[str]:
         """不足している必須設定を列挙。空リストなら起動可（Start ゲートで使う）。"""

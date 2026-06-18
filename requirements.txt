@@ -6,3 +6,6 @@ aiohttp
 soundfile
 numpy
 pyaudio
+# F2.5 入力。openai=STT(gpt-4o-transcribe)、torch=Silero VAD（マイク使用時のみ・遅延 import）。
+openai
+torch
