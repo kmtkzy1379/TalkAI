@@ -32,6 +32,7 @@
 | **C2** | **barge-in 発火が runner と AudioPlayQueue に二分**。runner は USER 発話で**無条件**世代+1（再生中でなくても） | 🔴2+本人 | 発火判断を AudioPlayQueue 1箇所に寄せ「再生中 AND ユーザ発話」に。runner は通知のみ |
 | **C3** | **`StreamFn` 型が2箇所で別定義・不整合**（model_registry: model=,messages= / orchestrator: messages のみ）。realcheck が毎回 adapter 手書き | 🟠1+本人 | 名前を分ける or Orchestrator が `ModelRegistry + role` を受け内部で `registry.stream(role, msgs)`（role 切替=response/autonomous/youtube も一元化） |
 | **C4** | **多ターン記憶（ConversationCache）が空白**。`Turn` 型はあるが貯める器・add_turn・5件window・100件保持が未実装 | 🟠1+本人 | COMPONENT_LOGIC に ConversationCache 節新設（後続フィーチャ）。下記プラン矛盾も解消 |
+| **C5** | **記憶は「実際に喋った文」だけ記録すべき**（生成≠発話）。実機ログ(2026-06-19)で確認: 🤖 ログ/`last_response` は**生成時点**で全文出るが TTS/再生は遅く、barge-in で実発話は途中で切れる（例「club」7文生成・実発話1-2文）。`last_response`(生成済み全文) を記憶に入れると喋ってない文まで残る | 🔴実機+本人 | C1/ConversationCache 実装時: **再生レイヤが「実際に再生し終えた文」を報告 → 記憶はそれを使う**。AudioPlayQueue の項目に文テキストを持たせ、play 完了時に spoken として記録。ついでに 🤖 表示も再生時点に移すと表示が正直になる。今は記録のみ（ユーザ「まだ対処不要」） |
 
 ## P3 — 軽微 / 自明 / テスト
 
