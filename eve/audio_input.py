@@ -89,6 +89,8 @@ class AudioInput:
         return await self.speech_queue.get()
 
     async def _process_loop(self) -> None:
+        from collections import deque
+
         import numpy as np
         import torch
 
@@ -96,6 +98,9 @@ class AudioInput:
         audio_buffer: list[bytes] = []
         is_speaking = False
         silence_start = None
+        # pre-roll: 発話検知の直前チャンクを溜め、開始時に先頭へ継ぎ足す（頭欠け防止）
+        preroll_chunks = max(1, int(Config.PREROLL_SEC * self.rate / self.chunk))
+        preroll: "deque[bytes]" = deque(maxlen=preroll_chunks)
         loop = asyncio.get_running_loop()
 
         while self.running:
@@ -115,6 +120,8 @@ class AudioInput:
                 if not is_speaking:
                     is_speaking = True
                     logger.debug("発話開始を検知")
+                    audio_buffer = list(preroll)  # 直前 ~PREROLL_SEC を先頭に（頭欠け防止）
+                    preroll.clear()
                     cb = self.callback_on_speech_start
                     if cb:
                         if asyncio.iscoroutinefunction(cb):
@@ -133,5 +140,7 @@ class AudioInput:
                     audio_buffer = []
                     if len(full_audio) > self.rate * 2 * 0.3:  # 最小0.3秒ゲート
                         self.speech_queue.put_nowait(full_audio)
+            else:
+                preroll.append(data)  # 非発話中は直近を pre-roll に溜める
 
             await asyncio.sleep(0)

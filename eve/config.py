@@ -55,6 +55,8 @@ class Config:
     CHANNELS = int(os.getenv("CHANNELS", "1"))
     VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.5"))
     SILENCE_LIMIT = float(os.getenv("SILENCE_LIMIT", "0.5"))
+    # 発話開始検知の直前を継ぎ足す pre-roll（頭欠け防止。検知は喋り始めより遅れるため）
+    PREROLL_SEC = float(os.getenv("PREROLL_SEC", "0.4"))
 
     # STT バックエンド（既定 = gpt-4o-transcribe。groq は幻聴多く非推奨=ロールバック用）
     STT_BACKEND = os.getenv("STT_BACKEND", "openai")  # openai | groq
