@@ -60,6 +60,17 @@ class RagStore:
             self.rag_path = _REPO_ROOT / self.rag_path
         self.max_chunks = max_chunks if max_chunks is not None else Config.RAG_MAX_CHUNKS
         self.top_k = top_k if top_k is not None else Config.RAG_TOP_K
+        # スコアリング・パラメータ（Config 既定だが属性として差替え可＝重み sweep / テスト用）。
+        # rel_baseline: 埋め込みの異方性補正。cos をこの値基準で [0,1] に再スケール
+        # （rel' = max(0,(cos-baseline)/(1-baseline))）。Ruri は ~0.75、生コサインなら 0.0。
+        self.rel_baseline = Config.RAG_REL_BASELINE
+        self.rel_floor = Config.RAG_RELEVANCE_FLOOR
+        self.w_rel = Config.RAG_W_REL
+        self.w_imp = Config.RAG_W_IMP
+        self.w_rec = Config.RAG_W_REC
+        self.recency_tau = Config.RAG_RECENCY_TAU
+        self.mmr_lambda = Config.RAG_MMR_LAMBDA
+        self.dup_hardcut = Config.RAG_DUP_HARDCUT
         self._chunks: "deque[dict]" = deque(maxlen=self.max_chunks)  # ロケット鉛筆
         self._write_queue: "asyncio.Queue[Optional[dict]]" = asyncio.Queue()
         self._write_task: Optional[asyncio.Task] = None
@@ -201,22 +212,21 @@ class RagStore:
         rel = unit @ qn  # cosine（正規化済みなので内積）
 
         now = time.time()
+        denom = max(1e-9, 1.0 - self.rel_baseline)
         scored: list[dict] = []
         for i, c in enumerate(chunks):
-            relevance = float(rel[i])
-            if relevance < Config.RAG_RELEVANCE_FLOOR:
+            cos = float(rel[i])
+            # 異方性補正: 高ベースラインに圧縮された cos を [0,1] に広げて relevance を実効化。
+            relevance = max(0.0, (cos - self.rel_baseline) / denom)
+            if relevance < self.rel_floor:
                 info["floor_excluded"] += 1  # ① 無関係を排除（破綻防止）
                 continue
-            recency = math.exp(-(now - _ts_epoch(c.get("timestamp", ""), now)) / Config.RAG_RECENCY_TAU)
+            recency = math.exp(-(now - _ts_epoch(c.get("timestamp", ""), now)) / self.recency_tau)
             importance = float(c.get("importance", 0.5))
-            base = (
-                Config.RAG_W_REL * relevance
-                + Config.RAG_W_IMP * importance
-                + Config.RAG_W_REC * recency
-            )
+            base = self.w_rel * relevance + self.w_imp * importance + self.w_rec * recency
             scored.append({
-                "relevance": relevance, "recency": recency, "importance": importance,
-                "base": base, "unit": unit[i], "chunk": c,
+                "relevance": relevance, "cos": cos, "recency": recency,
+                "importance": importance, "base": base, "unit": unit[i], "chunk": c,
             })
         if not scored:
             return [], info
@@ -226,10 +236,10 @@ class RagStore:
         pool = scored[: max(k * 4, 20)]
         info["pool"] = pool
 
-        # ③ hard-cut: ほぼ同一(cosine>閾値)の重複を除去
+        # ③ hard-cut: ほぼ同一(cosine>閾値)の重複を除去（query非依存の chunk 間類似）
         deduped: list[dict] = []
         for s in pool:
-            if any(float(s["unit"] @ d["unit"]) > Config.RAG_DUP_HARDCUT for d in deduped):
+            if any(float(s["unit"] @ d["unit"]) > self.dup_hardcut for d in deduped):
                 continue
             deduped.append(s)
 
@@ -239,7 +249,7 @@ class RagStore:
         remaining = [s for s in deduped if s is not top1]
 
         # ⑤ MMR: λ*base - (1-λ)*max_sim_to_selected で多様化
-        lam = Config.RAG_MMR_LAMBDA
+        lam = self.mmr_lambda
         while len(selected) < k and remaining:
             best, best_mmr = None, -float("inf")
             for s in remaining:

@@ -65,6 +65,13 @@ class FakeEmbedder(Embedder):
         return self._vec(text)
 
 
+def _store(rag_file: str | None = None, **kw) -> RagStore:
+    """fake 埋め込みは生コサイン運用＝異方性補正なし(rel_baseline=0)でテストする。"""
+    s = RagStore(FakeEmbedder(), rag_file=rag_file or _tmp(), **kw)
+    s.rel_baseline = 0.0
+    return s
+
+
 async def _seed(store: RagStore, items: list[tuple[str, str, float]]) -> None:
     """(display_text, search_text, importance) のリストを記憶に追加。"""
     for text, search, imp in items:
@@ -72,14 +79,14 @@ async def _seed(store: RagStore, items: list[tuple[str, str, float]]) -> None:
 
 
 async def t_rocket_pencil() -> bool:
-    store = RagStore(FakeEmbedder(), rag_file=_tmp(), max_chunks=5)
+    store = _store(max_chunks=5)
     for i in range(8):
         await store.add_chunk(text=f"記憶{i}", search_text="夏", importance=0.5)
     return len(store) == 5
 
 
 async def t_floor_excludes_unrelated() -> bool:
-    store = RagStore(FakeEmbedder(), rag_file=_tmp(), top_k=5)
+    store = _store(top_k=5)
     await _seed(store, [
         ("スイカは夏に最高", "夏 スイカ", 0.5),
         ("仕事が忙しい", "仕事", 0.5),  # 夏スイカ クエリと無関係 → フロアで除外
@@ -90,7 +97,7 @@ async def t_floor_excludes_unrelated() -> bool:
 
 
 async def t_top1_most_relevant() -> bool:
-    store = RagStore(FakeEmbedder(), rag_file=_tmp(), top_k=3)
+    store = _store(top_k=3)
     await _seed(store, [
         ("夏スイカ完全一致", "夏 スイカ", 0.4),  # 最類似(cosine=1.0)だが importance 低
         ("夏の旅行", "夏 旅行", 0.9),            # importance 高いが relevance 低
@@ -102,7 +109,7 @@ async def t_top1_most_relevant() -> bool:
 
 
 async def t_dedup_diversity() -> bool:
-    store = RagStore(FakeEmbedder(), rag_file=_tmp(), top_k=2)
+    store = _store(top_k=2)
     await _seed(store, [
         ("スイカ最高", "夏 スイカ", 0.5),    # A
         ("スイカ大好き", "夏 スイカ", 0.5),  # A' = A と同一ベクトル → hard-cut で片方排除
@@ -116,7 +123,7 @@ async def t_dedup_diversity() -> bool:
 
 
 async def t_count_cap() -> bool:
-    store = RagStore(FakeEmbedder(), rag_file=_tmp(), top_k=2)
+    store = _store(top_k=2)
     await _seed(store, [
         ("夏1", "夏 スイカ", 0.5), ("夏2", "夏 旅行", 0.5),
         ("夏3", "夏 音楽", 0.5), ("夏4", "夏 ラーメン", 0.5),
@@ -126,7 +133,7 @@ async def t_count_cap() -> bool:
 
 
 async def t_random() -> bool:
-    store = RagStore(FakeEmbedder(), rag_file=_tmp())
+    store = _store()
     await _seed(store, [("a", "夏", 0.5), ("b", "スイカ", 0.5), ("c", "旅行", 0.5)])
     res = store.random(2)
     return len(res) == 2 and all(c.as_topic_seed for c in res)
@@ -134,7 +141,7 @@ async def t_random() -> bool:
 
 async def t_persistence_roundtrip() -> bool:
     path = _tmp()
-    s1 = RagStore(FakeEmbedder(), rag_file=path)
+    s1 = _store(rag_file=path)
     await s1.initialize()
     await _seed(s1, [("スイカの思い出", "夏 スイカ", 0.6)])
     await s1.shutdown()
@@ -142,7 +149,7 @@ async def t_persistence_roundtrip() -> bool:
     with open(path, "r", encoding="utf-8") as f:
         raw = f.read()
 
-    s2 = RagStore(FakeEmbedder(), rag_file=path)
+    s2 = _store(rag_file=path)
     await s2.initialize()
     res = await s2.search("夏 スイカ", k=3)
     await s2.shutdown()
@@ -154,7 +161,7 @@ async def t_persistence_roundtrip() -> bool:
 
 
 async def t_orch_injects_rag() -> bool:
-    store = RagStore(FakeEmbedder(), rag_file=_tmp())
+    store = _store()
     await store.initialize()
     await _seed(store, [("スイカは夏に食べると最高だった", "夏 スイカ", 0.6)])
     seen: list[str] = []
