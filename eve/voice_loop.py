@@ -12,6 +12,7 @@ import logging
 from typing import Optional
 
 from .context_assembler import ContextAssembler
+from .memory import ConversationCache
 from .model_registry import ModelRegistry
 from .pipeline.audio_play_queue import AudioPlayQueue
 from .pipeline.orchestrator import PipelineRunner
@@ -33,12 +34,16 @@ class VoiceLoop:
         self.queue = StimulusQueue()
         self.tts = VoicevoxTTS()
         self.stt = make_stt()
+        self.cache = ConversationCache()  # 短期記憶（会話ログ・直近注入・実発話記録）
 
         async def stream_fn(messages):
             async for delta in self.registry.stream("response", messages):
                 yield delta
 
-        self.orchestrator = ResponseOrchestrator(self.audio, stream_fn, self.tts.generate, ContextAssembler())
+        self.orchestrator = ResponseOrchestrator(
+            self.audio, stream_fn, self.tts.generate, ContextAssembler(),
+            conversation_cache=self.cache,
+        )
         self.runner = PipelineRunner(self.queue, self.orchestrator, self.audio)
         self.input = MicSttInputSource(self.queue, self.stt, on_speech_start=self._barge_in)
         self._tasks: list[asyncio.Task] = []
@@ -64,6 +69,7 @@ class VoiceLoop:
         logger.info("ウォームアップ完了")
 
     async def run(self) -> None:
+        await self.cache.initialize()  # 既存ログ復元 + 書き込み worker 起動
         await self.warmup()
         self._tasks.append(asyncio.create_task(self.audio.play_worker()))
         self._tasks.append(asyncio.create_task(self.runner.run()))
@@ -75,6 +81,10 @@ class VoiceLoop:
         self.input.stop()
         for t in self._tasks:
             t.cancel()
+        try:
+            await self.cache.shutdown()  # 書き込みキューをドレイン（記録を取りこぼさない）
+        except Exception:
+            pass
         try:
             await self.tts.close()
         except Exception:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -68,7 +69,9 @@ check("complete は解決済みモデルへ", _seen.get("model") == reg2.resolve
 
 # 4. ContextAssembler — 時間接地 + 話題の種/過去の記憶のラベル分離
 now = Stamp.now()
-three_min_ago = Stamp(iso=now.iso, mono=now.mono - 180)
+# 直近ターンは壁時計(iso)で接地する（再起動後も正しい）。iso を 180 秒過去にする。
+past_iso = (datetime.fromisoformat(now.iso) - timedelta(seconds=180)).isoformat()
+three_min_ago = Stamp(iso=past_iso, mono=now.mono - 180)
 ctx = ContextAssembler(system_prompt="SYS").assemble(
     user_text="今の話をしよう",
     recent_turns=[Turn("user", "昔これ言った", three_min_ago)],

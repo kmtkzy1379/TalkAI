@@ -65,6 +65,14 @@ class Config:
     STT_BACKEND = os.getenv("STT_BACKEND", "openai")  # openai | groq
     STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-transcribe")
 
+    # 短期記憶（F3 ConversationCache）
+    # 会話ログの永続先（タイムスタンプ付き JSONL・ロケット鉛筆方式）。
+    HISTORY_FILE = os.getenv("HISTORY_FILE", "conversation_history.jsonl")
+    # メモリに保持する最大ターン数（古いものから押し出す＝ロケット鉛筆）。
+    HISTORY_MAX_TURNS = int(os.getenv("HISTORY_MAX_TURNS", "100"))
+    # 応答LLM に注入する直近ターン数（≈3往復）。レイテンシと過去逸れのため小さく保つ。
+    RECENT_TURN_COUNT = int(os.getenv("RECENT_TURN_COUNT", "6"))
+
     @classmethod
     def validate(cls) -> list[str]:
         """不足している必須設定を列挙。空リストなら起動可（Start ゲートで使う）。"""

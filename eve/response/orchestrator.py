@@ -13,13 +13,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import AsyncIterator, Awaitable, Callable, Optional
+from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable, Optional
 
-from ..context_assembler import ContextAssembler
+from ..context_assembler import ContextAssembler, Turn
 from ..pipeline.audio_play_queue import AudioPlayQueue
-from ..pipeline.stimulus import Stimulus
+from ..pipeline.stimulus import Stimulus, StimulusKind
 from .splitter import JapaneseSentenceSplitter
 from .style import SPEECH_STYLE, sanitize_for_speech
+
+if TYPE_CHECKING:  # 実行時の循環 import を避ける（型注釈のみ）
+    from ..memory.conversation_cache import ConversationCache
 
 logger = logging.getLogger(__name__)
 
@@ -35,16 +38,23 @@ class ResponseOrchestrator:
         tts_fn: TtsFn,
         context_assembler: Optional[ContextAssembler] = None,
         tts_concurrency: int = 3,
+        conversation_cache: Optional["ConversationCache"] = None,
     ) -> None:
         self._audio = audio
         self._stream_fn = stream_fn
         self._tts_fn = tts_fn
         self._ctx = context_assembler or ContextAssembler(system_prompt=SPEECH_STYLE)
         self._tts_concurrency = tts_concurrency
-        self.last_response = ""  # 自然さの目視・テスト用
+        # 任意注入: None なら短期記憶を使わない（F2 系テストは従来どおりの経路）。
+        self._cache = conversation_cache
+        self.last_response = ""  # 生成済み全文（自然さの目視・テスト用。記憶には使わない＝C5）
 
-    def _build_messages(self, stimulus: Stimulus) -> list[dict]:
-        ctx = self._ctx.assemble(user_text=str(stimulus.payload))
+    def _build_messages(
+        self, stimulus: Stimulus, recent_turns: Optional[list[Turn]] = None
+    ) -> list[dict]:
+        ctx = self._ctx.assemble(
+            user_text=str(stimulus.payload), recent_turns=recent_turns
+        )
         messages: list[dict] = []
         if ctx.system:
             messages.append({"role": "system", "content": ctx.system})
@@ -53,11 +63,25 @@ class ResponseOrchestrator:
 
     async def handle(self, stimulus: Stimulus) -> None:
         gen = self._audio.current_generation()
-        messages = self._build_messages(stimulus)
+        # 記憶: 現ターンを記録する**前**に直近会話をスナップショット（現発話が二重表示されない）。
+        recent = self._cache.recent_for_injection() if self._cache is not None else None
+        messages = self._build_messages(stimulus, recent)
+        # ユーザ発話なら user ターンを記録（自律/vision/callfunction には user ターンは無い）。
+        if self._cache is not None and stimulus.kind == StimulusKind.USER_UTTERANCE:
+            self._cache.add_turn("user", str(stimulus.payload))
         splitter = JapaneseSentenceSplitter()
         sem = asyncio.Semaphore(self._tts_concurrency)
         tasks: list[asyncio.Task] = []
         parts: list[str] = []
+        spoken: list[str] = []  # C5: 実際に再生し終えた文だけが入る（生成≠発話）
+        eve_recorded = False
+
+        def _record_eve() -> None:
+            nonlocal eve_recorded
+            if eve_recorded or self._cache is None:
+                return
+            eve_recorded = True
+            self._cache.add_turn("eve", "".join(spoken))  # 空なら add_turn 側で無視
 
         async def _tts_and_enqueue(seq: int, sentence: str) -> None:
             # A1: 同一世代である限り、TTS が None/例外でも **必ず seq を埋める**。
@@ -75,16 +99,17 @@ class ResponseOrchestrator:
             if wav is None:
                 logger.warning("TTS が音声を返さず（文をスキップ）: %.20s", sentence)
             if self._audio.current_generation() == gen:
-                self._audio.enqueue(gen, seq, wav)  # wav=None は番兵（再生時スキップ）
+                # on_played は「実際に再生し終えた時」だけ呼ばれる → spoken に積む（C5）。
+                self._audio.enqueue(gen, seq, wav, text=sentence, on_played=spoken.append)
 
         def _emit(sentence: str) -> None:
-            spoken = sanitize_for_speech(sentence)  # 残留マークダウン除去（コードゲート）
-            if not spoken:
+            clean = sanitize_for_speech(sentence)  # 残留マークダウン除去（コードゲート）
+            if not clean:
                 return  # 記号だけの行は読み上げない
-            logger.info("🤖 %s", spoken)  # 文ごとに表示（ストリーミング表示・喋った分だけ出る）
-            parts.append(spoken)
+            logger.info("🤖 %s", clean)  # 文ごとに表示（ストリーミング表示）
+            parts.append(clean)
             seq = self._audio.reserve_seq(gen)  # stream 順に予約（再生は seq 昇順）
-            tasks.append(asyncio.create_task(_tts_and_enqueue(seq, spoken)))
+            tasks.append(asyncio.create_task(_tts_and_enqueue(seq, clean)))
 
         try:
             try:
@@ -103,9 +128,14 @@ class ResponseOrchestrator:
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             self.last_response = "".join(parts)
+            if self._cache is not None:
+                # 現ターンの音声が再生し切るまで待ってから「実発話」を記録（C5）。
+                await self._audio.join()
+                _record_eve()
         except asyncio.CancelledError:
-            # barge-in でキャンセルされた: 進行中の TTS タスクも片付ける（孤児化防止）
-            for t in tasks:
+            # barge-in: ここまでに**実際に喋った分だけ**を記憶に記録（生成途中の文は残さない）。
+            _record_eve()
+            for t in tasks:  # 進行中の TTS タスクも片付ける（孤児化防止）
                 if not t.done():
                     t.cancel()
             raise

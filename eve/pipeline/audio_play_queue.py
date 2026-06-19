@@ -30,6 +30,9 @@ class _Item:
     generation: int
     seq: int
     audio: Any
+    text: str = ""  # この音声が読み上げる文（C5: 実発話の記憶用）
+    # 実際に再生し終えた時だけ呼ばれる（barge-in で捨てられた文では呼ばれない＝C5）。
+    on_played: Optional[Callable[[str], None]] = None
 
 
 class AudioPlayQueue:
@@ -103,8 +106,15 @@ class AudioPlayQueue:
         else:
             self.bump_generation()
 
-    def enqueue(self, generation: int, seq: int, audio: Any) -> None:
-        self._queue.put_nowait(_Item(generation, seq, audio))
+    def enqueue(
+        self,
+        generation: int,
+        seq: int,
+        audio: Any,
+        text: str = "",
+        on_played: Optional[Callable[[str], None]] = None,
+    ) -> None:
+        self._queue.put_nowait(_Item(generation, seq, audio, text, on_played))
 
     async def play_worker(self) -> None:
         while True:
@@ -128,6 +138,13 @@ class AudioPlayQueue:
             it = self._buffer.pop(self._next_seq)
             self._next_seq += 1
             await self._play(it.audio, it.generation)
+            # C5: 実際に再生した文だけ「喋った」と報告（B3 の途中停止も聞かれた扱い）。
+            # 番兵(audio=None)は再生していないので報告しない。
+            if it.audio is not None and it.on_played is not None:
+                try:
+                    it.on_played(it.text)
+                except Exception:
+                    logger.exception("on_played コールバックでエラー（再生は継続）")
 
     async def _play(self, audio: Any, generation: int) -> None:
         if audio is None:

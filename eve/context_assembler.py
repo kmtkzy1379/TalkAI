@@ -11,12 +11,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .clock import Stamp, elapsed_mono, elapsed_wall, humanize
+from .clock import Stamp, elapsed_wall, humanize
+
+# 注入セレクション（ConversationCache.recent_for_injection）が差し込む省略マーカの話者名。
+# ユーザー沈黙中の自律発話などで直近窓とアンカー往復が非連続になった時、その間に
+# 何件省略したかを伝えるセンチネル Turn（text=省略件数）。描画は assemble 内で特別扱い。
+OMITTED_SPEAKER = "__omitted__"
 
 
 @dataclass
 class Turn:
-    """直近会話の1ターン（in-session、monotonic で経過を測る）。"""
+    """会話の1ターン（話者単位の1発話）。
+
+    壁時計(stamp.iso)で経過を測り「3分前」等に接地する。再起動でディスクから復元した
+    Turn の monotonic は前プロセスの値で無意味なので、表示用の経過は壁時計を正とする
+    （monotonic は deadline 計算など in-session 期間用途に限定）。
+    """
 
     speaker: str
     text: str
@@ -60,10 +70,15 @@ class ContextAssembler:
         blocks: list[str] = []
 
         if recent_turns:
-            lines = [
-                f"[{humanize(elapsed_mono(t.stamp, now))}] {t.speaker}: {t.text}"
-                for t in recent_turns
-            ]
+            lines = []
+            for t in recent_turns:
+                if t.speaker == OMITTED_SPEAKER:
+                    # 非連続なタイムラインを AI に正直に伝える（地続きと誤解させない）
+                    lines.append(f"（中略: ユーザー沈黙中の発話 {t.text}件を省略）")
+                    continue
+                lines.append(
+                    f"[{humanize(elapsed_wall(t.stamp.iso, now.iso))}] {t.speaker}: {t.text}"
+                )
             blocks.append("# 直近の会話\n" + "\n".join(lines))
 
         if rag_chunks:

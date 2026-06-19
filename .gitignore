@@ -5,3 +5,9 @@ venv/
 .venv/
 *.egg-info/
 .pytest_cache/
+# ローカル診断用（コミットしない）
+tools/_*.py
+tools/audio_samples/
+# 会話ログ（F3 短期記憶・実行時に生成される永続ファイル）
+conversation_history.jsonl
+*.jsonl
