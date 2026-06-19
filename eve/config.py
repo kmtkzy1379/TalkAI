@@ -73,6 +73,25 @@ class Config:
     # 応答LLM に注入する直近ターン数（≈3往復）。レイテンシと過去逸れのため小さく保つ。
     RECENT_TURN_COUNT = int(os.getenv("RECENT_TURN_COUNT", "6"))
 
+    # 長期記憶（F3.5 RAG / 連想想起）
+    RAG_FILE = os.getenv("RAG_FILE", "rag_memory.jsonl")  # 永続 JSONL（埋め込み込み）
+    RAG_MAX_CHUNKS = int(os.getenv("RAG_MAX_CHUNKS", "500"))  # ロケット鉛筆の上限
+    RAG_TOP_K = int(os.getenv("RAG_TOP_K", "3"))  # 注入する記憶件数（top-1必須+MMR）
+    # 埋め込み backend（ruri=ローカル日本語特化 / openai=API）。STT と同じ差替え方式。
+    EMBED_BACKEND = os.getenv("EMBED_BACKEND", "ruri")  # ruri | openai
+    RURI_MODEL = os.getenv("RURI_MODEL", "cl-nagoya/ruri-v3-310m")  # 768次元・日本語最良
+    EMBED_MODEL = os.getenv("EMBED_MODEL", "text-embedding-3-small")  # openai backend 用
+    # memory-stream ランキング（Generative Agents 式）。
+    # 重み: relevance 最優先。recency は弱く（短期記憶が直近を既にカバー＝高recencyは重複想起の元）。
+    RAG_W_REL = float(os.getenv("RAG_W_REL", "0.5"))  # relevance 重み（話題の近さ・最優先）
+    RAG_W_IMP = float(os.getenv("RAG_W_IMP", "0.35"))  # importance 重み（重要度）
+    RAG_W_REC = float(os.getenv("RAG_W_REC", "0.15"))  # recency 重み（新しさ・隠し味程度）
+    RAG_RECENCY_TAU = float(os.getenv("RAG_RECENCY_TAU", "86400"))  # 減衰時定数[秒]（既定1日）
+    RAG_MMR_LAMBDA = float(os.getenv("RAG_MMR_LAMBDA", "0.7"))  # MMR: 関連0.7/多様0.3
+    RAG_DUP_HARDCUT = float(os.getenv("RAG_DUP_HARDCUT", "0.95"))  # これ超の重複は除外
+    # 関連度フロア: これ未満は無関係として除外（無関係混入で会話破綻させない）。実測で調整。
+    RAG_RELEVANCE_FLOOR = float(os.getenv("RAG_RELEVANCE_FLOOR", "0.3"))
+
     @classmethod
     def validate(cls) -> list[str]:
         """不足している必須設定を列挙。空リストなら起動可（Start ゲートで使う）。"""

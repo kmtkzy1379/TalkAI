@@ -15,7 +15,7 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable, Optional
 
-from ..context_assembler import ContextAssembler, Turn
+from ..context_assembler import ContextAssembler, RagChunk, Turn
 from ..pipeline.audio_play_queue import AudioPlayQueue
 from ..pipeline.stimulus import Stimulus, StimulusKind
 from .splitter import JapaneseSentenceSplitter
@@ -23,6 +23,7 @@ from .style import SPEECH_STYLE, sanitize_for_speech
 
 if TYPE_CHECKING:  # 実行時の循環 import を避ける（型注釈のみ）
     from ..memory.conversation_cache import ConversationCache
+    from ..memory.long_term import RagStore
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class ResponseOrchestrator:
         context_assembler: Optional[ContextAssembler] = None,
         tts_concurrency: int = 3,
         conversation_cache: Optional["ConversationCache"] = None,
+        rag_store: Optional["RagStore"] = None,
     ) -> None:
         self._audio = audio
         self._stream_fn = stream_fn
@@ -47,13 +49,20 @@ class ResponseOrchestrator:
         self._tts_concurrency = tts_concurrency
         # 任意注入: None なら短期記憶を使わない（F2 系テストは従来どおりの経路）。
         self._cache = conversation_cache
+        # 任意注入: 長期記憶(連想RAG)。None なら使わない。
+        self._rag = rag_store
         self.last_response = ""  # 生成済み全文（自然さの目視・テスト用。記憶には使わない＝C5）
 
     def _build_messages(
-        self, stimulus: Stimulus, recent_turns: Optional[list[Turn]] = None
+        self,
+        stimulus: Stimulus,
+        recent_turns: Optional[list[Turn]] = None,
+        rag_chunks: Optional[list[RagChunk]] = None,
     ) -> list[dict]:
         ctx = self._ctx.assemble(
-            user_text=str(stimulus.payload), recent_turns=recent_turns
+            user_text=str(stimulus.payload),
+            recent_turns=recent_turns,
+            rag_chunks=rag_chunks,
         )
         messages: list[dict] = []
         if ctx.system:
@@ -65,7 +74,14 @@ class ResponseOrchestrator:
         gen = self._audio.current_generation()
         # 記憶: 現ターンを記録する**前**に直近会話をスナップショット（現発話が二重表示されない）。
         recent = self._cache.recent_for_injection() if self._cache is not None else None
-        messages = self._build_messages(stimulus, recent)
+        # 長期記憶: 今の発話に連想する過去記憶を取得（クエリ埋め込みはここで・≤3s 内）。
+        rag_chunks = None
+        if self._rag is not None:
+            try:
+                rag_chunks = await self._rag.search(str(stimulus.payload))
+            except Exception:
+                logger.exception("RAG 検索に失敗（記憶なしで継続）")
+        messages = self._build_messages(stimulus, recent, rag_chunks)
         # ユーザ発話なら user ターンを記録（自律/vision/callfunction には user ターンは無い）。
         if self._cache is not None and stimulus.kind == StimulusKind.USER_UTTERANCE:
             self._cache.add_turn("user", str(stimulus.payload))

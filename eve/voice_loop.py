@@ -12,7 +12,8 @@ import logging
 from typing import Optional
 
 from .context_assembler import ContextAssembler
-from .memory import ConversationCache
+from .memory import ConversationCache, RagStore
+from .memory.embed import make_embedder
 from .model_registry import ModelRegistry
 from .pipeline.audio_play_queue import AudioPlayQueue
 from .pipeline.orchestrator import PipelineRunner
@@ -35,6 +36,7 @@ class VoiceLoop:
         self.tts = VoicevoxTTS()
         self.stt = make_stt()
         self.cache = ConversationCache()  # 短期記憶（会話ログ・直近注入・実発話記録）
+        self.rag = RagStore(make_embedder())  # 長期記憶（連想想起）
 
         async def stream_fn(messages):
             async for delta in self.registry.stream("response", messages):
@@ -42,7 +44,7 @@ class VoiceLoop:
 
         self.orchestrator = ResponseOrchestrator(
             self.audio, stream_fn, self.tts.generate, ContextAssembler(),
-            conversation_cache=self.cache,
+            conversation_cache=self.cache, rag_store=self.rag,
         )
         self.runner = PipelineRunner(self.queue, self.orchestrator, self.audio)
         self.input = MicSttInputSource(self.queue, self.stt, on_speech_start=self._barge_in)
@@ -59,6 +61,10 @@ class VoiceLoop:
         logger.info("ウォームアップ開始")
         await self.stt.warmup()
         try:
+            await self.rag.warmup()  # 埋め込みモデルの初回ロードを先に済ませる
+        except Exception as e:
+            logger.warning("RAG ウォームアップ失敗（続行）: %s", e)
+        try:
             await self.registry.complete("response", [{"role": "user", "content": "hi"}], max_tokens=1)
         except Exception as e:
             logger.warning("LLM ウォームアップ失敗（続行）: %s", e)
@@ -70,6 +76,7 @@ class VoiceLoop:
 
     async def run(self) -> None:
         await self.cache.initialize()  # 既存ログ復元 + 書き込み worker 起動
+        await self.rag.initialize()  # 既存 RAG 記憶を復元 + 書き込み worker 起動
         await self.warmup()
         self._tasks.append(asyncio.create_task(self.audio.play_worker()))
         self._tasks.append(asyncio.create_task(self.runner.run()))
@@ -83,6 +90,10 @@ class VoiceLoop:
             t.cancel()
         try:
             await self.cache.shutdown()  # 書き込みキューをドレイン（記録を取りこぼさない）
+        except Exception:
+            pass
+        try:
+            await self.rag.shutdown()
         except Exception:
             pass
         try:

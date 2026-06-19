@@ -9,3 +9,6 @@ pyaudio
 # F2.5 入力。openai=STT(gpt-4o-transcribe)、torch=Silero VAD（マイク使用時のみ・遅延 import）。
 openai
 torch
+# F3.5 長期記憶。sentence-transformers=Ruri v3 埋め込み（ローカル・遅延 import）。
+# Tier-1 決定論テストには不要（fake embed_fn 注入）。
+sentence-transformers
