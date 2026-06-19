@@ -9,6 +9,14 @@ Eve v2 = AI VTuber + 画面認識(VLM) 統合のデスクトップアプリ。v1
 - 永続化: JSONL / TXT フラットファイル（DB なし）
 - 外部API: OpenAI / Gemini / Groq / (Anthropic=現在停止中) / VOICEVOX(HTTP 127.0.0.1:50021) / VTube Studio(WebSocket) / YouTube Data API
 
+## 実装状況（2026-06-20・コードが正）
+
+実装順に **F0 基盤 / F1 2キュー骨格 / F2 応答背骨 / F2.5 声ループ / F3 短期記憶 / F3.5 長期RAG(連想想起)** まで完了。
+Tier-1 決定論テスト **94件が2回連続 PASS**。未実装: FeedbackLLM・surprise/SurpriseBus(中核原理は型/テストのみ未配線)・発話判定(沈黙nudge)・VLM・Call-Function・YouTube・UI・配線層PORT(vts/run/launcher/app)。
+- **引き継ぎ・未対応問題(P1-P3)・docs訂正は `docs/HANDOFF.md` に集約**（新セッションは最初に読む）。
+- 現状は**単一 asyncio ループ前提**（mic/VAD もループ上で動作。`AudioPlayQueue.set_loop` 等の cross-thread 機構は**未配線**＝VAD を別スレッド化するなら要決定）。
+- 埋め込みは `eve/memory/embed/make_embedder(ruri|openai)`（**ModelRegistry とは別系統**・`make_stt` と同方式）。Ruri v3-310m 既定。
+
 ## 中核原理（最優先・絶対に薄めない）
 
 **予測誤差(surprise)をリアルタイム一級信号にする。** surprise は (a)自発発話の要否/内容 と (b)文脈不整合の自己懐疑 の両方を**必須引数として**ゲートする。`should_speak(...)` は surprise を `Optional` にしない。surprise を反転したら発話/沈黙判定が反転する death-detection テストが通らなければビルド失敗（v1 で FEP が装飾化した＝症状の根、を再発させない）。

@@ -42,10 +42,25 @@ def elapsed_mono(then: Stamp, now: Stamp | None = None) -> float:
 
 
 def elapsed_wall(then_iso: str, now_iso_str: str | None = None) -> float:
-    """壁時計 ISO 差の経過秒。永続化済み要素（RAG チャンク等）用。"""
-    a = datetime.fromisoformat(then_iso)
-    b = datetime.fromisoformat(now_iso_str) if now_iso_str else datetime.now(timezone.utc)
-    return max(0.0, (b - a).total_seconds())
+    """壁時計 ISO 差の経過秒。永続化済み要素（RAG チャンク・会話ターン）用。
+
+    防御的: tz-naive な ISO（legacy/手編集/外部由来の timestamp）が来ても
+    UTC とみなして計算する。naive と aware の減算で TypeError を投げると
+    ContextAssembler.assemble がターンごと落ちる（応答が出ない）ため、ここで吸収する。
+    """
+    try:
+        a = datetime.fromisoformat(then_iso)
+        if a.tzinfo is None:
+            a = a.replace(tzinfo=timezone.utc)
+        if now_iso_str:
+            b = datetime.fromisoformat(now_iso_str)
+            if b.tzinfo is None:
+                b = b.replace(tzinfo=timezone.utc)
+        else:
+            b = datetime.now(timezone.utc)
+        return max(0.0, (b - a).total_seconds())
+    except (ValueError, TypeError):
+        return 0.0  # 壊れた timestamp は「たった今」扱い（落とさない）
 
 
 def humanize(delta_seconds: float) -> str:

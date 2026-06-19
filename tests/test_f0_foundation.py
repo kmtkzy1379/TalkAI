@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from eve.clock import Stamp, humanize  # noqa: E402
+from eve.clock import Stamp, elapsed_wall, humanize  # noqa: E402
 from eve.context_assembler import ContextAssembler, RagChunk, Turn  # noqa: E402
 from eve.model_registry import ModelRegistry  # noqa: E402
 
@@ -40,6 +40,9 @@ check("humanize 分", humanize(125) == "2分前")
 check("humanize 時間", humanize(7200) == "2時間前")
 s = Stamp.now()
 check("Stamp 二重保持", isinstance(s.iso, str) and isinstance(s.mono, float))
+# elapsed_wall は tz-naive な timestamp でも例外を投げない（防御的・UTC扱い）
+check("elapsed_wall naive 非クラッシュ", isinstance(elapsed_wall("2026-06-20T00:00:00"), float))
+check("elapsed_wall 壊れ値は0", elapsed_wall("not-a-date") == 0.0)
 
 # 2. ModelRegistry — role 解決と override
 reg = ModelRegistry()

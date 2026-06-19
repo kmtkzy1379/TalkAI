@@ -76,6 +76,8 @@ class AudioPlayQueue:
         self._generation += 1
         self._next_seq = 0
         self._buffer.clear()
+        # 古い世代の予約カウンタを破棄（世代ごとに1エントリ増え続ける無制限増加を防ぐ）。
+        self._reserve = {g: n for g, n in self._reserve.items() if g >= self._generation}
         kept: list[_Item] = []
         while not self._queue.empty():
             try:
