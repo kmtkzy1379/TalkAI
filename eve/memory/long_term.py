@@ -146,15 +146,19 @@ class RagStore:
     ) -> None:
         """1 記憶チャンクを追加（埋め込み→メモリ→永続化キュー）。
 
-        chunk の中身は将来 FeedbackLLM の出力（要約/感情/次予測/予測差/理由）を想定。
-        `text` は注入される表示文、`search_text`（省略時 summary→text）が埋め込み対象。
+        **圧縮埋め込み / 展開注入**（ユーザ設計 2026-06-20）— 土台はこの schema で実装済:
+        - 埋め込み（＝検索キー）は **要約 + タグ** だけに行う（`search_text` 省略時 `summary`＋`topic_tags`）。
+          FeedbackLLM の感情/予測/誤差まで埋め込むとユーザ発話への関連度が薄まるため検索キーは話題に絞る。
+        - 注入される表示文は `text`（選出時の「解凍」＝感情/予測等を含む完全版）。schema は全フィールドを保持。
+        - feedback 実装時は `add_chunk(text=<完全版レンダリング>, summary=<要約>, topic_tags=<tags>,
+          emotions=..., next_prediction=..., prediction_diff=..., reason=...)` を呼ぶだけ（新規機構は不要）。
         """
         text = (text or "").strip()
         if not text:
             return
         tags = topic_tags or []
+        # 検索キー = 要約(or search_text) + タグ のみ。完全版(text)は埋め込まない（圧縮埋め込み）。
         target = (search_text or summary or text).strip()
-        # 検索用テキストにタグを足して連想の手掛かりを増やす
         if tags:
             target = f"{target} | {' '.join(tags)}"
         embs = await self._embedder.embed_documents([target])

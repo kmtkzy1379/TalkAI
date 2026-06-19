@@ -84,17 +84,20 @@ class Config:
     # memory-stream ランキング（Generative Agents 式）。
     # 重み: relevance 最優先。recency は弱く（短期記憶が直近を既にカバー＝高recencyは重複想起の元）。
     # importance も控えめ（高importance記憶が話題無関係でも紛れ込むのを防ぐ）。実測 sweep で調整。
-    RAG_W_REL = float(os.getenv("RAG_W_REL", "0.6"))  # relevance 重み（話題の近さ・最優先）
-    RAG_W_IMP = float(os.getenv("RAG_W_IMP", "0.25"))  # importance 重み（重要度・控えめ）
-    RAG_W_REC = float(os.getenv("RAG_W_REC", "0.15"))  # recency 重み（新しさ・隠し味程度）
+    # sweep 実測(2026-06-20, Ruri)で確定: importance を効かせすぎると高importance記憶が
+    # 話題無関係でも紛れ込む → relevance 優勢・importance 控えめが最も自然。
+    RAG_W_REL = float(os.getenv("RAG_W_REL", "0.7"))  # relevance 重み（話題の近さ・最優先）
+    RAG_W_IMP = float(os.getenv("RAG_W_IMP", "0.18"))  # importance 重み（重要度・控えめ）
+    RAG_W_REC = float(os.getenv("RAG_W_REC", "0.12"))  # recency 重み（新しさ・隠し味程度）
     RAG_RECENCY_TAU = float(os.getenv("RAG_RECENCY_TAU", "86400"))  # 減衰時定数[秒]（既定1日）
     RAG_MMR_LAMBDA = float(os.getenv("RAG_MMR_LAMBDA", "0.7"))  # MMR: 関連0.7/多様0.3
     RAG_DUP_HARDCUT = float(os.getenv("RAG_DUP_HARDCUT", "0.95"))  # これ超の重複は除外
     # 埋め込み異方性の補正基準。cos をこの値基準で再スケール（rel'=(cos-base)/(1-base)）。
-    # Ruri/e5 系は無関係でも cos~0.75 に密集するため ~0.75。生コサイン運用なら 0.0。
-    RAG_REL_BASELINE = float(os.getenv("RAG_REL_BASELINE", "0.75"))
-    # 関連度フロア（再スケール後の rel' に対して）: これ未満は無関係として除外。実測 sweep で調整。
-    RAG_RELEVANCE_FLOOR = float(os.getenv("RAG_RELEVANCE_FLOOR", "0.1"))
+    # Ruri/e5 系は無関係でも cos~0.75 に密集するため ~0.77。生コサイン運用なら 0.0。
+    RAG_REL_BASELINE = float(os.getenv("RAG_REL_BASELINE", "0.77"))
+    # 関連度フロア（再スケール後の rel' に対して）: これ未満は無関係として除外。
+    # 高めに取り「無関係が混じる破綻」を防ぐ（クリーン優先＝たまに1-2件に減る方を許容・ユーザ裁定）。
+    RAG_RELEVANCE_FLOOR = float(os.getenv("RAG_RELEVANCE_FLOOR", "0.15"))
 
     @classmethod
     def validate(cls) -> list[str]:
