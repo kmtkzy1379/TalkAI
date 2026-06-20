@@ -132,6 +132,18 @@ class ConversationCache:
         turns = list(self._turns)
         return turns[-k:] if k > 0 else []
 
+    def turns_since(self, iso: Optional[str]) -> list[Turn]:
+        """watermark(iso・排他)より後の実発話ターンを古い順で返す（FeedbackLLM の span 用）。
+
+        iso=None なら保持中の全ターン。iso 比較は now_iso() 由来の UTC ISO 同士の辞書順
+        （全て `+00:00`）で順序が一致する。FeedbackLLM が「前回フィードバック地点〜最新」を
+        漏れなくカバーするための入力源（未フィードバックの会話＝記憶喪失を作らない）。
+        """
+        turns = list(self._turns)
+        if not iso:
+            return turns
+        return [t for t in turns if t.stamp.iso > iso]
+
     def recent_for_injection(self, window: Optional[int] = None) -> list[Turn]:
         """応答LLM へ注入する直近会話を選ぶ（自律発話で文脈が逸れないように）。
 

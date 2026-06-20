@@ -10,6 +10,7 @@ from __future__ import annotations
 from .feedback_llm import FeedbackLLM, render_chunk_text, render_last_feedback
 from .parser import FeedbackResult, parse_feedback
 from .prediction_state import NEUTRAL_SURPRISE, PredictionState, clamp_surprise
+from .worker import FeedbackWorker
 
 __all__ = [
     "PredictionState",
@@ -20,4 +21,5 @@ __all__ = [
     "FeedbackLLM",
     "render_chunk_text",
     "render_last_feedback",
+    "FeedbackWorker",
 ]

@@ -21,11 +21,12 @@ from eve.context_assembler import Turn  # noqa: E402
 from eve.feedback import (  # noqa: E402
     NEUTRAL_SURPRISE,
     FeedbackLLM,
+    FeedbackWorker,
     PredictionState,
     parse_feedback,
 )
 from eve.feedback.prompts import build_messages, build_user_text  # noqa: E402
-from eve.memory import RagStore  # noqa: E402
+from eve.memory import ConversationCache, RagStore  # noqa: E402
 from eve.memory.embed import Embedder  # noqa: E402
 from eve.model_registry import ModelRegistry  # noqa: E402
 
@@ -77,6 +78,38 @@ def _reg_const(text: str) -> ModelRegistry:
         return {"choices": [{"message": {"content": text}}]}
 
     return ModelRegistry(completion_fn=fake)
+
+
+class GatedFake:
+    """並行度・呼び出し回数・入力スパンを観測でき、gate で run を保持できる fake。"""
+
+    def __init__(self, gate: "asyncio.Event | None" = None) -> None:
+        self.gate = gate
+        self.concurrent = 0
+        self.max_concurrent = 0
+        self.calls = 0
+        self.seen_spans: list[str] = []
+
+    async def __call__(self, model, messages, **kw):
+        self.calls += 1
+        self.concurrent += 1
+        self.max_concurrent = max(self.max_concurrent, self.concurrent)
+        self.seen_spans.append(messages[1]["content"])
+        n = self.calls
+        try:
+            if self.gate is not None:
+                await self.gate.wait()
+            return {
+                "choices": [
+                    {"message": {"content": f"summary: s{n}\nnext_prediction: p{n}\nsurprise: {n * 10}"}}
+                ]
+            }
+        finally:
+            self.concurrent -= 1
+
+
+def _cache() -> ConversationCache:
+    return ConversationCache(history_file=_tmp())
 
 _passed = 0
 _failed = 0
@@ -250,6 +283,88 @@ async def t_fb_rag_write() -> bool:
     return diff_ok and text_ok and search_ok and fb.state.surprise == 35
 
 
+# ========== B5 worker（single-flight + watermark/span）==========
+async def t_worker_nonblocking_trigger() -> bool:
+    """trigger() は O(1) で即返り、処理は背景で進む。"""
+    cache = _cache()
+    fake = GatedFake()
+    worker = FeedbackWorker(FeedbackLLM(ModelRegistry(completion_fn=fake)), cache)
+    worker.start()
+    cache.add_turn("user", "a")
+    cache.add_turn("eve", "b")
+    import time
+
+    t0 = time.monotonic()
+    worker.trigger()
+    dt = time.monotonic() - t0
+    await asyncio.sleep(0.05)
+    await worker.stop()
+    return dt < 0.01 and fake.calls >= 1
+
+
+async def t_worker_single_flight() -> bool:
+    cache = _cache()
+    gate = asyncio.Event()
+    fake = GatedFake(gate=gate)
+    worker = FeedbackWorker(FeedbackLLM(ModelRegistry(completion_fn=fake)), cache)
+    worker.start()
+    cache.add_turn("user", "a")
+    cache.add_turn("eve", "b")
+    worker.trigger()
+    await asyncio.sleep(0.02)  # 1件目が run に入り gate で保持される
+    cache.add_turn("user", "c")
+    cache.add_turn("eve", "d")
+    worker.trigger()  # 2件目のトリガ（1件目 gate 中）
+    await asyncio.sleep(0.02)
+    gate.set()  # 解放
+    await asyncio.sleep(0.05)
+    await worker.stop()
+    return fake.max_concurrent == 1  # 同時実行は常に1（single-flight）
+
+
+async def t_worker_no_skip() -> bool:
+    cache = _cache()
+    gate = asyncio.Event()
+    fake = GatedFake(gate=gate)
+    fb = FeedbackLLM(ModelRegistry(completion_fn=fake))
+    worker = FeedbackWorker(fb, cache)
+    worker.start()
+    cache.add_turn("user", "u1")
+    cache.add_turn("eve", "e1")
+    worker.trigger()
+    await asyncio.sleep(0.02)  # span1 を処理中（gate 保持）
+    # 処理中に3往復ぶん到着
+    cache.add_turn("user", "u2")
+    cache.add_turn("eve", "e2")
+    cache.add_turn("user", "u3")
+    cache.add_turn("eve", "e3")
+    worker.trigger()
+    gate.set()
+    await asyncio.sleep(0.06)
+    await worker.stop()
+    leftover = cache.turns_since(fb.state.watermark)  # 未処理が残っていないこと
+    seen_u3 = any("u3" in s for s in fake.seen_spans)  # 後続ターンもカバーされた
+    return leftover == [] and seen_u3 and fb.state.watermark is not None
+
+
+async def t_worker_surprise_not_frozen() -> bool:
+    cache = _cache()
+    fake = GatedFake()  # gate なし＝即返り、surprise=calls*10
+    fb = FeedbackLLM(ModelRegistry(completion_fn=fake))
+    fb.state.last_prediction = "seed"  # cold を避け diff を反映させる
+    worker = FeedbackWorker(fb, cache)
+    worker.start()
+    seen: list[int] = []
+    for i in range(3):
+        cache.add_turn("user", f"u{i}")
+        cache.add_turn("eve", f"e{i}")
+        worker.trigger()
+        await asyncio.sleep(0.03)
+        seen.append(fb.state.surprise)
+    await worker.stop()
+    return len(set(seen)) > 1 and fb.state.watermark is not None  # 凍結しない
+
+
 async def main() -> None:
     # B1
     check("B1 PredictionState 既定値", t_predstate_defaults())
@@ -269,6 +384,11 @@ async def main() -> None:
     check("B4 FEP ループ閉(last_prediction 更新)", await t_fb_fep_close())
     check("B4 surprise 反応性(一致 低/不一致 高)", await t_fb_surprise_reactivity())
     check("B4 RAG 書込(圧縮埋め込み/展開注入)", await t_fb_rag_write())
+    # B5
+    check("B5 trigger は非ブロッキング", await t_worker_nonblocking_trigger())
+    check("B5 single-flight(同時実行=1)", await t_worker_single_flight())
+    check("B5 no-skip(span カバー・記憶喪失なし)", await t_worker_no_skip())
+    check("B5 surprise 凍結しない", await t_worker_surprise_not_frozen())
 
 
 if __name__ == "__main__":
