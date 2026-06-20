@@ -36,6 +36,11 @@ try:
     check("VoiceLoop 構築成功(遅延importのみ)", True)
     check("orchestrator に短期記憶を配線", vl.orchestrator._cache is vl.cache)
     check("orchestrator に長期記憶(RAG)を配線", vl.orchestrator._rag is vl.rag)
+    # F4: 内分泌系（PredictionState / FeedbackLLM / FeedbackWorker）の配線
+    check("orchestrator に PredictionState を配線", vl.orchestrator._state is vl.prediction)
+    check("orchestrator 完了トリガ=feedback worker.trigger", vl.orchestrator._on_complete == vl.feedback_worker.trigger)
+    check("FeedbackLLM に RAG/PredictionState を配線", vl.feedback._rag is vl.rag and vl.feedback._state is vl.prediction)
+    check("FeedbackWorker に feedback/cache を配線", vl.feedback_worker._fb is vl.feedback and vl.feedback_worker._cache is vl.cache)
     check("runner に orchestrator を配線", vl.runner._orch is vl.orchestrator)
     check("runner と input が同じ queue を共有", vl.runner._queue is vl.queue and vl.input._queue is vl.queue)
     check("input に barge-in callback を結線", callable(vl.input._on_speech_start))

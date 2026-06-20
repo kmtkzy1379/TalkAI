@@ -12,6 +12,7 @@ import logging
 from typing import Optional
 
 from .context_assembler import ContextAssembler
+from .feedback import FeedbackLLM, FeedbackWorker, PredictionState
 from .memory import ConversationCache, RagStore
 from .memory.embed import make_embedder
 from .model_registry import ModelRegistry
@@ -38,6 +39,11 @@ class VoiceLoop:
         self.cache = ConversationCache()  # 短期記憶（会話ログ・直近注入・実発話記録）
         self.rag = RagStore(make_embedder())  # 長期記憶（連想想起）
 
+        # F4 内分泌系: 各応答後に非同期で内省 → RAG 書込 + surprise + 直近フィードバック注入。
+        self.prediction = PredictionState()  # loop 所有・単一書込（feedback worker のみ書く）
+        self.feedback = FeedbackLLM(self.registry, rag_store=self.rag, prediction_state=self.prediction)
+        self.feedback_worker = FeedbackWorker(self.feedback, self.cache)
+
         async def stream_fn(messages):
             async for delta in self.registry.stream("response", messages):
                 yield delta
@@ -45,6 +51,8 @@ class VoiceLoop:
         self.orchestrator = ResponseOrchestrator(
             self.audio, stream_fn, self.tts.generate, ContextAssembler(),
             conversation_cache=self.cache, rag_store=self.rag,
+            prediction_state=self.prediction,
+            on_response_complete=self.feedback_worker.trigger,  # 正常完了で feedback を起こす
         )
         self.runner = PipelineRunner(self.queue, self.orchestrator, self.audio)
         self.input = MicSttInputSource(self.queue, self.stt, on_speech_start=self._barge_in)
@@ -77,6 +85,12 @@ class VoiceLoop:
     async def run(self) -> None:
         await self.cache.initialize()  # 既存ログ復元 + 書き込み worker 起動
         await self.rag.initialize()  # 既存 RAG 記憶を復元 + 書き込み worker 起動
+        # F4 起動時 catch-up: watermark を永続 RAG の最新 timestamp から復元し、
+        # それより新しい復元会話（前回 feedback 途中で落ちた tail）を1回取り戻す。
+        self.prediction.watermark = self.rag.latest_timestamp()
+        self.feedback_worker.start()
+        if self.cache.turns_since(self.prediction.watermark):
+            self.feedback_worker.trigger()
         await self.warmup()
         self._tasks.append(asyncio.create_task(self.audio.play_worker()))
         self._tasks.append(asyncio.create_task(self.runner.run()))
@@ -86,6 +100,12 @@ class VoiceLoop:
 
     async def stop(self) -> None:
         self.input.stop()
+        # feedback worker を先に drain/停止（進行中 add_chunk を rag.shutdown 前に flush 機会を与える。
+        # 未完分は watermark 未前進なので次回起動の catch-up が回収＝記憶喪失を作らない）。
+        try:
+            await self.feedback_worker.stop()
+        except Exception:
+            pass
         for t in self._tasks:
             t.cancel()
         try:

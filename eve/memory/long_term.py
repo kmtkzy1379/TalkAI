@@ -128,6 +128,19 @@ class RagStore:
     async def warmup(self) -> None:
         await self._embedder.warmup()
 
+    def latest_timestamp(self) -> Optional[str]:
+        """保持中チャンクの最大 timestamp(iso)。None=チャンク無し。
+
+        FeedbackLLM の **watermark 起動復元**用（前回セッションで feedback 済みの会話位置を
+        永続 RAG の timestamp から復元し、それより新しい復元会話を起動時 catch-up する）。
+        """
+        best: Optional[str] = None
+        for r in self._chunks:
+            ts = r.get("timestamp")
+            if isinstance(ts, str) and (best is None or ts > best):
+                best = ts
+        return best
+
     # --- 書き込み ---------------------------------------------------------
 
     async def add_chunk(

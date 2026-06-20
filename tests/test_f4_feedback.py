@@ -443,6 +443,50 @@ async def t_orch_trigger_only_on_normal_completion() -> bool:
     return normal_ok and n["c"] == 1  # barge-in（CancelledError）はトリガしない
 
 
+# ========== B7 起動 catch-up / shutdown 回収 ==========
+async def t_startup_catchup() -> bool:
+    """前回 feedback 途中で落ちた tail を起動時に取り戻す（記憶喪失なし）。"""
+    cache = _cache()
+    store = _store()
+    # 前回までの feedback チャンク（古い timestamp = watermark の元）
+    await store.add_chunk(
+        text="要約: 古い話", summary="古い", search_text="夏",
+        timestamp="2020-01-01T00:00:00+00:00",
+    )
+    # 復元会話: watermark(2020) より新しい未 feedback の tail
+    cache.add_turn("user", "未処理の話題")
+    cache.add_turn("eve", "そうだね")
+    fb = FeedbackLLM(_reg_const("summary: 取り戻し\ntags: 夏"), rag_store=store, prediction_state=PredictionState())
+    worker = FeedbackWorker(fb, cache)
+    # 起動 catch-up 相当: watermark を RAG の最新 timestamp から復元 → 未処理あれば trigger
+    fb.state.watermark = store.latest_timestamp()
+    worker.start()
+    if cache.turns_since(fb.state.watermark):
+        worker.trigger()
+    await asyncio.sleep(0.05)
+    await worker.stop()
+    advanced = fb.state.watermark != "2020-01-01T00:00:00+00:00"
+    return advanced and cache.turns_since(fb.state.watermark) == [] and len(store) == 2
+
+
+async def t_shutdown_recovery() -> bool:
+    """進行中 feedback を stop で中断 → watermark 未前進 → 次回 catch-up 対象（喪失しない）。"""
+    cache = _cache()
+    store = _store()
+    gate = asyncio.Event()  # 解放しない → run は保持され stop で cancel される
+    fb = FeedbackLLM(ModelRegistry(completion_fn=GatedFake(gate=gate)), rag_store=store, prediction_state=PredictionState())
+    worker = FeedbackWorker(fb, cache)
+    worker.start()
+    cache.add_turn("user", "x")
+    cache.add_turn("eve", "y")
+    worker.trigger()
+    await asyncio.sleep(0.02)  # run に入り gate で保持
+    await worker.stop(drain_timeout=0.05)  # drain 期限切れ → cancel
+    leftover = cache.turns_since(fb.state.watermark)
+    # 未完なので watermark 未前進・チャンク未保存・未処理が残る＝次回 catch-up で回収可能
+    return fb.state.watermark is None and len(leftover) == 2 and len(store) == 0
+
+
 async def main() -> None:
     # B1
     check("B1 PredictionState 既定値", t_predstate_defaults())
@@ -471,6 +515,9 @@ async def main() -> None:
     check("B6 last_feedback を文脈注入", await t_orch_injects_last_feedback())
     check("B6 注入タイミング(build 時点を読む)", await t_orch_injection_timing())
     check("B6 トリガは正常完了のみ(barge-in しない)", await t_orch_trigger_only_on_normal_completion())
+    # B7
+    check("B7 起動 catch-up(未処理 tail を取り戻す)", await t_startup_catchup())
+    check("B7 shutdown 中断は watermark 未前進で回収可能", await t_shutdown_recovery())
 
 
 if __name__ == "__main__":
