@@ -177,17 +177,75 @@ litellm 等で provider 差を吸収。`feedback_llm.py` の3段 fallback と ca
 
 ---
 
-## 9. スレッド/プロセスモデル（B 提案・v1 から継承）
+## 9. スレッド/プロセスモデル（loop 単一所有を正とする・将来契約／P2 裁定 a・2026-06-21）
 
-| 実行単位 | 役割 |
+> **核不変条件**: 共有状態は **loop 所有・単一書込者・同期読み・ロックなし**。
+> StimulusQueue / AudioPlayQueue(seq+generation 権威) / ConversationCache / RagStore /
+> （F4〜）PredictionState・（F5〜）SurpriseBus はすべて asyncio loop が唯一の書込者。
+> 永続化など I/O のみ background worker に逃がす（state は触らず値を返すだけ）。
+> 旧 `AudioPlayQueue.set_loop`+cross-thread `interrupt` 分岐は**削除済**（呼び出し0の死にコード）。
+
+### 9.1 実行単位の分類（4種）
+
+| 分類 | 定義 | 例 |
+|---|---|---|
+| **(i) 単一 asyncio loop** | パイプライン本体。共有状態を所有・書込・読込 | StimulusQueue / Orchestrator / AudioPlayQueue / SurpriseBus / 全サイドカー(F4 FeedbackLLM・F5 発話判定・VLM 推論/統合・task executor・search・screen-op の制御部) / VAD 推論(現状) |
+| **(ii) executor offload** | ブロッキング呼び出しを `run_in_executor`/`asyncio.to_thread` で逃がす。**loop 所有状態に一切触れず、値を返すだけ**。返り値は await したコルーチンが loop 上で適用する | mic read / file I/O(cache・long_term) / embeddings(ruri/openai) / STT(openai/groq) / TTS 再生 / VLM capture(mss) / search fetch / screen-op argv 実行 |
+| **(iii) 真の OS スレッド** | 連続リアルタイム capture が強制する時のみ生成。**loop 所有状態を直接 mutate 禁止**。§9.3 の橋渡し契約で loop に渡す | （現状ゼロ）将来候補=VLM 連続 capture(N fps)・audio callback(PortAudio thread) |
+| **(iv) 別プロセス** | 完全分離・IPC なし | `vts.py`(VTube Studio 制御) |
+
+UI(Tkinter) は別途メインスレッド。widget 更新は `root.after(0, fn)`、UI→loop は `run_coroutine_threadsafe`。
+
+### 9.2 将来プロデューサの分類（既定=async-task+executor、真スレッドは最後の手段）
+
+| プロデューサ | 分類 | 根拠 |
+|---|---|---|
+| FeedbackLLM(F4) / 発話判定(F5) / VLM 推論×3+統合 / task executor / search / screen-op | (i) loop サイドカー（§9.4） | いずれも awaitable。新 OS スレッド不要。ブロッキング部分のみ (ii) へ |
+| VLM capture | (ii) 既定 / (iii) 連続撮影時のみ | 単発トリガは `to_thread`。N fps 連続が実測で必要なら capture スレッド(iii)へ昇格 |
+| audio callback(将来) | (iii) | PortAudio が own thread で callback→唯一の本物の cross-thread。§9.3 の最初の実利用者 |
+| VAD 推論 | (i) ループ上同期（**現状維持**） | 軽量(Silero・数ms)。executor 化は audio callback API 移行時にまとめて（先回りしない） |
+
+**真の OS スレッドを足してよいのは「連続リアルタイム capture が他の手段で成立しない」と実測で示せた時だけ。**
+推測で先回りスレッドを作らない（v1 の VLM 3スレッド肥大の再発防止）。
+
+### 9.3 橋渡し契約（OS スレッド → loop）
+
+不変条件:
+> **OS スレッドは loop 所有状態（StimulusQueue / AudioPlayQueue / PredictionState / SurpriseBus / caches）を直接 mutate しない。** 必ず下記3手段のいずれかで loop に渡す。
+
+| 手段 | API | 用途 |
+|---|---|---|
+| **1. fire-and-forget の state poke** | `loop.call_soon_threadsafe(fn)` | 戻り値不要の即時通知（barge-in の世代+1 等） |
+| **2. awaitable work の実行** | `asyncio.run_coroutine_threadsafe(coro, loop)` | 結果が要る稀ケースのみ。基本使わない |
+| **3. データ受け渡し（既定・推奨）** | thread-safe queue に push → loop task が `await q.get()` で drain | 連続データ(capture frame / audio chunk)はこれ |
+
+**barge-in の原則的置換**（削除した `set_loop`+cross-thread `interrupt` の正しい後継）:
+将来 audio が callback ベース(PortAudio thread)に移っても、callback スレッドは **生 PCM を queue に push するだけ**（手段3）。VAD 終端判定・STT enqueue・barge-in 判断（再生中 AND ユーザ発話 → `bump_generation`）は**すべて loop 上の drain task** が行う。即時停止が要るなら手段1で `call_soon_threadsafe(bump_generation)`。
+**スレッドが `bump_generation` / queue.put を直接呼ぶ設計は禁止**（= 削除した旧 cross-thread 分岐。スレッド安全性をスレッド側で再獲得しようとせず、loop に集約して獲得する）。
+
+### 9.4 サイドカー契約（FeedbackLLM=F4 を一般化・VLM/search/task が従う）
+
+応答クリティカルパス外で loop 所有状態を更新する非同期 worker の共通形。
+
+| 要素 | 規則 |
 |---|---|
-| メインスレッド | Tkinter UI。widget 更新は `root.after(0, fn)` 経由のみ |
-| asyncio loop スレッド | パイプライン本体(StimulusQueue/Orchestrator/各キュー)。UI→loop は `run_coroutine_threadsafe` |
-| VLM ワーカースレッド群 | capture / 推論 / 統合 |
-| 音声 I/O スレッド | mic 取り込み / 再生 |
-| **別プロセス** `vts.py` | VTube Studio 制御（自己完結・IPCなし） |
+| **単一書込** | loop 所有状態(PredictionState/SurpriseBus/RAG)はサイドカー worker からのみ書く → ロック不要 |
+| **single-flight** | worker は同時1件（per-turn `create_task` 禁止）。前job 進行中の新着はトリガで待つ |
+| **off-critical-path トリガ** | 起動側は dirty フラグ + `asyncio.Event.set()` のみ（O(1)・非ブロッキング）。bounded queue の `await put` 禁止（満杯で応答経路がブロック） |
+| **背圧2方式** | ①**latest-wins**（lossy・最新のみ重要な VLM screen-diff 等）／②**watermark/span-coverage**（no-skip・蓄積が必要な FeedbackLLM 等＝未処理を作らない・起動時 catch-up・記憶喪失を防ぐ） |
+| **lifecycle** | `VoiceLoop.run` で `create_task` 起動 / `stop` で進行中を drain → cancel。state 前進は永続化成功時のみ（落ちても次回 catch-up が回収） |
+| **off-critical-path** | 応答 stream / TTS / 再生を絶対ブロックしない。失敗は logger + no-op フォールバック（落とさない） |
 
-**PredictionState/SurpriseBus は loop 所有の単一更新者**（ロック不要、同期読み）。これが FEP 死蔵(v1)の構造的治療。
+実装 precedent: `ConversationCache._write_worker` / `RagStore._write_worker`（loop 所有 background task を queue で駆動する既存形）。サイドカーはこれに **トリガ + 背圧方式 + state 単一書込** を足したもの。
+
+### 9.5 真スレッド昇格条件（チェックリスト）
+
+新 OS スレッドを足す前に全部 Yes を確認:
+1. その仕事は **連続・リアルタイム capture**（撮影/録音の定常ストリーム）か？
+2. `to_thread`/`run_in_executor`(単発 offload) では**フレーム落ち/レイテンシが実測で不足**するか？
+3. スレッドは **生データを queue に push するだけ**で、loop 所有状態に触れないか？（§9.3 手段3）
+4. lifecycle（start/stop・drain・例外時の安全停止）を VoiceLoop が所有できるか？
+いずれか No → サイドカー(i)+executor(ii) で実装する。
 
 ---
 

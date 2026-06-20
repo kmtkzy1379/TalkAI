@@ -36,11 +36,7 @@
   feedback 実装時は `add_chunk(text=<完全版>, summary=<要約>, topic_tags=..., emotions=...)` を呼ぶだけ（土台実装済）。
 
 ## 監査で見つかった未対応問題（新セッションで優先度順に）
-- **[P2] スレッドモデル未決**: `AudioPlayQueue.set_loop` / cross-thread `interrupt` は**未配線**（grep で呼び出し 0）。
-  VAD 推論(`audio_input.py:120`)もループ上で同期実行（Silero は軽量だが本来 executor 送りが綺麗）。
-  現状は全てループ上なので**壊れていない**が、将来 VAD を別スレッド化すると thread-safe path が無く壊れる。
-  → 決める: (a) 単一ループを正として cross-thread コードを削除し docstring を正直に、(b) VAD 別スレッド化＋
-  `set_loop`+`run_coroutine_threadsafe` を配線。**今のうちにどちらかへ寄せる**。
+- **[P2 RESOLVED 2026-06-21] スレッドモデル裁定 = (a) 採用**: 単一ループを正とし `AudioPlayQueue.set_loop`/`_loop`/cross-thread `interrupt` 分岐（呼び出し0の死にコード）を**削除済**。`interrupt()` は `bump_generation()` の薄いラッパに簡素化（ループ上前提を docstring 明記）。将来の OS スレッド（VLM 連続 capture／audio callback）は **`PIPELINE_DESIGN.md §9` の橋渡し契約 + サイドカー契約**経由（OS スレッドは loop 所有 state を直接 mutate 禁止）。VAD 推論はループ上同期を**据え置き**（軽量・壊れていない／別スレッド化は audio callback API 移行時にまとめて＝§9.3 の最初の利用者）。回帰ガード: `tests/test_f1_pipeline.py`。
 - **[P2] `StreamFn` 型が2箇所で不整合**（`model_registry.py` vs `response/orchestrator.py`）。VoiceLoop の adapter で
   実害は出ていないが統一推奨（監査 AUDIT C3）。
 - **[P2] `handle()` の `await audio.join()`** は play_worker 稼働が前提。停止順序/将来 refactor で hang しうる。
