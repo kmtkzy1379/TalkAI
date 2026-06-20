@@ -161,6 +161,22 @@ async def t3_midsentence_stop() -> bool:
     return 0 < len(chunks) < 100  # 全チャンクは鳴らない＝途中で停止した
 
 
+# ---------- P2 単一ループ所有（cross-thread 機構削除の回帰ガード）----------
+def t_p2_single_loop_only() -> bool:
+    """P2 裁定(a): AudioPlayQueue から cross-thread 機構を削除済み。
+
+    set_loop/_loop を持たず、interrupt() は世代を進めるだけ（ループ上前提）。
+    将来 OS スレッドからの barge-in は §9.3 橋渡し契約経由（直接呼ばない）。
+    """
+    audio = AudioPlayQueue()
+    no_set_loop = not hasattr(audio, "set_loop")
+    no_loop_attr = not hasattr(audio, "_loop")
+    g0 = audio.current_generation()
+    audio.interrupt()  # 同期文脈から呼んでも bump_generation するだけ＝安全
+    bumped = audio.current_generation() == g0 + 1
+    return no_set_loop and no_loop_attr and bumped
+
+
 # ---------- T7 E2E パイプライン破綻なし ----------
 async def t7_e2e() -> dict:
     played, play_fn = _recorder()
@@ -213,6 +229,8 @@ async def main() -> None:
     check("T3 seq 順再生", await t3_seq_order())
     check("T3 世代で古い音声を破棄", await t3_generation_drop())
     check("T3 barge-inで文の途中でも停止", await t3_midsentence_stop())
+
+    check("P2 単一ループ所有(set_loop/_loop 削除・interrupt は世代+1)", t_p2_single_loop_only())
 
     r = await t7_e2e()
     check("T7 例外なし", r["raised"] is None)

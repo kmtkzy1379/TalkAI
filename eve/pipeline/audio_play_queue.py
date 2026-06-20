@@ -56,11 +56,6 @@ class AudioPlayQueue:
         self._next_seq = 0  # 現 generation で次に再生すべき seq
         self._buffer: dict[int, _Item] = {}  # 順不同で来た seq の待避（現 generation 分）
         self._reserve: dict[int, int] = {}  # generation -> 次に予約する seq
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
-
-    def set_loop(self, loop: asyncio.AbstractEventLoop) -> None:
-        """別スレッド（VAD/STT スレッド等）からの barge-in 用にメインループを渡す。"""
-        self._loop = loop
 
     def current_generation(self) -> int:
         return self._generation
@@ -92,21 +87,14 @@ class AudioPlayQueue:
         return self._generation
 
     def interrupt(self) -> None:
-        """どのスレッドからでも安全に barge-in（世代を進める）。
+        """barge-in（世代を進める）。**asyncio ループ上から呼ぶ前提**。
 
+        単一ループ所有を正とする（P2 裁定 a）。将来 OS スレッドから割り込むときは
+        スレッド側で直接呼ばず、PIPELINE_DESIGN.md §9.3 の橋渡し契約
+        （call_soon_threadsafe / queue→loop drain）経由にすること。
         generation モデルなので完了待ち Event やタイマーリセットは不要（v1 比の簡素化）。
         """
-        if self._loop is not None and self._loop.is_running():
-            try:
-                running: Optional[asyncio.AbstractEventLoop] = asyncio.get_running_loop()
-            except RuntimeError:
-                running = None
-            if running is self._loop:
-                self.bump_generation()
-            else:
-                self._loop.call_soon_threadsafe(self.bump_generation)
-        else:
-            self.bump_generation()
+        self.bump_generation()
 
     def enqueue(
         self,
