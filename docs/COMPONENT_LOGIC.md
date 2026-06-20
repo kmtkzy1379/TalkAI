@@ -57,10 +57,12 @@
 
 ---
 
-## G. FeedbackLLM（内分泌系・遅延許容・非同期）【確定】
-- **挙動**: 各応答後に非同期起動。出力 = emotion / summary / user-emotion推定 / next-prediction / **prediction-diff(0-100)**。沈黙時は話題提案。応答クリティカルパスに乗らない。
-- **関わり**: SurpriseBus(diff を書込) / RAG(summary を1チャンク=FB1+応答1 で保存) / ContextAssembler(直近feedback1)。
-- **PORT**: v1 `feedback_llm.py` の3段fallback/cache_control を ModelRegistry に一般化（gpt-4o ハードコード/anthropic既定は撤去）。
+## G. FeedbackLLM（内分泌系・遅延許容・非同期）【実装済 2026-06-21・F4】
+- **実装**: `eve/feedback/`（`prediction_state.py` / `parser.py` / `prompts.py` / `feedback_llm.py` / `worker.py`）。各応答後に `FeedbackWorker`（single-flight サイドカー）が非同期起動。出力 = summary / emotion / user-emotion / next-prediction / **prediction-diff(0-100)** / reason / tags。応答クリティカルパスに乗らない（トリガは O(1)・worker は別タスク）。
+- **watermark/span 方式（ユーザ裁定）**: 入力は「前回フィードバック地点〜最新」のスパンを必ずカバー＝**未フィードバックの会話＝記憶喪失を作らない**。watermark は RAG 書込成功時のみ前進・起動時 catch-up・shutdown 未完は未前進で次回回収。
+- **関わり**: `PredictionState`(diff=surprise をメソッド API で書込・単一書込) / RAG(`add_chunk` で 1チャンク=FB1+応答1・圧縮埋め込み/展開注入) / ContextAssembler(`last_feedback` を build 時に同期読み)。
+- **F5 へ繰越**: 沈黙時の話題提案は発話判定LLM側へ。多生産者 `SurpriseBus`(FB diff + VLM screen-diff) は F5（F4 は単一生産者 `PredictionState`・surprise はメソッド API なので2生産者化で呼出側不変）。
+- **PORT 方針の実際**: v1 `feedback_llm.py` の3段 fallback は**採用せず**（lean・サイドカーは失敗を no-op で許容し次 run で回復）。cache_control も現状不要。モデルは ModelRegistry role="feedback"（gpt-4o ハードコード/anthropic 既定は持ち込まない）。出力は JSON でなく**タグ付きテキスト**（小モデルの部分出力に頑健・parser は raise しない）。
 
 ---
 

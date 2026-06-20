@@ -4,10 +4,11 @@
 > **食い違いはコードが正。** 本書は 4 エージェント並列監査＋一次ソース（実コード行）確認で作成。
 
 ## 現在地
-- ブランチ: `feat/f3.5-long-term-rag`（main 未マージ）。
-- 実装済（実装順）: **F0 基盤 / F1 2キュー骨格 / F2 応答背骨 / F2.5 声ループ / F3 短期記憶 / F3.5 長期RAG（連想想起）**。
-- 未実装: FeedbackLLM / SurpriseBus・中核原理(surprise) / 発話判定(沈黙nudge) / VLM / Call-Function(task/search/screen-op) / YouTube / UI / 配線層PORT(vts/run/launcher/app)。
-- テスト: **Tier-1 9ファイル 94件 2回連続 PASS**（API不要・決定論）。flaky なし。
+- ブランチ: `feat/f4-feedback`（`feat/f3.5-long-term-rag` から分岐・main 未マージ）。
+- 実装済（実装順）: **F0 基盤 / F1 2キュー骨格 / F2 応答背骨 / F2.5 声ループ / F3 短期記憶 / F3.5 長期RAG（連想想起） / P2 スレッド掃除（裁定a）/ F4 FeedbackLLM**。
+- 未実装: SurpriseBus(多生産者集約) / 発話判定(沈黙nudge・should_speak ゲート + T2 death-detection) / VLM / Call-Function(task/search/screen-op) / YouTube / UI / 配線層PORT(vts/run/launcher/app)。
+  - **F5 へ明示的に繰り越した F4 隣接項目**: 多生産者 `SurpriseBus`（FB の prediction-diff + VLM の screen-diff 集約・F4 は単一生産者の `PredictionState` のみ）/ `should_speak` ゲートと**完全な T2 death-detection**（F4 は「surprise 反応性」で非装飾性を担保）/ 「barge-in 自体を予測誤差として surprise に載せる」（レッドチーム MAJOR 4・F5 の SurpriseBus 入力）。
+- テスト: **Tier-1 10ファイル 122件 2回連続 PASS**（API不要・決定論）。flaky なし。F4 は `tests/test_f4_feedback.py`（23件）。
 - venv は v1 のものを流用: `C:\Users\tester\Desktop\portfolio8-VLM-AI\venv`（`sentence-transformers` 導入済＝Ruri 用）。
 
 ## 実行コマンド
@@ -63,10 +64,10 @@
   - **ソフト AEC は不採用**（イヤホン前提＋常時リッスンで物理解決）。
   - RAG 件数 **300 → 500**、注入 **5 → 6 ターン**（≈3往復）、`RAG_MAX_CHUNKS`/`RECENT_TURN_COUNT`。
   - 埋め込みは **ModelRegistry role でなく `make_embedder`**。`summarize` role は追加済（実装先行）。
-- **中核原理(surprise/SurpriseBus/should_speak) は未実装**。FeedbackLLM 未実装 → RAG は**仮データ運用**中。
+- **F4 実装済**（2026-06-21）: FeedbackLLM が各応答後に非同期で {要約/感情/ユーザ感情/次予測/予測差(0-100)/理由/タグ} を生成し、RAG へ `add_chunk`（圧縮埋め込み/展開注入）+ `PredictionState` へ surprise + 直近フィードバック注入。**SurpriseBus 多生産者集約 / should_speak / 完全 T2 は F5**。RAG は実 feedback 運用へ（仮データ運用は終了）。
+  - F4 設計の要点: `eve/feedback/`（PredictionState=loop 所有・単一書込・surprise はメソッド API で F5 の VLM 第2生産者化に耐える / parser=タグ付きテキスト・raise しない / FeedbackWorker=single-flight + **watermark/span**）。**watermark 方式で「フィードバックしてない会話＝記憶喪失」を作らない**（前回 feedback 地点〜最新を必ずカバー・起動時 catch-up・shutdown 未完は watermark 未前進で回収）。サイドカー契約は `PIPELINE_DESIGN.md §9.4`。
 
 ## 次の実装候補（自然な順）
-1. **FeedbackLLM**: 各応答後に非同期で {要約 / 感情 / 次予測 / 予測差 / 理由 / タグ} を生成。
-   → RAG へ `add_chunk` で書込（土台あり）／中核原理の **surprise(prediction_diff)** を供給。
-2. SurpriseBus + 発話判定LLM（沈黙 nudge・random RAG=話題の種に `rag.random(2)` を供給）。
-3. VLM（capture→Gemini×3→統合）／ Call-Function（task/search/screen-op）／ YouTube ／ UI ／ 配線層 PORT。
+1. **SurpriseBus + 発話判定LLM(should_speak)**: F4 の `PredictionState.surprise` を per-source 化（FB + VLM screen-diff の集約）し、沈黙 nudge を surprise 必須引数でゲート。**完全な T2 death-detection（surprise 反転で should_speak 反転）をここで追加**。random RAG=話題の種に `rag.random(2)` を供給。
+2. VLM（capture→Gemini×3→統合・screen-diff を SurpriseBus へ）／ Call-Function（task/search/screen-op）／ YouTube ／ UI ／ 配線層 PORT。
+   - いずれも `PIPELINE_DESIGN.md §9.2-9.4` のサイドカー契約（single-flight + 背圧 latest-wins/watermark）と橋渡し契約に従う。VLM 連続 capture が真スレッド昇格の最初の候補（§9.5）。

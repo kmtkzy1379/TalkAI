@@ -2,7 +2,7 @@
 
 > **⚠ 実装で更新された点 (2026-06-20・コードが正)**: STT は **partial 投機を採用せず** VAD区間→gpt-4o-transcribe(final)。
 > **ソフト AEC は不採用**（イヤホン前提＋常時リッスン）。RAG は **500件・直近6ターン**（本文の 300件/5ターンは旧値）。
-> 埋め込みは ModelRegistry role でなく **make_embedder(ruri|openai)**。surprise/SurpriseBus/FeedbackLLM/VLM/UI は**未実装**。
+> 埋め込みは ModelRegistry role でなく **make_embedder(ruri|openai)**。**FeedbackLLM と surprise 生産者 `PredictionState` は実装済(F4)**。多生産者 `SurpriseBus`/`should_speak`/VLM/UI は**未実装**。
 > 実装状況・未対応問題・最新仕様は `docs/HANDOFF.md` 参照。
 
 > 本書は新企画書を契約として、**統合パイプラインの骨格**を定義する（実装ステップ②）。
