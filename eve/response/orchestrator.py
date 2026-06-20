@@ -22,6 +22,7 @@ from .splitter import JapaneseSentenceSplitter
 from .style import SPEECH_STYLE, sanitize_for_speech
 
 if TYPE_CHECKING:  # 実行時の循環 import を避ける（型注釈のみ）
+    from ..feedback.prediction_state import PredictionState
     from ..memory.conversation_cache import ConversationCache
     from ..memory.long_term import RagStore
 
@@ -41,6 +42,8 @@ class ResponseOrchestrator:
         tts_concurrency: int = 3,
         conversation_cache: Optional["ConversationCache"] = None,
         rag_store: Optional["RagStore"] = None,
+        prediction_state: Optional["PredictionState"] = None,
+        on_response_complete: Optional[Callable[[], None]] = None,
     ) -> None:
         self._audio = audio
         self._stream_fn = stream_fn
@@ -51,6 +54,10 @@ class ResponseOrchestrator:
         self._cache = conversation_cache
         # 任意注入: 長期記憶(連想RAG)。None なら使わない。
         self._rag = rag_store
+        # 任意注入(F4): 直近フィードバックの同期読み元（last_feedback を文脈へ注入）。
+        self._state = prediction_state
+        # 任意注入(F4): 正常完了時に feedback worker を起こすトリガ（O(1)・非ブロッキング）。
+        self._on_complete = on_response_complete
         self.last_response = ""  # 生成済み全文（自然さの目視・テスト用。記憶には使わない＝C5）
 
     def _build_messages(
@@ -59,16 +66,27 @@ class ResponseOrchestrator:
         recent_turns: Optional[list[Turn]] = None,
         rag_chunks: Optional[list[RagChunk]] = None,
     ) -> list[dict]:
+        last_feedback = self._state.last_feedback if self._state is not None else None
         ctx = self._ctx.assemble(
             user_text=str(stimulus.payload),
             recent_turns=recent_turns,
             rag_chunks=rag_chunks,
+            last_feedback=last_feedback,
         )
         messages: list[dict] = []
         if ctx.system:
             messages.append({"role": "system", "content": ctx.system})
         messages.append({"role": "user", "content": ctx.render()})
         return messages
+
+    def _notify_complete(self) -> None:
+        """正常完了時に feedback worker を起こす（O(1)・例外は握りつぶす）。"""
+        if self._on_complete is None:
+            return
+        try:
+            self._on_complete()
+        except Exception:
+            logger.exception("feedback トリガで例外（無視して継続）")
 
     async def handle(self, stimulus: Stimulus) -> None:
         gen = self._audio.current_generation()
@@ -148,6 +166,9 @@ class ResponseOrchestrator:
                 # 現ターンの音声が再生し切るまで待ってから「実発話」を記録（C5）。
                 await self._audio.join()
                 _record_eve()
+            # F4: 正常完了時のみ feedback をトリガ（barge-in=CancelledError 経路では呼ばない）。
+            # 直近の eve ターンが記録された後なので、worker のスパンに今回応答が含まれる。
+            self._notify_complete()
         except asyncio.CancelledError:
             # barge-in: ここまでに**実際に喋った分だけ**を記憶に記録（生成途中の文は残さない）。
             _record_eve()

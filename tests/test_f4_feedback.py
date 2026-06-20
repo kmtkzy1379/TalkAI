@@ -29,6 +29,12 @@ from eve.feedback.prompts import build_messages, build_user_text  # noqa: E402
 from eve.memory import ConversationCache, RagStore  # noqa: E402
 from eve.memory.embed import Embedder  # noqa: E402
 from eve.model_registry import ModelRegistry  # noqa: E402
+from eve.pipeline import AudioPlayQueue, Stimulus, StimulusKind  # noqa: E402
+from eve.response import ResponseOrchestrator  # noqa: E402
+
+
+async def _noop_play(audio) -> None:
+    pass
 
 _tmpdir = tempfile.mkdtemp(prefix="eve_f4_")
 _counter = 0
@@ -365,6 +371,78 @@ async def t_worker_surprise_not_frozen() -> bool:
     return len(set(seen)) > 1 and fb.state.watermark is not None  # 凍結しない
 
 
+# ========== B6 orchestrator 配線 ==========
+async def _tts_fn(s: str) -> bytes:
+    return b"x"
+
+
+async def t_orch_injects_last_feedback() -> bool:
+    captured: dict = {}
+
+    async def stream_fn(messages):
+        captured["m"] = messages
+        yield "はい。"
+
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    state = PredictionState()
+    state.last_feedback = "前回は天気の話で盛り上がった（予測差35 / 楽しさ）"
+    orch = ResponseOrchestrator(audio, stream_fn, _tts_fn, prediction_state=state)
+    await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "やあ"))
+    user_msg = captured["m"][-1]["content"]
+    return "# 直近フィードバック" in user_msg and "前回は天気の話" in user_msg
+
+
+async def t_orch_injection_timing() -> bool:
+    """feedback が build 前に完了していれば今の応答に、なければ次の応答に載る。"""
+    seen: list[str] = []
+
+    async def stream_fn(messages):
+        seen.append(messages[-1]["content"])
+        yield "ok。"
+
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    state = PredictionState()
+    orch = ResponseOrchestrator(audio, stream_fn, _tts_fn, prediction_state=state)
+    await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "1"))  # feedback まだ無い
+    state.last_feedback = "新フィードバック"  # ターン間で feedback が完了したと仮定
+    await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "2"))
+    return "# 直近フィードバック" not in seen[0] and "新フィードバック" in seen[1]
+
+
+async def t_orch_trigger_only_on_normal_completion() -> bool:
+    n = {"c": 0}
+
+    def on_complete() -> None:
+        n["c"] += 1
+
+    audio = AudioPlayQueue(play_fn=_noop_play)
+
+    async def quick_stream(messages):
+        yield "はい。"
+
+    orch = ResponseOrchestrator(audio, quick_stream, _tts_fn, on_response_complete=on_complete)
+    await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "hi"))
+    normal_ok = n["c"] == 1
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_stream(messages):
+        started.set()
+        await release.wait()
+        yield "x。"
+
+    orch2 = ResponseOrchestrator(audio, slow_stream, _tts_fn, on_response_complete=on_complete)
+    task = asyncio.create_task(orch2.handle(Stimulus(StimulusKind.USER_UTTERANCE, "hey")))
+    await started.wait()
+    task.cancel()  # barge-in
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    return normal_ok and n["c"] == 1  # barge-in（CancelledError）はトリガしない
+
+
 async def main() -> None:
     # B1
     check("B1 PredictionState 既定値", t_predstate_defaults())
@@ -389,6 +467,10 @@ async def main() -> None:
     check("B5 single-flight(同時実行=1)", await t_worker_single_flight())
     check("B5 no-skip(span カバー・記憶喪失なし)", await t_worker_no_skip())
     check("B5 surprise 凍結しない", await t_worker_surprise_not_frozen())
+    # B6
+    check("B6 last_feedback を文脈注入", await t_orch_injects_last_feedback())
+    check("B6 注入タイミング(build 時点を読む)", await t_orch_injection_timing())
+    check("B6 トリガは正常完了のみ(barge-in しない)", await t_orch_trigger_only_on_normal_completion())
 
 
 if __name__ == "__main__":
