@@ -36,6 +36,10 @@ try:
     check("VoiceLoop 構築成功(遅延importのみ)", True)
     check("orchestrator に短期記憶を配線", vl.orchestrator._cache is vl.cache)
     check("orchestrator に長期記憶(RAG)を配線", vl.orchestrator._rag is vl.rag)
+    # 応答プロンプト leak 修正: system プロンプトが空でなく SPEECH_STYLE を含む（"システム応答" leak 防止）
+    from eve.response.style import SPEECH_STYLE as _SS  # noqa: E402
+    check("orchestrator の system プロンプトが非空", bool(vl.orchestrator._ctx.system_prompt))
+    check("orchestrator の system が SPEECH_STYLE", vl.orchestrator._ctx.system_prompt == _SS)
     # F4: 内分泌系（PredictionState / FeedbackLLM / FeedbackWorker）の配線
     check("orchestrator に PredictionState を配線", vl.orchestrator._state is vl.prediction)
     check("orchestrator 完了トリガ=feedback worker.trigger", vl.orchestrator._on_complete == vl.feedback_worker.trigger)

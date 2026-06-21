@@ -22,6 +22,7 @@ from .pipeline.stimulus_queue import StimulusQueue
 from .response.input_source import MicSttInputSource
 from .response.orchestrator import ResponseOrchestrator
 from .response.player import RealAudioPlayer
+from .response.style import SPEECH_STYLE
 from .response.tts import VoicevoxTTS
 from .stt import make_stt
 
@@ -49,7 +50,11 @@ class VoiceLoop:
                 yield delta
 
         self.orchestrator = ResponseOrchestrator(
-            self.audio, stream_fn, self.tts.generate, ContextAssembler(),
+            # system プロンプト= SPEECH_STYLE（最小スタイル指示・ペルソナではない）。
+            # 空 ContextAssembler() を渡すと system 無しで応答が "システム応答…" と自己ラベル化する
+            # leak が出るため、明示的に SPEECH_STYLE を与える。
+            self.audio, stream_fn, self.tts.generate,
+            ContextAssembler(system_prompt=SPEECH_STYLE),
             conversation_cache=self.cache, rag_store=self.rag,
             prediction_state=self.prediction,
             on_response_complete=self.feedback_worker.trigger,  # 正常完了で feedback を起こす
