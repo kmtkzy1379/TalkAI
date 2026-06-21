@@ -4,11 +4,12 @@
 > **食い違いはコードが正。** 本書は 4 エージェント並列監査＋一次ソース（実コード行）確認で作成。
 
 ## 現在地
-- ブランチ: `feat/f4-feedback`（`feat/f3.5-long-term-rag` から分岐・main 未マージ）。
-- 実装済（実装順）: **F0 基盤 / F1 2キュー骨格 / F2 応答背骨 / F2.5 声ループ / F3 短期記憶 / F3.5 長期RAG（連想想起） / P2 スレッド掃除（裁定a）/ F4 FeedbackLLM**。
-- 未実装: SurpriseBus(多生産者集約) / 発話判定(沈黙nudge・should_speak ゲート + T2 death-detection) / VLM / Call-Function(task/search/screen-op) / YouTube / UI / 配線層PORT(vts/run/launcher/app)。
-  - **F5 へ明示的に繰り越した F4 隣接項目**: 多生産者 `SurpriseBus`（FB の prediction-diff + VLM の screen-diff 集約・F4 は単一生産者の `PredictionState` のみ）/ `should_speak` ゲートと**完全な T2 death-detection**（F4 は「surprise 反応性」で非装飾性を担保）/ 「barge-in 自体を予測誤差として surprise に載せる」（レッドチーム MAJOR 4・F5 の SurpriseBus 入力）。
-- テスト: **Tier-1 10ファイル 122件 2回連続 PASS**（API不要・決定論）。flaky なし。F4 は `tests/test_f4_feedback.py`（23件）。
+- ブランチ: `feat/f5-speech`（`feat/f4-feedback` から分岐・main 未マージ）。
+- 実装済（実装順）: **F0 / F1 / F2 / F2.5 / F3 / F3.5 / P2 スレッド掃除 / F4 FeedbackLLM / 応答プロンプト leak 修正 / F5 発話判定(沈黙→自発発話)**。
+- 未実装: SurpriseBus(多生産者集約・VLM 時) / (b)文脈不整合の自己懐疑(タスク管理隣接) / VLM / Call-Function(task/search/screen-op) / YouTube / UI / 配線層PORT(vts/run/launcher/app)。
+  - **F5 で実装**: 5秒沈黙→`should_speak`（surprise を必須 code ゲート: HI≥強制speak / LO未満強制silence / 中間は LLM）→ True で `AUTONOMOUS_SPEECH` 刺激。**決定論 T2**（surprise 反転で speak/silence 反転＝ビルド失敗ゲート）。発話判定ログ(True/False+理由・deque10・観測専用)。**Q3 裁定: バックオフ/再挨拶抑制/沈黙カテゴリは不採用**（症状の機械抑制でなく should_speak/文脈/feedback を直す方針・5秒連続評価は意図的）。`eve/speech/{decider,monitor}.py`。
+  - **F5 へ繰越（VLM/タスク時）**: 多生産者 `SurpriseBus`（FB diff + VLM screen-diff・現状は `PredictionState.surprise` 単一生産者を直接読む）/ (b)自己懐疑（応答経路・タスク管理隣接）/ 締切近接抑制（`pending_obligation` no-op フック）。
+- テスト: **Tier-1 11ファイル 152件 2回連続 PASS**（API不要・決定論）。flaky なし。F5 は `tests/test_f5_speech.py`（24件・T2 含む）。
 - venv は v1 のものを流用: `C:\Users\tester\Desktop\portfolio8-VLM-AI\venv`（`sentence-transformers` 導入済＝Ruri 用）。
 
 ## 実行コマンド

@@ -51,9 +51,14 @@
 
 ---
 
-## F. 発話判定LLM（沈黙経路・クリティカルパス外）【確定】
-- **挙動**: 5s 沈黙で起動。入力 = "…" + 直近会話 + ランダムRAG2 + 画面認識 + **surprise**。True なら(理由+応答LLMへの入力)を返し autonomous_speech 刺激に。False なら(理由→ログのみ)で無音。VAD のターン終端とは役割分離（VAD=話し終え検出 / 沈黙タイマー=誰も話さない時間）。
-- **関わり**: SurpriseBus(読) / RAG(random) / VLM / StimulusQueue / ModelRegistry(軽量高速役)。
+## F. 発話判定LLM（沈黙経路・クリティカルパス外）【実装済 2026-06-21・F5】
+- **実装**: `eve/speech/decider.py`(should_speak/パーサ/decide_fn) + `eve/speech/monitor.py`(SpeechState/SilenceMonitor/SpeechDecider)。
+- **挙動**: **5秒沈黙**で起動（フラット5秒で連続再評価＝実世界を細かく観測）。入力 = "…" + 直近会話 + ランダムRAG2(`rag.random`=話題の種) + 画面認識(VLM後続) + **surprise**。True なら(理由+応答LLMへの入力 content)を返し `AUTONOMOUS_SPEECH` 刺激に。False なら(理由→**発話判定ログのみ**・応答LLMには入れない＝「楽な False」偏り防止)。VAD のターン終端とは役割分離（VAD=話し終え検出 / 沈黙監視=誰も話さない時間）。
+- **surprise の code ゲート（中核原理・T2）**: HI(60)≥強制 speak / LO(20)未満強制 silence / 中間は LLM 判断。固定投票でも surprise 反転で speak↔silence 反転（決定論 T2）。surprise は非 Optional。
+- **発話判定ログ**: True/False とも `{ts,speak,reason,content}` を deque(10) で記録・**処理には関与しない**（観測専用）。
+- **Q3 裁定（企画書どおり単純化）**: バックオフ/再挨拶抑制/沈黙カテゴリは**不採用**。モノローグ/再挨拶が出たら抑制で隠さず should_speak/文脈/feedback を直す。
+- **ガード（loop・OS スレッド0・ロック0）**: 応答中(`runner.is_busy()`)/ユーザ発話中(`user_speaking`)/5秒未満 では発火しない。SpeechDecider は single-flight。
+- **関わり**: `PredictionState.surprise`(読・単一生産者) / RAG(random) / StimulusQueue / ModelRegistry(role `speech_decide`)。
 
 ---
 

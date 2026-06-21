@@ -11,8 +11,8 @@ Eve v2 = AI VTuber + 画面認識(VLM) 統合のデスクトップアプリ。v1
 
 ## 実装状況（2026-06-20・コードが正）
 
-実装順に **F0 基盤 / F1 2キュー骨格 / F2 応答背骨 / F2.5 声ループ / F3 短期記憶 / F3.5 長期RAG(連想想起) / P2 スレッド掃除(裁定a) / F4 FeedbackLLM** まで完了。
-Tier-1 決定論テスト **122件が2回連続 PASS**。未実装: SurpriseBus(多生産者集約)・発話判定(沈黙nudge・should_speak ゲート+完全T2)・VLM・Call-Function・YouTube・UI・配線層PORT(vts/run/launcher/app)。**F4 で中核原理 surprise の生産者(`eve/feedback/PredictionState`)が稼働**（消費ゲート should_speak と多生産者 SurpriseBus は F5）。
+実装順に **F0 / F1 / F2 / F2.5 / F3 / F3.5 / P2 スレッド掃除(裁定a) / F4 FeedbackLLM / F5 発話判定(沈黙→自発発話)** まで完了。
+Tier-1 決定論テスト **152件が2回連続 PASS**。未実装: SurpriseBus(多生産者集約・VLM時)・(b)自己懐疑(タスク隣接)・VLM・Call-Function・YouTube・UI・配線層PORT(vts/run/launcher/app)。**中核原理 surprise は生産者(F4 `PredictionState`)+消費ゲート(F5 `should_speak`・決定論T2)が両方稼働**。多生産者 SurpriseBus は VLM(第2生産者)時に。
 - **引き継ぎ・未対応問題(P1-P3)・docs訂正は `docs/HANDOFF.md` に集約**（新セッションは最初に読む）。
 - 現状は**単一 asyncio ループ前提**（mic read=executor／VAD 推論=ループ上同期）。cross-thread 機構は **P2 裁定(a)で削除済**＝loop が全共有 state の唯一所有者。将来 OS スレッドは `PIPELINE_DESIGN.md §9.3` の橋渡し契約経由（VAD 別スレッド化＝最初の利用候補）。
 - 埋め込みは `eve/memory/embed/make_embedder(ruri|openai)`（**ModelRegistry とは別系統**・`make_stt` と同方式）。Ruri v3-310m 既定。
