@@ -34,16 +34,21 @@ class SpeechState:
         self.last_activity_mono = now_fn()
         self.last_eval_mono = now_fn()  # 最後に発話判定した時刻（フラット再評価カデンス）
         self.user_speaking = False
+        # ユーザ活動の単調カウンタ。発話判定の最中にユーザが話し始めたら（seq 変化）
+        # 自発発話を中止・破棄するために使う（ユーザ優先）。eve 活動では増やさない。
+        self.user_activity_seq = 0
         self.speech_log: deque = deque(maxlen=log_max or Config.SPEECH_LOG_MAX)
 
     # --- 活動マーク（VoiceLoop から呼ぶ）---
     def mark_user_speech_start(self) -> None:
         self.user_speaking = True
+        self.user_activity_seq += 1
         self.last_activity_mono = self._now()
 
     def mark_user_utterance(self) -> None:
         """STT 結果が届いた（発話終了）。"""
         self.user_speaking = False
+        self.user_activity_seq += 1
         self.last_activity_mono = self._now()
 
     def mark_eve_activity(self) -> None:
@@ -141,6 +146,7 @@ class SpeechDecider:
         seeds = self._rag.random(self._k) if self._rag is not None else []
         surprise = int(self._pred.surprise)  # 必須・int
         silence = self._state.silence_seconds()
+        seq0 = self._state.user_activity_seq  # 判定中にユーザが話したか検出する基準
         self._idle.clear()
         try:
             decision = await should_speak(
@@ -149,6 +155,10 @@ class SpeechDecider:
             )
         finally:
             self._idle.set()
+        # ユーザ優先: 判定中にユーザが話し始めたら自発発話を**中止・破棄**（put しない）。
+        if self._state.user_activity_seq != seq0:
+            self._state.record_decision(speak=False, reason="ユーザ発話により自発発話を中止（削除）", content="")
+            return
         # True/False とも発話判定ログに記録（観測専用・処理非関与）+ 再評価カデンス更新
         self._state.record_decision(speak=decision.speak, reason=decision.reason, content=decision.content)
         if decision.speak:

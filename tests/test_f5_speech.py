@@ -422,6 +422,44 @@ def t_eve_activity_resets_silence() -> bool:
     return due_before and (not due_after) and speaking and not_speaking
 
 
+# ===== Fix1 barge-in が自発発話を中止・削除 =====
+async def t_discard_kind() -> bool:
+    q = StimulusQueue()
+    await q.put(Stimulus(StimulusKind.USER_UTTERANCE, "u"))
+    await q.put(Stimulus(StimulusKind.AUTONOMOUS_SPEECH, AutonomousSpeech("a", "r"), merge_key="autonomous"))
+    n = q.discard_kind(StimulusKind.AUTONOMOUS_SPEECH)
+    kinds = [s.kind for s in q.snapshot()]
+    return n == 1 and StimulusKind.AUTONOMOUS_SPEECH not in kinds and StimulusKind.USER_UTTERANCE in kinds
+
+
+async def t_decider_user_preempts() -> bool:
+    """判定中にユーザが話し始めたら自発発話を中止・破棄（put しない）。"""
+    state = SpeechState()
+    cache = ConversationCache(history_file=_tmp())
+    await cache.initialize()
+    rag = _store()
+    pred = PredictionState()
+    gate = asyncio.Event()
+
+    async def gated(*, surprise, silence_seconds, recent_turns, topic_seeds):
+        await gate.wait()
+        return SpeechDecision(True, "話したい", "やあ")  # LLM は speak と判断
+
+    q = StimulusQueue()
+    dec = SpeechDecider(state=state, cache=cache, rag=rag, prediction_state=pred, queue=q, decide_fn=gated)
+    dec.start()
+    dec.trigger()
+    await asyncio.sleep(0.02)  # 判定中（gate 保持）
+    state.mark_user_speech_start()  # ← ユーザが話し始めた（user_activity_seq 変化）
+    gate.set()
+    await asyncio.sleep(0.05)
+    await dec.stop()
+    await cache.shutdown()
+    log = list(state.speech_log)
+    # 刺激は出ず、ログは中止として記録される（speak=False・理由に「中止」）
+    return q.qsize() == 0 and len(log) == 1 and log[0]["speak"] is False and "中止" in log[0]["reason"]
+
+
 async def main() -> None:
     check("T2 反転(silence 投票・surprise が唯一の要因)", await t_t2_inversion_silence_vote())
     check("T2 反転(speak 投票・対称)", await t_t2_inversion_speak_vote())
@@ -450,6 +488,9 @@ async def main() -> None:
     check("C3 decider single-flight(同時=1)", await t_decider_single_flight())
     # C4
     check("C4 Eve 発話で沈黙時計リセット + user_speaking トグル", t_eve_activity_resets_silence())
+    # Fix1
+    check("Fix1 discard_kind が自発刺激を削除", await t_discard_kind())
+    check("Fix1 判定中ユーザ発話で自発発話を中止・破棄", await t_decider_user_preempts())
 
 
 if __name__ == "__main__":

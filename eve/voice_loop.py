@@ -18,6 +18,7 @@ from .memory.embed import make_embedder
 from .model_registry import ModelRegistry
 from .pipeline.audio_play_queue import AudioPlayQueue
 from .pipeline.orchestrator import PipelineRunner
+from .pipeline.stimulus import StimulusKind
 from .pipeline.stimulus_queue import StimulusQueue
 from .response.input_source import MicSttInputSource
 from .response.orchestrator import ResponseOrchestrator
@@ -84,8 +85,10 @@ class VoiceLoop:
         """発話開始の瞬間: 音声停止＋進行中応答キャンセル（Eve が即譲る）。"""
         logger.info("⏸ 発話検知（割り込み）")
         self.audio.interrupt()
-        self.runner.interrupt()
-        self.speech_state.mark_user_speech_start()  # F5: ユーザ発話中は自発発話しない + 沈黙時計
+        self.runner.interrupt()  # 進行中応答(自発含む)を cancel＝実発話分のみ記録(C5)
+        # F5: ユーザ優先。判定中の自発発話は seq 変化で自己破棄、キュー済みの自発刺激は削除。
+        self.speech_state.mark_user_speech_start()
+        self.queue.discard_kind(StimulusKind.AUTONOMOUS_SPEECH)
 
     def _on_response_complete(self) -> None:
         """応答 正常完了: F4 feedback を起こす + F5 沈黙時計をリセット（Eve が喋った）。"""

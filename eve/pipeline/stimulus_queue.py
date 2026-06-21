@@ -87,3 +87,13 @@ class StimulusQueue:
         texts = [str(s.payload) for _, s in self._items if s.kind == StimulusKind.USER_UTTERANCE]
         self._items = [(e, s) for (e, s) in self._items if s.kind != StimulusKind.USER_UTTERANCE]
         return texts
+
+    def discard_kind(self, kind: StimulusKind) -> int:
+        """待機中の指定 kind の刺激を全削除し削除件数を返す（同期・loop 上から呼ぶ）。
+
+        barge-in でユーザが話し始めた時に未処理の AUTONOMOUS_SPEECH を消す等（ユーザ優先）。
+        await を挟まずに呼ぶ前提（atomic）。
+        """
+        before = len(self._items)
+        self._items = [(e, s) for (e, s) in self._items if s.kind != kind]
+        return before - len(self._items)
