@@ -87,7 +87,7 @@ ctx = ContextAssembler(system_prompt="SYS").assemble(
 msgs = ctx  # assemble は native ロール messages を返す
 joined = messages_to_text(msgs)
 sysmsg = msgs[0]["content"]
-check("ctx 相対時刻を注入", "3分前" in joined)
+check("ctx RAG に相対時刻接地(system)", "たった今" in sysmsg)
 check("ctx 話題の種ラベル(system)", "話題の種" in sysmsg)
 check("ctx 過去の記憶ラベル(system)", "過去の記憶" in sysmsg)
 check("ctx ユーザ発話は user ロール末尾", msgs[-1]["role"] == "user" and msgs[-1]["content"] == "今の話をしよう")

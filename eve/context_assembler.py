@@ -74,7 +74,7 @@ class ContextAssembler:
             parts.append(f"# 発話判定理由\n{speech_decision_reason}")
         return "\n\n".join(parts)
 
-    def _build_conversation(self, recent_turns, now) -> list[dict]:
+    def _build_conversation(self, recent_turns) -> list[dict]:
         """直近会話を native ロール列に。連続同 role はマージ（provider 互換）。"""
         convo: list[dict] = []
         pending_note: str | None = None
@@ -84,7 +84,9 @@ class ContextAssembler:
                 pending_note = f"（中略: ユーザー沈黙中の発話 {t.text}件を省略）"
                 continue
             role = "assistant" if t.speaker == SPEAKER_EVE else "user"
-            seg = f"（{humanize(elapsed_wall(t.stamp.iso, now.iso))}）{t.text}"
+            # ターン本文はそのまま（相対時刻の前置きは付けない＝応答LLMが「（たった今）」等を
+            # 復唱してしまう leak を防ぐ。直近会話は本来"直近"で、新旧の接地は RAG 側で行う）。
+            seg = t.text
             if pending_note:
                 seg = pending_note + "\n" + seg
                 pending_note = None
@@ -116,7 +118,7 @@ class ContextAssembler:
                 ),
             }
         ]
-        messages.extend(self._build_conversation(recent_turns, now))
+        messages.extend(self._build_conversation(recent_turns))
         if autonomous_content is not None:
             # 自発発話: ユーザ発話でなく“イブが自分から言う一言”の指示（話者取り違え防止）。
             messages.append({
