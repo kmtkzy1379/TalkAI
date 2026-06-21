@@ -144,7 +144,8 @@ class SpeechDecider:
         recent = self._cache.recent_for_injection() if self._cache is not None else []
         recent = [Turn(t.speaker, t.text, t.stamp) for t in recent if t.speaker != OMITTED_SPEAKER]
         seeds = self._rag.random(self._k) if self._rag is not None else []
-        surprise = int(self._pred.surprise)  # 必須・int
+        surprise = int(self._pred.surprise)  # 必須・int（指標として渡す）
+        last_feedback = getattr(self._pred, "last_feedback", None)  # イブの今の感情/要約
         silence = self._state.silence_seconds()
         seq0 = self._state.user_activity_seq  # 判定中にユーザが話したか検出する基準
         self._idle.clear()
@@ -152,6 +153,7 @@ class SpeechDecider:
             decision = await should_speak(
                 surprise=surprise, silence_seconds=silence,
                 recent_turns=recent, topic_seeds=seeds, decide_fn=self._decide_fn,
+                last_feedback=last_feedback,
             )
         finally:
             self._idle.set()

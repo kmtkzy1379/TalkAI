@@ -105,10 +105,8 @@ class Config:
     # ユーザ 5秒無言で発話判定LLM を回す（企画書準拠）。trigger 兼フラット再評価カデンス。
     # ＝バックオフで間隔を伸ばさず 5秒ごとに連続評価し続ける（実世界を細かく観測する意図）。
     SILENCE_THRESHOLD_SEC = float(os.getenv("SILENCE_THRESHOLD_SEC", "5.0"))
-    # surprise ゲート帯（中核原理を code で強制）。HI 以上=強制 speak / LO 未満=強制 silence。
-    # 中間(NEUTRAL=20 含む)は発話判定LLM に委ねる（長い沈黙では話題の種で能動的に振れる）。
-    SURPRISE_SPEAK_FORCE = int(os.getenv("SURPRISE_SPEAK_FORCE", "60"))
-    SURPRISE_SILENCE_FLOOR = int(os.getenv("SURPRISE_SILENCE_FLOOR", "20"))
+    # surprise は数値で発話を絶対決定しない（指標）。発話判定LLM が surprise+感情+内容を総合判断する
+    # （ユーザ裁定）。よって SURPRISE_SPEAK_FORCE/FLOOR の数値ゲートは廃止。
     # 沈黙時の「話題の種」= ランダム RAG 取得件数（search でなく random）。
     RAG_RANDOM_K = int(os.getenv("RAG_RANDOM_K", "2"))
     # 発話判定ログ（True/False とも記録・ロケット鉛筆・処理には関与しない＝観測専用）。

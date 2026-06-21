@@ -89,16 +89,17 @@ def check(name: str, cond: bool) -> None:
         print(f"FAIL {name}")
 
 
-HI = Config.SURPRISE_SPEAK_FORCE  # 60
-LO = Config.SURPRISE_SILENCE_FLOOR  # 20
-
-
-async def _fixed_silence(*, surprise, silence_seconds, recent_turns, topic_seeds):
+async def _fixed_silence(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None):
     return SpeechDecision(False, "fixed-silence", "")
 
 
-async def _fixed_speak(*, surprise, silence_seconds, recent_turns, topic_seeds):
+async def _fixed_speak(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None):
     return SpeechDecision(True, "fixed-speak", "やあ")
+
+
+async def _surprise_driven(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None):
+    # surprise を読む fake（＝surprise を加味する LLM の代理）。配線の死活検出に使う。
+    return SpeechDecision(surprise >= 50, f"surprise={surprise}", "x")
 
 
 def _reg(text: str) -> ModelRegistry:
@@ -115,18 +116,11 @@ async def _call(surprise, decide_fn, pending=False) -> SpeechDecision:
     )
 
 
-# ===== T2 death-detection =====
-async def t_t2_inversion_silence_vote() -> bool:
-    """固定 silence 投票でも、surprise を高/低に振ると speak/silence が反転（surprise が唯一の要因）。"""
-    hi = await _call(HI + 20, _fixed_silence)
-    lo = await _call(LO - 15, _fixed_silence)
-    return hi.speak is True and lo.speak is False
-
-
-async def t_t2_inversion_speak_vote() -> bool:
-    """固定 speak 投票でも、低 surprise は強制 silence に反転（対称）。"""
-    hi = await _call(HI + 20, _fixed_speak)
-    lo = await _call(LO - 15, _fixed_speak)
+# ===== T2 death-detection（surprise が判定に効く配線である保証）=====
+async def t_t2_surprise_wired() -> bool:
+    """surprise を読む decider なら surprise を振ると判定が反転（surprise が決定に効く配線）。"""
+    hi = await _call(80, _surprise_driven)
+    lo = await _call(10, _surprise_driven)
     return hi.speak is True and lo.speak is False
 
 
@@ -135,27 +129,41 @@ def t_surprise_is_required() -> bool:
     return p.default is inspect.Parameter.empty
 
 
-# ===== ゲート帯 =====
-async def t_middle_defers_to_llm() -> bool:
-    mid = (HI + LO) // 2  # 40: LO<=surprise<HI → LLM の判断どおり
-    sp = await _call(mid, _fixed_speak)
-    si = await _call(mid, _fixed_silence)
+# ===== 判定は LLM 任せ（数値ゲート撤廃・surprise は指標）=====
+async def t_llm_authoritative() -> bool:
+    sp = await _call(5, _fixed_speak)     # 低 surprise でも LLM が speak なら speak
+    si = await _call(95, _fixed_silence)  # 高 surprise でも LLM が silence なら silence
     return sp.speak is True and si.speak is False
 
 
-async def t_pending_overrides_even_high() -> bool:
-    d = await _call(HI + 30, _fixed_speak, pending=True)
-    return d.speak is False  # 強制発話帯でも pending が優先
+async def t_pending_hard_silence() -> bool:
+    d = await _call(95, _fixed_speak, pending=True)
+    return d.speak is False  # pending は唯一の hard ゲート（LLM speak でも沈黙）
 
 
-async def t_force_speak_uses_llm_content() -> bool:
-    d = await _call(HI + 10, _fixed_speak)
-    return d.speak is True and d.content == "やあ"  # content は LLM のものを使う
+async def t_speak_uses_llm_content() -> bool:
+    d = await _call(40, _fixed_speak)
+    return d.speak is True and d.content == "やあ"
 
 
-async def t_force_speak_fallback_content() -> bool:
-    d = await _call(HI + 10, _fixed_silence)  # LLM が content 無し → fallback
-    return d.speak is True and d.content != ""
+async def t_empty_content_fallback() -> bool:
+    async def speak_empty(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None):
+        return SpeechDecision(True, "話す", "")  # speak だが content 空
+
+    d = await _call(40, speak_empty)
+    return d.speak is True and d.content.strip() != ""  # 全 speak 経路で fallback 保証
+
+
+async def t_last_feedback_passed_to_decider() -> bool:
+    seen: dict = {}
+
+    async def capture(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None):
+        seen["fb"] = last_feedback
+        return SpeechDecision(False, "r", "")
+
+    await should_speak(surprise=20, silence_seconds=5, recent_turns=[], topic_seeds=[],
+                       decide_fn=capture, last_feedback="楽しい気分")
+    return seen.get("fb") == "楽しい気分"
 
 
 # ===== パーサ =====
@@ -181,6 +189,12 @@ def t_parse_garbage_silence() -> bool:
 
 def t_parse_ellipsis_silence() -> bool:
     return parse_speech_decision("…").speak is False
+
+
+def t_parse_content_no_tag_silence() -> bool:
+    # speak タグが無く content だけ → 保守的に silence（P6: content で speak 推定しない）。
+    d = parse_speech_decision("content: うーん、やめておく")
+    return d.speak is False
 
 
 # ===== make_decide_fn（保守フォールバック）=====
@@ -332,7 +346,7 @@ async def t_decider_speak_injects() -> bool:
     await rag.add_chunk(text="夏祭りの思い出", summary="夏", search_text="夏", importance=0.5)
     pred = PredictionState()  # surprise=20(NEUTRAL) → 中間帯 → LLM 判断
 
-    async def fake_decide(*, surprise, silence_seconds, recent_turns, topic_seeds):
+    async def fake_decide(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None):
         return SpeechDecision(True, "話題がある", "天気の話を振る")
 
     q = StimulusQueue()
@@ -360,7 +374,7 @@ async def t_decider_silence_no_stimulus() -> bool:
     rag = _store()
     pred = PredictionState()
 
-    async def fake_silence(*, surprise, silence_seconds, recent_turns, topic_seeds):
+    async def fake_silence(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None):
         return SpeechDecision(False, "特に言うことがない", "")
 
     q = StimulusQueue()
@@ -384,7 +398,7 @@ async def t_decider_single_flight() -> bool:
     gate = asyncio.Event()
     stats = {"concurrent": 0, "max": 0}
 
-    async def gated(*, surprise, silence_seconds, recent_turns, topic_seeds):
+    async def gated(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None):
         stats["concurrent"] += 1
         stats["max"] = max(stats["max"], stats["concurrent"])
         try:
@@ -441,7 +455,7 @@ async def t_decider_user_preempts() -> bool:
     pred = PredictionState()
     gate = asyncio.Event()
 
-    async def gated(*, surprise, silence_seconds, recent_turns, topic_seeds):
+    async def gated(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None):
         await gate.wait()
         return SpeechDecision(True, "話したい", "やあ")  # LLM は speak と判断
 
@@ -461,18 +475,19 @@ async def t_decider_user_preempts() -> bool:
 
 
 async def main() -> None:
-    check("T2 反転(silence 投票・surprise が唯一の要因)", await t_t2_inversion_silence_vote())
-    check("T2 反転(speak 投票・対称)", await t_t2_inversion_speak_vote())
+    check("T2 surprise が判定に効く配線(反転)", await t_t2_surprise_wired())
     check("surprise は必須引数(既定なし)", t_surprise_is_required())
-    check("中間帯は LLM 判断どおり", await t_middle_defers_to_llm())
-    check("pending は強制発話帯より優先(沈黙)", await t_pending_overrides_even_high())
-    check("強制発話は LLM の content を使う", await t_force_speak_uses_llm_content())
-    check("強制発話で content 無し→fallback", await t_force_speak_fallback_content())
+    check("判定は LLM 任せ(数値ゲート撤廃)", await t_llm_authoritative())
+    check("pending は唯一の hard 沈黙", await t_pending_hard_silence())
+    check("speak は LLM の content を使う", await t_speak_uses_llm_content())
+    check("speak で content 空→fallback(全 speak 経路)", await t_empty_content_fallback())
+    check("last_feedback(感情)を decider に渡す", await t_last_feedback_passed_to_decider())
     check("parse yes", t_parse_yes())
     check("parse no", t_parse_no())
     check("parse 全角コロン", t_parse_fullwidth())
     check("parse ゴミ→silence", t_parse_garbage_silence())
     check("parse …→silence", t_parse_ellipsis_silence())
+    check("parse content のみ(タグ無)→silence", t_parse_content_no_tag_silence())
     check("decide_fn 正常", await t_decidefn_valid())
     check("decide_fn ゴミ→silence", await t_decidefn_garbage_silence())
     check("decide_fn API 例外→silence", await t_decidefn_apierror_silence())
