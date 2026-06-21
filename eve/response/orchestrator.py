@@ -15,9 +15,11 @@ import asyncio
 import logging
 from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable, Optional
 
+from ..config import Config
 from ..context_assembler import ContextAssembler, RagChunk, Turn
 from ..pipeline.audio_play_queue import AudioPlayQueue
 from ..pipeline.stimulus import Stimulus, StimulusKind
+from ..speech.decider import AutonomousSpeech
 from .splitter import JapaneseSentenceSplitter
 from .style import SPEECH_STYLE, sanitize_for_speech
 
@@ -67,11 +69,21 @@ class ResponseOrchestrator:
         rag_chunks: Optional[list[RagChunk]] = None,
     ) -> list[dict]:
         last_feedback = self._state.last_feedback if self._state is not None else None
+        # F5 自発発話: payload は AutonomousSpeech(content, reason)。content を user_text、
+        # reason を発話判定理由としてそれぞれ注入（USER 等は従来どおり payload を文字列化）。
+        payload = stimulus.payload
+        speech_reason = None
+        if stimulus.kind == StimulusKind.AUTONOMOUS_SPEECH and isinstance(payload, AutonomousSpeech):
+            user_text = payload.content
+            speech_reason = payload.reason
+        else:
+            user_text = str(payload)
         ctx = self._ctx.assemble(
-            user_text=str(stimulus.payload),
+            user_text=user_text,
             recent_turns=recent_turns,
             rag_chunks=rag_chunks,
             last_feedback=last_feedback,
+            speech_decision_reason=speech_reason,
         )
         messages: list[dict] = []
         if ctx.system:
@@ -96,9 +108,13 @@ class ResponseOrchestrator:
         rag_chunks = None
         if self._rag is not None:
             try:
-                rag_chunks = await self._rag.search(str(stimulus.payload))
+                if stimulus.kind == StimulusKind.AUTONOMOUS_SPEECH:
+                    # 自発発話は「話題の種」＝ランダム RAG（search でない・同期・思い出話に縛られない）。
+                    rag_chunks = self._rag.random(Config.RAG_RANDOM_K)
+                else:
+                    rag_chunks = await self._rag.search(str(stimulus.payload))
             except Exception:
-                logger.exception("RAG 検索に失敗（記憶なしで継続）")
+                logger.exception("RAG 取得に失敗（記憶なしで継続）")
         messages = self._build_messages(stimulus, recent, rag_chunks)
         # ユーザ発話なら user ターンを記録（自律/vision/callfunction には user ターンは無い）。
         if self._cache is not None and stimulus.kind == StimulusKind.USER_UTTERANCE:

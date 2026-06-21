@@ -87,6 +87,10 @@ class PipelineRunner:
         if self._active and not self._active.done():
             self._active.cancel()
 
+    def is_busy(self) -> bool:
+        """応答生成が進行中か（F5 沈黙監視が応答中に発火しないためのガード）。"""
+        return self._active is not None and not self._active.done()
+
     async def run(self) -> None:
         # A2: 1刺激の失敗で単一 consumer を殺さない。例外は traceback 付きでログし継続。
         # 連続失敗（想定外が頻発）は無理に回さず停止＝循環ブレーカ。

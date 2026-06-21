@@ -10,18 +10,66 @@ import inspect
 import logging
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logging.disable(logging.CRITICAL)
 
 from eve.config import Config  # noqa: E402
+from eve.context_assembler import ContextAssembler  # noqa: E402
+from eve.memory import ConversationCache, RagStore  # noqa: E402
+from eve.memory.embed import Embedder  # noqa: E402
 from eve.model_registry import ModelRegistry  # noqa: E402
+from eve.pipeline import AudioPlayQueue, PipelineRunner, Stimulus, StimulusKind, StimulusQueue  # noqa: E402
+from eve.pipeline.orchestrator import StubOrchestrator  # noqa: E402
+from eve.response import ResponseOrchestrator  # noqa: E402
 from eve.speech import (  # noqa: E402
+    AutonomousSpeech,
     SpeechDecision,
     make_decide_fn,
     parse_speech_decision,
     should_speak,
 )
+
+_tmpdir = tempfile.mkdtemp(prefix="eve_f5_")
+_counter = 0
+
+
+def _tmp() -> str:
+    global _counter
+    _counter += 1
+    return os.path.join(_tmpdir, f"f5_{_counter}.jsonl")
+
+
+class FakeEmbedder(Embedder):
+    AXES = ["夏", "祭り", "仕事", "旅行"]
+
+    def __init__(self) -> None:
+        self.dim = len(self.AXES)
+
+    def _vec(self, text: str):
+        v = [1.0 if ax in text else 0.0 for ax in self.AXES]
+        return v if any(v) else [0.001] * len(self.AXES)
+
+    async def embed_documents(self, texts):
+        return [self._vec(t) for t in texts]
+
+    async def embed_query(self, text):
+        return self._vec(text)
+
+
+def _store() -> RagStore:
+    s = RagStore(FakeEmbedder(), rag_file=_tmp())
+    s.rel_baseline = 0.0
+    return s
+
+
+async def _noop_play(audio, should_stop=None) -> None:
+    pass
+
+
+async def _tts(s: str) -> bytes:
+    return b"x"
 
 _passed = 0
 _failed = 0
@@ -153,6 +201,59 @@ async def t_decidefn_apierror_silence() -> bool:
     return d.speak is False
 
 
+# ===== C2 orchestrator 配線 =====
+async def t_autonomous_injection() -> bool:
+    captured: dict = {}
+
+    async def stream_fn(messages):
+        captured["m"] = messages
+        yield "やあ、最近どう？"
+
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    cache = ConversationCache(history_file=_tmp())
+    await cache.initialize()
+    cache.add_turn("user", "こんにちは")
+    cache.add_turn("eve", "やあ")
+    rag = _store()
+    await rag.add_chunk(text="夏祭りに行った思い出", summary="夏祭り", search_text="夏 祭り", importance=0.5)
+    orch = ResponseOrchestrator(
+        audio, stream_fn, _tts, ContextAssembler(system_prompt="S"),
+        conversation_cache=cache, rag_store=rag,
+    )
+    worker = asyncio.create_task(audio.play_worker())
+    users_before = sum(1 for t in cache.recent(99) if t.speaker == "user")
+    await orch.handle(
+        Stimulus(StimulusKind.AUTONOMOUS_SPEECH, AutonomousSpeech("天気の話を振ってみる", "間が空いたから")),
+    )
+    worker.cancel()
+    msg = captured["m"][-1]["content"]
+    users_after = sum(1 for t in cache.recent(99) if t.speaker == "user")
+    eve_turns = [t.text for t in cache.recent(99) if t.speaker == "eve"]
+    await cache.shutdown()
+    return (
+        "天気の話を振ってみる" in msg                 # content → user_text
+        and "# 発話判定理由" in msg and "間が空いたから" in msg  # reason → speech_decision_reason
+        and "話題の種" in msg                          # rag.random は as_topic_seed=True
+        and users_after == users_before               # メモリ非汚染: user ターン増えない
+        and any("やあ、最近どう" in t for t in eve_turns)  # eve 発話は記録される
+    )
+
+
+async def t_is_busy() -> bool:
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    runner = PipelineRunner(StimulusQueue(), StubOrchestrator(audio), audio)
+    idle = runner.is_busy() is False
+
+    async def slow():
+        await asyncio.sleep(0.15)
+
+    runner._active = asyncio.create_task(slow())
+    busy = runner.is_busy() is True
+    await runner._active
+    done = runner.is_busy() is False
+    return idle and busy and done
+
+
 async def main() -> None:
     check("T2 反転(silence 投票・surprise が唯一の要因)", await t_t2_inversion_silence_vote())
     check("T2 反転(speak 投票・対称)", await t_t2_inversion_speak_vote())
@@ -169,6 +270,9 @@ async def main() -> None:
     check("decide_fn 正常", await t_decidefn_valid())
     check("decide_fn ゴミ→silence", await t_decidefn_garbage_silence())
     check("decide_fn API 例外→silence", await t_decidefn_apierror_silence())
+    # C2
+    check("C2 自発発話注入(content+理由+話題の種・非汚染)", await t_autonomous_injection())
+    check("C2 runner.is_busy()", await t_is_busy())
 
 
 if __name__ == "__main__":
