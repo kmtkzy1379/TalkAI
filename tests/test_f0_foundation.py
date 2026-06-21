@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eve.clock import Stamp, elapsed_wall, humanize  # noqa: E402
-from eve.context_assembler import ContextAssembler, RagChunk, Turn  # noqa: E402
+from eve.context_assembler import ContextAssembler, RagChunk, Turn, messages_to_text  # noqa: E402
 from eve.model_registry import ModelRegistry  # noqa: E402
 
 _passed = 0
@@ -84,12 +84,15 @@ ctx = ContextAssembler(system_prompt="SYS").assemble(
     ],
     now=now,
 )
-rendered = ctx.render()
-check("ctx 相対時刻を注入", "3分前" in rendered)
-check("ctx 話題の種ラベル", "話題の種" in rendered)
-check("ctx 過去の記憶ラベル", "過去の記憶" in rendered)
-check("ctx ユーザ発話=今", "ユーザ発話（今）" in rendered)
-check("ctx system 分離", ctx.system == "SYS")
+msgs = ctx  # assemble は native ロール messages を返す
+joined = messages_to_text(msgs)
+sysmsg = msgs[0]["content"]
+check("ctx 相対時刻を注入", "3分前" in joined)
+check("ctx 話題の種ラベル(system)", "話題の種" in sysmsg)
+check("ctx 過去の記憶ラベル(system)", "過去の記憶" in sysmsg)
+check("ctx ユーザ発話は user ロール末尾", msgs[-1]["role"] == "user" and msgs[-1]["content"] == "今の話をしよう")
+check("ctx 過去発話は assistant/user ロール", any(m["role"] == "user" and "昔これ言った" in m["content"] for m in msgs))
+check("ctx system に SYS とロールアンカー", "SYS" in sysmsg and "イブ" in sysmsg)
 
 print(f"\n合計: PASS {_passed} / FAIL {_failed}")
 sys.exit(1 if _failed else 0)

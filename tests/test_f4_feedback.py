@@ -388,8 +388,8 @@ async def t_orch_injects_last_feedback() -> bool:
     state.last_feedback = "前回は天気の話で盛り上がった（予測差35 / 楽しさ）"
     orch = ResponseOrchestrator(audio, stream_fn, _tts_fn, prediction_state=state)
     await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "やあ"))
-    user_msg = captured["m"][-1]["content"]
-    return "# 直近フィードバック" in user_msg and "前回は天気の話" in user_msg
+    joined = "\n".join(m["content"] for m in captured["m"])  # 直近フィードバックは system に入る
+    return "# 直近フィードバック" in joined and "前回は天気の話" in joined
 
 
 async def t_orch_injection_timing() -> bool:
@@ -397,7 +397,7 @@ async def t_orch_injection_timing() -> bool:
     seen: list[str] = []
 
     async def stream_fn(messages):
-        seen.append(messages[-1]["content"])
+        seen.append("\n".join(m["content"] for m in messages))
         yield "ok。"
 
     audio = AudioPlayQueue(play_fn=_noop_play)

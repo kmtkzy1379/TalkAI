@@ -172,7 +172,7 @@ async def t_orch_injects_rag() -> bool:
     audio = AudioPlayQueue(play_fn=play_fn)
 
     async def stream_fn(messages):
-        seen.append(messages[-1]["content"])
+        seen.append("\n".join(m["content"] for m in messages))  # 文脈は system 等に分散→全結合で検査
         yield "うん。"
 
     async def tts_fn(s):

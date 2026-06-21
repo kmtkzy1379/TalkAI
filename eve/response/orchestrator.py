@@ -81,7 +81,8 @@ class ResponseOrchestrator:
             speech_reason = payload.reason
         else:
             user_text = str(payload)
-        ctx = self._ctx.assemble(
+        # native ロール messages（system + user/assistant ターン列 + 最終 user発話/自発指示）。
+        return self._ctx.assemble(
             user_text=user_text,
             autonomous_content=autonomous_content,
             recent_turns=recent_turns,
@@ -89,11 +90,6 @@ class ResponseOrchestrator:
             last_feedback=last_feedback,
             speech_decision_reason=speech_reason,
         )
-        messages: list[dict] = []
-        if ctx.system:
-            messages.append({"role": "system", "content": ctx.system})
-        messages.append({"role": "user", "content": ctx.render()})
-        return messages
 
     def _notify_complete(self) -> None:
         """正常完了時に feedback worker を起こす（O(1)・例外は握りつぶす）。"""

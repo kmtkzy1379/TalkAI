@@ -244,18 +244,19 @@ async def t_autonomous_injection() -> bool:
         Stimulus(StimulusKind.AUTONOMOUS_SPEECH, AutonomousSpeech("天気の話を振ってみる", "間が空いたから")),
     )
     worker.cancel()
-    msg = captured["m"][-1]["content"]
+    last = captured["m"][-1]                                  # 自発指示は最終 user メッセージ
+    joined = "\n".join(m["content"] for m in captured["m"])   # 文脈(理由/話題の種)は system に分散
     users_after = sum(1 for t in cache.recent(99) if t.speaker == "user")
     eve_turns = [t.text for t in cache.recent(99) if t.speaker == "eve"]
     await cache.shutdown()
     return (
-        "天気の話を振ってみる" in msg                 # content は注入される
-        and "# 自分から話す" in msg                    # Fix3: イブ自身の発話として枠分け
-        and "# ユーザ発話（今）" not in msg            # Fix3: ユーザ発話枠には入れない（話者取り違え防止）
-        and "# 発話判定理由" in msg and "間が空いたから" in msg  # reason → speech_decision_reason
-        and "話題の種" in msg                          # rag.random は as_topic_seed=True
-        and users_after == users_before               # メモリ非汚染: user ターン増えない
-        and any("やあ、最近どう" in t for t in eve_turns)  # eve 発話は記録される
+        last["role"] == "user"
+        and "天気の話を振ってみる" in last["content"]       # content は最終 user 指示に入る
+        and "返事ではなく" in last["content"]               # Fix3/4: 自分から話す指示（返事でない）
+        and "# 発話判定理由" in joined and "間が空いたから" in joined  # reason は system
+        and "話題の種" in joined                            # rag.random は as_topic_seed=True
+        and users_after == users_before                     # メモリ非汚染: user ターン増えない
+        and any("やあ、最近どう" in t for t in eve_turns)   # eve 発話は記録される
     )
 
 
@@ -478,13 +479,21 @@ async def t_decider_user_preempts() -> bool:
 
 # ===== Fix3 自発発話の話者ロール枠分け（取り違え防止）=====
 def t_autonomous_content_own_block() -> bool:
-    r = ContextAssembler(system_prompt="S").assemble(autonomous_content="天気の話を振る").render()
-    return "# 自分から話す" in r and "天気の話を振る" in r and "# ユーザ発話（今）" not in r
+    msgs = ContextAssembler(system_prompt="S").assemble(autonomous_content="天気の話を振る")
+    last = msgs[-1]
+    # 自発: 最終 user 指示に下書きが入り「返事ではなく自分から」と明示。過去 user ターンには無い。
+    return (
+        last["role"] == "user"
+        and "天気の話を振る" in last["content"]
+        and "返事ではなく" in last["content"]
+        and not any(m is not last and m["role"] == "user" and "天気の話を振る" in m["content"] for m in msgs)
+    )
 
 
 def t_user_text_still_user_block() -> bool:
-    r = ContextAssembler(system_prompt="S").assemble(user_text="こんにちは").render()
-    return "# ユーザ発話（今）" in r and "こんにちは" in r and "# 自分から話す" not in r
+    msgs = ContextAssembler(system_prompt="S").assemble(user_text="こんにちは")
+    # USER 経路: 最終メッセージは user ロールでユーザの言葉そのまま（native ロール）。
+    return msgs[-1]["role"] == "user" and msgs[-1]["content"] == "こんにちは"
 
 
 async def main() -> None:

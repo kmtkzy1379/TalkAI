@@ -17,7 +17,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logging.disable(logging.CRITICAL)
 
-from eve.context_assembler import OMITTED_SPEAKER, ContextAssembler, Turn  # noqa: E402
+from eve.context_assembler import OMITTED_SPEAKER, ContextAssembler, Turn, messages_to_text  # noqa: E402
 from eve.clock import Stamp  # noqa: E402
 from eve.memory import ConversationCache  # noqa: E402
 from eve.pipeline import (  # noqa: E402
@@ -122,9 +122,10 @@ def t_omission_marker_render() -> bool:
         Turn(OMITTED_SPEAKER, "3", now),
         Turn("eve", "そういえば", now),
     ]
-    rendered = ContextAssembler(system_prompt="S").assemble(
+    msgs = ContextAssembler(system_prompt="S").assemble(
         user_text="今", recent_turns=turns, now=now
-    ).render()
+    )
+    rendered = messages_to_text(msgs)
     return "中略" in rendered and "3件を省略" in rendered and "りんご好き" in rendered
 
 
@@ -166,7 +167,7 @@ async def t_continuity_wiring() -> bool:
     seen: list[str] = []
 
     async def stream_fn(messages):
-        seen.append(messages[-1]["content"])
+        seen.append("\n".join(m["content"] for m in messages))  # 過去ターンは別 role メッセージ→全結合
         yield "うん。"
 
     async def tts_fn(s):
