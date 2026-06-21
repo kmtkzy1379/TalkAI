@@ -42,9 +42,16 @@ try:
     check("orchestrator の system が SPEECH_STYLE", vl.orchestrator._ctx.system_prompt == _SS)
     # F4: 内分泌系（PredictionState / FeedbackLLM / FeedbackWorker）の配線
     check("orchestrator に PredictionState を配線", vl.orchestrator._state is vl.prediction)
-    check("orchestrator 完了トリガ=feedback worker.trigger", vl.orchestrator._on_complete == vl.feedback_worker.trigger)
+    check("orchestrator 完了トリガ=_on_response_complete(feedback+沈黙リセット)", vl.orchestrator._on_complete == vl._on_response_complete)
     check("FeedbackLLM に RAG/PredictionState を配線", vl.feedback._rag is vl.rag and vl.feedback._state is vl.prediction)
     check("FeedbackWorker に feedback/cache を配線", vl.feedback_worker._fb is vl.feedback and vl.feedback_worker._cache is vl.cache)
+    # F5: 発話判定（SpeechState / SpeechDecider / SilenceMonitor）の配線
+    check("SpeechDecider に state/queue/prediction を配線",
+          vl.speech_decider._state is vl.speech_state and vl.speech_decider._queue is vl.queue and vl.speech_decider._pred is vl.prediction)
+    check("SilenceMonitor に state/decider を配線",
+          vl.silence_monitor._state is vl.speech_state and vl.silence_monitor._decider is vl.speech_decider)
+    check("SilenceMonitor の busy ガード=runner.is_busy", vl.silence_monitor._is_busy == vl.runner.is_busy)
+    check("input に発話到着フック(沈黙時計リセット)を配線", vl.input._on_utterance == vl.speech_state.mark_user_utterance)
     check("runner に orchestrator を配線", vl.runner._orch is vl.orchestrator)
     check("runner と input が同じ queue を共有", vl.runner._queue is vl.queue and vl.input._queue is vl.queue)
     check("input に barge-in callback を結線", callable(vl.input._on_speech_start))

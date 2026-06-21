@@ -24,6 +24,7 @@ from .response.orchestrator import ResponseOrchestrator
 from .response.player import RealAudioPlayer
 from .response.style import SPEECH_STYLE
 from .response.tts import VoicevoxTTS
+from .speech import SilenceMonitor, SpeechDecider, SpeechState, make_decide_fn
 from .stt import make_stt
 
 logger = logging.getLogger(__name__)
@@ -45,6 +46,14 @@ class VoiceLoop:
         self.feedback = FeedbackLLM(self.registry, rag_store=self.rag, prediction_state=self.prediction)
         self.feedback_worker = FeedbackWorker(self.feedback, self.cache)
 
+        # F5 発話判定: 5秒沈黙で should_speak → True で AUTONOMOUS_SPEECH を投入。
+        self.speech_state = SpeechState()  # loop 所有 ephemeral（沈黙計測/発話判定ログ）
+        self.speech_decider = SpeechDecider(
+            state=self.speech_state, cache=self.cache, rag=self.rag,
+            prediction_state=self.prediction, queue=self.queue,
+            decide_fn=make_decide_fn(self.registry),  # role=speech_decide
+        )
+
         async def stream_fn(messages):
             async for delta in self.registry.stream("response", messages):
                 yield delta
@@ -57,10 +66,18 @@ class VoiceLoop:
             ContextAssembler(system_prompt=SPEECH_STYLE),
             conversation_cache=self.cache, rag_store=self.rag,
             prediction_state=self.prediction,
-            on_response_complete=self.feedback_worker.trigger,  # 正常完了で feedback を起こす
+            on_response_complete=self._on_response_complete,  # 正常完了で feedback + 沈黙時計リセット
         )
         self.runner = PipelineRunner(self.queue, self.orchestrator, self.audio)
-        self.input = MicSttInputSource(self.queue, self.stt, on_speech_start=self._barge_in)
+        # 沈黙監視は応答中(runner busy)/ユーザ発話中は発火しない（is_busy をガードに使う）。
+        self.silence_monitor = SilenceMonitor(
+            state=self.speech_state, decider=self.speech_decider, is_busy_fn=self.runner.is_busy,
+        )
+        self.input = MicSttInputSource(
+            self.queue, self.stt,
+            on_speech_start=self._barge_in,                      # ユーザ発話開始（barge-in）
+            on_utterance=self.speech_state.mark_user_utterance,  # 発話終了→沈黙時計リセット
+        )
         self._tasks: list[asyncio.Task] = []
 
     def _barge_in(self) -> None:
@@ -68,6 +85,12 @@ class VoiceLoop:
         logger.info("⏸ 発話検知（割り込み）")
         self.audio.interrupt()
         self.runner.interrupt()
+        self.speech_state.mark_user_speech_start()  # F5: ユーザ発話中は自発発話しない + 沈黙時計
+
+    def _on_response_complete(self) -> None:
+        """応答 正常完了: F4 feedback を起こす + F5 沈黙時計をリセット（Eve が喋った）。"""
+        self.feedback_worker.trigger()
+        self.speech_state.mark_eve_activity()
 
     async def warmup(self) -> None:
         """STT/LLM/TTS を1回空打ちして cold-start（初回の数秒遅延）を消す。"""
@@ -99,12 +122,25 @@ class VoiceLoop:
         await self.warmup()
         self._tasks.append(asyncio.create_task(self.audio.play_worker()))
         self._tasks.append(asyncio.create_task(self.runner.run()))
+        # F5: 発話判定 worker + 沈黙監視を起動（沈黙時計の baseline をここでリセット）。
+        self.speech_state.mark_eve_activity()
+        self.speech_decider.start()
+        self.silence_monitor.start()
         await self.input.start()  # mic + STT 消費タスクを起動
         logger.info("VoiceLoop 稼働。話しかけてください。")
         await asyncio.Event().wait()  # キャンセルされるまで稼働
 
     async def stop(self) -> None:
         self.input.stop()
+        # F5: 沈黙監視を止め（新規トリガを断つ）→ 発話判定 worker を drain/停止。
+        try:
+            await self.silence_monitor.stop()
+        except Exception:
+            pass
+        try:
+            await self.speech_decider.stop()
+        except Exception:
+            pass
         # feedback worker を先に drain/停止（進行中 add_chunk を rag.shutdown 前に flush 機会を与える。
         # 未完分は watermark 未前進なので次回起動の catch-up が回収＝記憶喪失を作らない）。
         try:

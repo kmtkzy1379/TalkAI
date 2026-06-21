@@ -44,10 +44,12 @@ class MicSttInputSource(InputSource):
     （VoiceLoop が audio.interrupt + runner.interrupt を束ねて渡す）。
     """
 
-    def __init__(self, queue: StimulusQueue, stt: Stt, on_speech_start=None) -> None:
+    def __init__(self, queue: StimulusQueue, stt: Stt, on_speech_start=None, on_utterance=None) -> None:
         super().__init__(queue)
         self._stt = stt
         self._on_speech_start = on_speech_start
+        # 発話セグメント到着（＝ユーザが話し終えた）時に呼ぶ。F5 の沈黙時計リセット用。
+        self._on_utterance = on_utterance
         self._ai = None
         self._task = None
 
@@ -63,6 +65,12 @@ class MicSttInputSource(InputSource):
         assert self._ai is not None
         while True:
             pcm = await self._ai.get_audio()
+            # 発話セグメントが届いた＝ユーザは話し終えた（F5: user_speaking 解除 + 沈黙時計リセット）。
+            if self._on_utterance is not None:
+                try:
+                    self._on_utterance()
+                except Exception:
+                    logger.exception("on_utterance フックで例外（無視して継続）")
             try:
                 text = await self._stt.transcribe(pcm)
             except Exception:  # STT 失敗はこの発話を捨てて継続（起こりうる）

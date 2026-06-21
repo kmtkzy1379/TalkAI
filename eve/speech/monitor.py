@@ -29,28 +29,34 @@ class SpeechState:
 
     def __init__(self, *, now_fn: Callable[[], float] = now_mono, log_max: Optional[int] = None) -> None:
         self._now = now_fn
-        self.last_user_activity_mono = now_fn()  # ユーザが最後に動いた（発話開始/到着）時刻
+        # 最後に「誰かが喋った」時刻（user 発話開始/到着 + eve 応答/自発発話 完了）。
+        # eve も含めるのは、Eve が喋った直後に 5秒で自分にモノローグしないため（沈黙=誰も話さない時間）。
+        self.last_activity_mono = now_fn()
         self.last_eval_mono = now_fn()  # 最後に発話判定した時刻（フラット再評価カデンス）
         self.user_speaking = False
         self.speech_log: deque = deque(maxlen=log_max or Config.SPEECH_LOG_MAX)
 
-    # --- ユーザ活動（VoiceLoop から呼ぶ）---
+    # --- 活動マーク（VoiceLoop から呼ぶ）---
     def mark_user_speech_start(self) -> None:
         self.user_speaking = True
-        self.last_user_activity_mono = self._now()
+        self.last_activity_mono = self._now()
 
     def mark_user_utterance(self) -> None:
         """STT 結果が届いた（発話終了）。"""
         self.user_speaking = False
-        self.last_user_activity_mono = self._now()
+        self.last_activity_mono = self._now()
+
+    def mark_eve_activity(self) -> None:
+        """Eve が喋った（応答 or 自発発話 完了）→ 沈黙時計をリセット。"""
+        self.last_activity_mono = self._now()
 
     # --- 計測 ---
     def silence_seconds(self) -> float:
-        return max(0.0, self._now() - self.last_user_activity_mono)
+        return max(0.0, self._now() - self.last_activity_mono)
 
     def eval_due(self, threshold: float) -> bool:
         """5秒沈黙 + フラット再評価カデンス（前回判定/活動から threshold 秒）。"""
-        base = max(self.last_eval_mono, self.last_user_activity_mono)
+        base = max(self.last_eval_mono, self.last_activity_mono)
         return (self._now() - base) >= threshold
 
     def record_decision(self, *, speak: bool, reason: str, content: str) -> None:

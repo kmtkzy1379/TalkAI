@@ -407,6 +407,21 @@ async def t_decider_single_flight() -> bool:
     return stats["max"] == 1  # 同時実行は常に1（single-flight）
 
 
+def t_eve_activity_resets_silence() -> bool:
+    """Eve が喋ったら沈黙時計がリセット（直後に自分へモノローグしない）+ user_speaking トグル。"""
+    clk = [1000.0]
+    state = SpeechState(now_fn=lambda: clk[0])
+    clk[0] = 1006.0
+    due_before = state.eval_due(5.0)  # baseline から 6s → 評価可
+    state.mark_eve_activity()  # Eve 発話 → last_activity=1006
+    due_after = state.eval_due(5.0)  # 直後 → 不可（モノローグ防止）
+    state.mark_user_speech_start()
+    speaking = state.user_speaking is True
+    state.mark_user_utterance()
+    not_speaking = state.user_speaking is False
+    return due_before and (not due_after) and speaking and not_speaking
+
+
 async def main() -> None:
     check("T2 反転(silence 投票・surprise が唯一の要因)", await t_t2_inversion_silence_vote())
     check("T2 反転(speak 投票・対称)", await t_t2_inversion_speak_vote())
@@ -433,6 +448,8 @@ async def main() -> None:
     check("C3 decider speak→AUTONOMOUS 刺激+ログ", await t_decider_speak_injects())
     check("C3 decider silence→刺激なし+ログ記録", await t_decider_silence_no_stimulus())
     check("C3 decider single-flight(同時=1)", await t_decider_single_flight())
+    # C4
+    check("C4 Eve 発話で沈黙時計リセット + user_speaking トグル", t_eve_activity_resets_silence())
 
 
 if __name__ == "__main__":
