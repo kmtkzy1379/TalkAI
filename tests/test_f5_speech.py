@@ -23,9 +23,13 @@ from eve.model_registry import ModelRegistry  # noqa: E402
 from eve.pipeline import AudioPlayQueue, PipelineRunner, Stimulus, StimulusKind, StimulusQueue  # noqa: E402
 from eve.pipeline.orchestrator import StubOrchestrator  # noqa: E402
 from eve.response import ResponseOrchestrator  # noqa: E402
+from eve.feedback import PredictionState  # noqa: E402
 from eve.speech import (  # noqa: E402
     AutonomousSpeech,
+    SilenceMonitor,
+    SpeechDecider,
     SpeechDecision,
+    SpeechState,
     make_decide_fn,
     parse_speech_decision,
     should_speak,
@@ -254,6 +258,155 @@ async def t_is_busy() -> bool:
     return idle and busy and done
 
 
+# ===== C3 SpeechState / SilenceMonitor / SpeechDecider =====
+class _FakeDecider:
+    def __init__(self) -> None:
+        self.triggers = 0
+        self._idle = True
+
+    def trigger(self) -> None:
+        self.triggers += 1
+
+    def is_idle(self) -> bool:
+        return self._idle
+
+
+def t_speechlog_rocket_pencil() -> bool:
+    state = SpeechState(log_max=10)
+    for i in range(12):
+        state.record_decision(speak=(i % 2 == 0), reason=f"r{i}", content="")
+    log = list(state.speech_log)
+    speaks = [e["speak"] for e in log]
+    return (
+        len(log) == 10  # ロケット鉛筆（最古2件押し出る）
+        and (True in speaks and False in speaks)  # True/False とも記録
+        and log[0]["reason"] == "r2"
+    )
+
+
+def t_flat_cadence() -> bool:
+    clk = [1000.0]
+    state = SpeechState(now_fn=lambda: clk[0])
+    clk[0] = 1006.0
+    due1 = state.eval_due(5.0)  # baseline から 6s → 評価可
+    state.record_decision(speak=False, reason="x", content="")  # last_eval=1006
+    due2 = state.eval_due(5.0)  # 直後 → 不可（5秒連打しない）
+    clk[0] = 1012.0
+    due3 = state.eval_due(5.0)  # 6s 経過 → 再び可（フラット5秒）
+    return due1 and (not due2) and due3
+
+
+def t_monitor_guards() -> bool:
+    clk = [1000.0]
+    state = SpeechState(now_fn=lambda: clk[0])
+    fd = _FakeDecider()
+    busy = [False]
+    mon = SilenceMonitor(state=state, decider=fd, is_busy_fn=lambda: busy[0], threshold_sec=5.0, tick_sec=0.7)
+    clk[0] = 1003.0
+    early = mon.tick()  # 3s < 5s → 発火しない
+    clk[0] = 1006.0
+    fired = mon.tick()  # 6s ≥ 5s → 発火
+    n1 = fd.triggers
+    clk[0] = 1020.0
+    busy[0] = True
+    busy_block = mon.tick()  # 応答中 → 発火しない
+    busy[0] = False
+    state.user_speaking = True
+    user_block = mon.tick()  # ユーザ発話中 → 発火しない
+    state.user_speaking = False
+    fd._idle = False
+    idle_block = mon.tick()  # decider 処理中 → 発火しない
+    return (
+        early is False and fired is True and n1 == 1
+        and busy_block is False and user_block is False and idle_block is False
+    )
+
+
+async def t_decider_speak_injects() -> bool:
+    state = SpeechState()
+    cache = ConversationCache(history_file=_tmp())
+    await cache.initialize()
+    cache.add_turn("user", "こんにちは")
+    cache.add_turn("eve", "やあ")
+    rag = _store()
+    await rag.add_chunk(text="夏祭りの思い出", summary="夏", search_text="夏", importance=0.5)
+    pred = PredictionState()  # surprise=20(NEUTRAL) → 中間帯 → LLM 判断
+
+    async def fake_decide(*, surprise, silence_seconds, recent_turns, topic_seeds):
+        return SpeechDecision(True, "話題がある", "天気の話を振る")
+
+    q = StimulusQueue()
+    dec = SpeechDecider(state=state, cache=cache, rag=rag, prediction_state=pred, queue=q, decide_fn=fake_decide)
+    dec.start()
+    dec.trigger()
+    await asyncio.sleep(0.05)
+    await dec.stop()
+    await cache.shutdown()
+    log = list(state.speech_log)
+    ok_queue = q.qsize() == 1
+    s = await q.get() if ok_queue else None
+    return (
+        ok_queue and s.kind == StimulusKind.AUTONOMOUS_SPEECH
+        and isinstance(s.payload, AutonomousSpeech) and s.payload.content == "天気の話を振る"
+        and len(log) == 1 and log[0]["speak"] is True
+    )
+
+
+async def t_decider_silence_no_stimulus() -> bool:
+    state = SpeechState()
+    cache = ConversationCache(history_file=_tmp())
+    await cache.initialize()
+    cache.add_turn("user", "こんにちは")
+    rag = _store()
+    pred = PredictionState()
+
+    async def fake_silence(*, surprise, silence_seconds, recent_turns, topic_seeds):
+        return SpeechDecision(False, "特に言うことがない", "")
+
+    q = StimulusQueue()
+    dec = SpeechDecider(state=state, cache=cache, rag=rag, prediction_state=pred, queue=q, decide_fn=fake_silence)
+    dec.start()
+    dec.trigger()
+    await asyncio.sleep(0.05)
+    await dec.stop()
+    await cache.shutdown()
+    log = list(state.speech_log)
+    # 黙る: 刺激は出ないが発話判定ログには記録（観測のため）
+    return q.qsize() == 0 and len(log) == 1 and log[0]["speak"] is False
+
+
+async def t_decider_single_flight() -> bool:
+    state = SpeechState()
+    cache = ConversationCache(history_file=_tmp())
+    await cache.initialize()
+    rag = _store()
+    pred = PredictionState()
+    gate = asyncio.Event()
+    stats = {"concurrent": 0, "max": 0}
+
+    async def gated(*, surprise, silence_seconds, recent_turns, topic_seeds):
+        stats["concurrent"] += 1
+        stats["max"] = max(stats["max"], stats["concurrent"])
+        try:
+            await gate.wait()
+            return SpeechDecision(False, "r", "")
+        finally:
+            stats["concurrent"] -= 1
+
+    q = StimulusQueue()
+    dec = SpeechDecider(state=state, cache=cache, rag=rag, prediction_state=pred, queue=q, decide_fn=gated)
+    dec.start()
+    dec.trigger()
+    await asyncio.sleep(0.02)
+    dec.trigger()  # 1件目処理中の2発目
+    await asyncio.sleep(0.02)
+    gate.set()
+    await asyncio.sleep(0.05)
+    await dec.stop()
+    await cache.shutdown()
+    return stats["max"] == 1  # 同時実行は常に1（single-flight）
+
+
 async def main() -> None:
     check("T2 反転(silence 投票・surprise が唯一の要因)", await t_t2_inversion_silence_vote())
     check("T2 反転(speak 投票・対称)", await t_t2_inversion_speak_vote())
@@ -273,6 +426,13 @@ async def main() -> None:
     # C2
     check("C2 自発発話注入(content+理由+話題の種・非汚染)", await t_autonomous_injection())
     check("C2 runner.is_busy()", await t_is_busy())
+    # C3
+    check("C3 発話判定ログ ロケット鉛筆(T/F両方・maxlen10)", t_speechlog_rocket_pencil())
+    check("C3 フラット5秒カデンス(連打しない)", t_flat_cadence())
+    check("C3 SilenceMonitor ガード(busy/user/閾値/idle)", t_monitor_guards())
+    check("C3 decider speak→AUTONOMOUS 刺激+ログ", await t_decider_speak_injects())
+    check("C3 decider silence→刺激なし+ログ記録", await t_decider_silence_no_stimulus())
+    check("C3 decider single-flight(同時=1)", await t_decider_single_flight())
 
 
 if __name__ == "__main__":

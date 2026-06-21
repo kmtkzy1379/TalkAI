@@ -13,6 +13,7 @@ from .decider import (
     parse_speech_decision,
     should_speak,
 )
+from .monitor import SilenceMonitor, SpeechDecider, SpeechState
 
 __all__ = [
     "AutonomousSpeech",
@@ -21,4 +22,7 @@ __all__ = [
     "make_decide_fn",
     "parse_speech_decision",
     "build_decide_messages",
+    "SpeechState",
+    "SpeechDecider",
+    "SilenceMonitor",
 ]
