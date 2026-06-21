@@ -249,7 +249,9 @@ async def t_autonomous_injection() -> bool:
     eve_turns = [t.text for t in cache.recent(99) if t.speaker == "eve"]
     await cache.shutdown()
     return (
-        "天気の話を振ってみる" in msg                 # content → user_text
+        "天気の話を振ってみる" in msg                 # content は注入される
+        and "# 自分から話す" in msg                    # Fix3: イブ自身の発話として枠分け
+        and "# ユーザ発話（今）" not in msg            # Fix3: ユーザ発話枠には入れない（話者取り違え防止）
         and "# 発話判定理由" in msg and "間が空いたから" in msg  # reason → speech_decision_reason
         and "話題の種" in msg                          # rag.random は as_topic_seed=True
         and users_after == users_before               # メモリ非汚染: user ターン増えない
@@ -474,6 +476,17 @@ async def t_decider_user_preempts() -> bool:
     return q.qsize() == 0 and len(log) == 1 and log[0]["speak"] is False and "中止" in log[0]["reason"]
 
 
+# ===== Fix3 自発発話の話者ロール枠分け（取り違え防止）=====
+def t_autonomous_content_own_block() -> bool:
+    r = ContextAssembler(system_prompt="S").assemble(autonomous_content="天気の話を振る").render()
+    return "# 自分から話す" in r and "天気の話を振る" in r and "# ユーザ発話（今）" not in r
+
+
+def t_user_text_still_user_block() -> bool:
+    r = ContextAssembler(system_prompt="S").assemble(user_text="こんにちは").render()
+    return "# ユーザ発話（今）" in r and "こんにちは" in r and "# 自分から話す" not in r
+
+
 async def main() -> None:
     check("T2 surprise が判定に効く配線(反転)", await t_t2_surprise_wired())
     check("surprise は必須引数(既定なし)", t_surprise_is_required())
@@ -506,6 +519,9 @@ async def main() -> None:
     # Fix1
     check("Fix1 discard_kind が自発刺激を削除", await t_discard_kind())
     check("Fix1 判定中ユーザ発話で自発発話を中止・破棄", await t_decider_user_preempts())
+    # Fix3
+    check("Fix3 自発 content はイブ自身の発話枠(ユーザ枠でない)", t_autonomous_content_own_block())
+    check("Fix3 USER は従来どおりユーザ発話枠", t_user_text_still_user_block())
 
 
 if __name__ == "__main__":

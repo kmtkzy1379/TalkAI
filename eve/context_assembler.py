@@ -59,6 +59,7 @@ class ContextAssembler:
         self,
         *,
         user_text: str | None = None,
+        autonomous_content: str | None = None,
         recent_turns: list[Turn] | None = None,
         rag_chunks: list[RagChunk] | None = None,
         last_feedback: str | None = None,
@@ -96,7 +97,16 @@ class ContextAssembler:
             blocks.append(f"# 直近フィードバック\n{last_feedback}")
         if speech_decision_reason:
             blocks.append(f"# 発話判定理由\n{speech_decision_reason}")
-        if user_text is not None:
+        # 自発発話: イブ自身が"自分から"言う下書き。**ユーザ発話ではない**ので、これに返事を
+        # するのでなく、直前の会話に合うイブ自身の自然な一言にして言う（話者ロール取り違え防止）。
+        if autonomous_content is not None:
+            blocks.append(
+                "# 自分から話す（イブ自身の発話・ユーザの発話ではない）\n"
+                "次の下書きを、直前の会話に合うイブ自身の自然な話し言葉にして"
+                "“あなた（イブ）が自分から”言う。ユーザ発話への返事にはしない。\n"
+                f"下書き: {autonomous_content}"
+            )
+        elif user_text is not None:
             blocks.append(f"# ユーザ発話（今）\n{user_text}")
 
         return AssembledContext(system=self.system_prompt, blocks=blocks)

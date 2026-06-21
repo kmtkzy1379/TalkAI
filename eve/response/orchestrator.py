@@ -69,17 +69,21 @@ class ResponseOrchestrator:
         rag_chunks: Optional[list[RagChunk]] = None,
     ) -> list[dict]:
         last_feedback = self._state.last_feedback if self._state is not None else None
-        # F5 自発発話: payload は AutonomousSpeech(content, reason)。content を user_text、
-        # reason を発話判定理由としてそれぞれ注入（USER 等は従来どおり payload を文字列化）。
+        # F5 自発発話: payload は AutonomousSpeech(content, reason)。content は**ユーザ発話でなく
+        # イブ自身の下書き**として autonomous_content へ（ユーザ枠に入れると応答LLMが自分の発話に
+        # 返事して話者を取り違える＝Fix3）。reason は発話判定理由。USER 等は従来どおり user_text。
         payload = stimulus.payload
         speech_reason = None
+        user_text = None
+        autonomous_content = None
         if stimulus.kind == StimulusKind.AUTONOMOUS_SPEECH and isinstance(payload, AutonomousSpeech):
-            user_text = payload.content
+            autonomous_content = payload.content
             speech_reason = payload.reason
         else:
             user_text = str(payload)
         ctx = self._ctx.assemble(
             user_text=user_text,
+            autonomous_content=autonomous_content,
             recent_turns=recent_turns,
             rag_chunks=rag_chunks,
             last_feedback=last_feedback,
