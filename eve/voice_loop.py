@@ -104,7 +104,9 @@ class VoiceLoop:
         except Exception as e:
             logger.warning("RAG ウォームアップ失敗（続行）: %s", e)
         try:
-            await self.registry.complete("response", [{"role": "user", "content": "hi"}], max_tokens=1)
+            # max_tokens は付けない: reasoning 系(gpt-5.x)は1トークンで完了できず BadRequest 警告に
+            # なる。warmup は一度きり・"hi" への短応答なのでコストは無視できる。
+            await self.registry.complete("response", [{"role": "user", "content": "hi"}])
         except Exception as e:
             logger.warning("LLM ウォームアップ失敗（続行）: %s", e)
         try:

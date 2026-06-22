@@ -30,10 +30,14 @@
 
 ---
 
-## C. ContextAssembler（過去参照防止の要）【確定/推奨】
-- **挙動**: 応答LLM への文脈を組み立てる。入力 = 発話 + systemプロンプト + 直近5ターン + RAG2 + 直近feedback1 + 画面認識(統合済) + 発話判定理由 + CallFunction定義。
-- **過去参照防止(Msg6)**: 全要素に ISO-8601+monotonic タイムスタンプ → 組立時に相対時刻(「3分前」等)を明示注入。RAG/feedback/vision は**応答前に非同期準備済み**にしキャッシュ参照（≤3s 予算のため）。無言時 random RAG は「話題の種」と明示ラベルし「思い出話」と峻別。
-- **関わり**: RAG / FeedbackLLM / VLM / SurpriseBus(自己懐疑ヒント) / 応答LLM。**ここが「今の会話に接地」を強制する責任点。**
+## C. ContextAssembler（過去参照防止の要 + 話者ロール接地）【実装済・native ロール（Fix4）】
+- **挙動**: 応答LLM への文脈を **native チャットロール messages** で組み立てる（`assemble(...) -> list[dict]`）。
+  - `system` = systemプロンプト(スタイル) + **ロールアンカー「assistant=イブ自身／user=相手・自分の発話に返事しない」** + 文脈(過去の記憶RAG/話題の種/画面/直近feedback/発話判定理由)。
+  - 会話 = `user`/`assistant` の **native ターン列**（連続同roleはマージ・中略マーカ保持）。
+  - 最終 = ユーザ発話(user) or **自発指示**「返事でなくイブ自身から一言」(user)。
+- **なぜ native ロール（Fix3/Fix4）**: 1個の `role:"user"` ブロブに会話を詰めるとモデルが話者を取り違え、**自分(イブ)の発話に自分で返事/自分の質問に自答**する実機事故が出た。assistant=イブをモデル本来のロール構造で示し構造的に防ぐ（実機で解消確認）。自発の content は「ユーザ発話」枠でなく自発指示として渡す。
+- **過去参照防止(Msg6)**: RAG/feedback/vision は **system に相対時刻付き**で接地（無言時 random RAG は「話題の種」と明示ラベルし「過去の記憶」と峻別）。直近会話ターンは本文のみ（相対時刻前置きは応答LLMが復唱する leak のため撤去＝Fix4b）。
+- **関わり**: RAG / FeedbackLLM / VLM / 応答LLM。**ここが「今の会話に接地」+「話者ロール接地」を強制する責任点。**
 
 ---
 
