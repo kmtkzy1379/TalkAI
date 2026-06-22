@@ -9,6 +9,14 @@ Eve v2 = AI VTuber + 画面認識(VLM) 統合のデスクトップアプリ。v1
 - 永続化: JSONL / TXT フラットファイル（DB なし）
 - 外部API: OpenAI / Gemini / Groq / (Anthropic=現在停止中) / VOICEVOX(HTTP 127.0.0.1:50021) / VTube Studio(WebSocket) / YouTube Data API
 
+## 実装状況（2026-06-20・コードが正）
+
+実装順に **F0 / F1 / F2 / F2.5 / F3 / F3.5 / P2 スレッド掃除(裁定a) / F4 FeedbackLLM / F5 発話判定(沈黙→自発発話)** まで完了。
+Tier-1 決定論テスト **158件が2回連続 PASS**。未実装: SurpriseBus(多生産者集約・VLM時)・(b)自己懐疑(タスク隣接)・VLM・Call-Function・YouTube・UI・配線層PORT(vts/run/launcher/app)。**中核原理 surprise は生産者(F4 `PredictionState`)+消費(F5 `should_speak`)が両方稼働**。**surprise は数値で発話を絶対決定せず「指標」として発話判定LLMが感情/内容と総合判断**（Fix2 裁定・HI/LO 強制ゲート撤廃）。T2 は「surprise が必須引数として判定に効く配線」。**応答文脈は native チャットロール(system+user/assistant ターン列)で組む＝話者取り違え防止(Fix4・`context_assembler.assemble` は messages リストを返す)**。多生産者 SurpriseBus は VLM 時に。
+- **引き継ぎ・未対応問題(P1-P3)・docs訂正は `docs/HANDOFF.md` に集約**（新セッションは最初に読む）。
+- 現状は**単一 asyncio ループ前提**（mic read=executor／VAD 推論=ループ上同期）。cross-thread 機構は **P2 裁定(a)で削除済**＝loop が全共有 state の唯一所有者。将来 OS スレッドは `PIPELINE_DESIGN.md §9.3` の橋渡し契約経由（VAD 別スレッド化＝最初の利用候補）。
+- 埋め込みは `eve/memory/embed/make_embedder(ruri|openai)`（**ModelRegistry とは別系統**・`make_stt` と同方式）。Ruri v3-310m 既定。
+
 ## 中核原理（最優先・絶対に薄めない）
 
 **予測誤差(surprise)をリアルタイム一級信号にする。** surprise は (a)自発発話の要否/内容 と (b)文脈不整合の自己懐疑 の両方を**必須引数として**ゲートする。`should_speak(...)` は surprise を `Optional` にしない。surprise を反転したら発話/沈黙判定が反転する death-detection テストが通らなければビルド失敗（v1 で FEP が装飾化した＝症状の根、を再発させない）。
@@ -19,6 +27,7 @@ Eve v2 = AI VTuber + 画面認識(VLM) 統合のデスクトップアプリ。v1
 - **エッジだけストリーミング**: 入力=増分STT(50–300ms partial で投機開始)、出力=token stream→文分割→TTS→順次再生。間の応答LLMはターン制（VAD/沈黙で境界）。フルデュプレックスにはしない（確定済の設計判断）。
 - **ModelRegistry(role→model 間接層)**: provider 非依存。`.env` 既定 + UI から swap/temp。**Claude API は現在停止中 → Sonnet 役は GPT/Gemini で代用**。後で Claude に戻せるよう間接層は必須。
 - **surprise の単一更新者**: `SurpriseBus`/`PredictionState` は asyncio loop 所有・同期読み・ロックなし。FeedbackLLM の prediction-diff(0-100) と VLM の screen-diff を集約。
+- **スレッドモデルの正**: loop 単一所有・単一書込・ロックなし。`run_in_executor` は state 非接触で値を返すだけ。真の OS スレッドは連続 capture が強制する時のみ＋`PIPELINE_DESIGN.md §9.3` 橋渡し契約必須（OS スレッドは loop 所有 state を直接 mutate 禁止）。サイドカー(FeedbackLLM/VLM/task/search)は §9.4 契約に従う（single-flight + 背圧 latest-wins/watermark）。
 
 ## v2 で必ず潰す v1 の問題（必要なものだけ記憶）
 

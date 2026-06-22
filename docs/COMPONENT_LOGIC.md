@@ -1,5 +1,9 @@
 # Eve v2 — コンポーネント挙動仕様（優先順位決定の前提）
 
+> **⚠ 実装で更新された点 (2026-06-20・コードが正)**: A-1 STT は **partial 投機なし**（VAD区間→final）・AEC 不採用。
+> §I RAG は **件数 500**（300は旧値）、注入は直近6ターン、ランキングに **異方性 baseline 補正**を追加、
+> 埋め込みは **make_embedder**（ModelRegistry role でない）。実装状況・最新仕様は `docs/HANDOFF.md`。
+
 > 目的: 各ロジックが「何をどう処理し、どう振る舞うか」と「どの機能と関わるか」を、**具体コードの前に**確定する。これがないと優先順位を決めても後で破綻する（ユーザ指示）。
 > 出典: `PIPELINE_DESIGN.md`（骨格）+ 4並列調査エージェント（claw-code / Scrapling / screen-op安全 / OSSサーベイ、いずれも一次ソース確認済）。
 > 凡例: 【確定】=企画書/調査で決まり。【推奨】=本書の設計提案。【要決定】=ユーザ裁定待ち。
@@ -26,10 +30,14 @@
 
 ---
 
-## C. ContextAssembler（過去参照防止の要）【確定/推奨】
-- **挙動**: 応答LLM への文脈を組み立てる。入力 = 発話 + systemプロンプト + 直近5ターン + RAG2 + 直近feedback1 + 画面認識(統合済) + 発話判定理由 + CallFunction定義。
-- **過去参照防止(Msg6)**: 全要素に ISO-8601+monotonic タイムスタンプ → 組立時に相対時刻(「3分前」等)を明示注入。RAG/feedback/vision は**応答前に非同期準備済み**にしキャッシュ参照（≤3s 予算のため）。無言時 random RAG は「話題の種」と明示ラベルし「思い出話」と峻別。
-- **関わり**: RAG / FeedbackLLM / VLM / SurpriseBus(自己懐疑ヒント) / 応答LLM。**ここが「今の会話に接地」を強制する責任点。**
+## C. ContextAssembler（過去参照防止の要 + 話者ロール接地）【実装済・native ロール（Fix4）】
+- **挙動**: 応答LLM への文脈を **native チャットロール messages** で組み立てる（`assemble(...) -> list[dict]`）。
+  - `system` = systemプロンプト(スタイル) + **ロールアンカー「assistant=イブ自身／user=相手・自分の発話に返事しない」** + 文脈(過去の記憶RAG/話題の種/画面/直近feedback/発話判定理由)。
+  - 会話 = `user`/`assistant` の **native ターン列**（連続同roleはマージ・中略マーカ保持）。
+  - 最終 = ユーザ発話(user) or **自発指示**「返事でなくイブ自身から一言」(user)。
+- **なぜ native ロール（Fix3/Fix4）**: 1個の `role:"user"` ブロブに会話を詰めるとモデルが話者を取り違え、**自分(イブ)の発話に自分で返事/自分の質問に自答**する実機事故が出た。assistant=イブをモデル本来のロール構造で示し構造的に防ぐ（実機で解消確認）。自発の content は「ユーザ発話」枠でなく自発指示として渡す。
+- **過去参照防止(Msg6)**: RAG/feedback/vision は **system に相対時刻付き**で接地（無言時 random RAG は「話題の種」と明示ラベルし「過去の記憶」と峻別）。直近会話ターンは本文のみ（相対時刻前置きは応答LLMが復唱する leak のため撤去＝Fix4b）。
+- **関わり**: RAG / FeedbackLLM / VLM / 応答LLM。**ここが「今の会話に接地」+「話者ロール接地」を強制する責任点。**
 
 ---
 
@@ -47,16 +55,23 @@
 
 ---
 
-## F. 発話判定LLM（沈黙経路・クリティカルパス外）【確定】
-- **挙動**: 5s 沈黙で起動。入力 = "…" + 直近会話 + ランダムRAG2 + 画面認識 + **surprise**。True なら(理由+応答LLMへの入力)を返し autonomous_speech 刺激に。False なら(理由→ログのみ)で無音。VAD のターン終端とは役割分離（VAD=話し終え検出 / 沈黙タイマー=誰も話さない時間）。
-- **関わり**: SurpriseBus(読) / RAG(random) / VLM / StimulusQueue / ModelRegistry(軽量高速役)。
+## F. 発話判定LLM（沈黙経路・クリティカルパス外）【実装済 2026-06-21・F5】
+- **実装**: `eve/speech/decider.py`(should_speak/パーサ/decide_fn) + `eve/speech/monitor.py`(SpeechState/SilenceMonitor/SpeechDecider)。
+- **挙動**: **5秒沈黙**で起動（フラット5秒で連続再評価＝実世界を細かく観測）。入力 = "…" + 直近会話 + ランダムRAG2(`rag.random`=話題の種) + **イブの今の感情/要約(直近フィードバック)** + 画面認識(VLM後続) + **surprise**。True なら(理由+応答LLMへの入力 content)を返し `AUTONOMOUS_SPEECH` 刺激に。False なら(理由→**発話判定ログのみ**・応答LLMには入れない＝「楽な False」偏り防止)。speak で content 空なら全 speak 経路で fallback。VAD のターン終端とは役割分離（VAD=話し終え検出 / 沈黙監視=誰も話さない時間）。
+- **surprise は「指標」（数値で絶対決定しない・ユーザ裁定 Fix2）**: HI/LO の数値強制ゲートは**撤廃**。人間も予想が外れたから必ず話す/当たったから必ず黙る訳ではない（感情/思考が高ぶる/安定するだけ）。surprise+感情+内容を**発話判定LLMが総合判断**。唯一の hard ゲートは `pending_obligation`（予約締切等の事実・将来 Call-Function）。**T2 death-detection は「surprise が必須引数として判定に効く配線」へ作り替え**（surprise を読む fake で振ると判定が反転・Optional 化禁止）。
+- **発話判定ログ**: True/False とも `{ts,speak,reason,content}` を deque(10) で記録・**処理には関与しない**（観測専用）。
+- **Q3 裁定（企画書どおり単純化）**: バックオフ/再挨拶抑制/沈黙カテゴリは**不採用**。モノローグ/再挨拶が出たら抑制で隠さず should_speak/文脈/feedback を直す。
+- **ガード（loop・OS スレッド0・ロック0）**: 応答中(`runner.is_busy()`)/ユーザ発話中(`user_speaking`)/5秒未満 では発火しない。SpeechDecider は single-flight。
+- **関わり**: `PredictionState.surprise`(読・単一生産者) / RAG(random) / StimulusQueue / ModelRegistry(role `speech_decide`)。
 
 ---
 
-## G. FeedbackLLM（内分泌系・遅延許容・非同期）【確定】
-- **挙動**: 各応答後に非同期起動。出力 = emotion / summary / user-emotion推定 / next-prediction / **prediction-diff(0-100)**。沈黙時は話題提案。応答クリティカルパスに乗らない。
-- **関わり**: SurpriseBus(diff を書込) / RAG(summary を1チャンク=FB1+応答1 で保存) / ContextAssembler(直近feedback1)。
-- **PORT**: v1 `feedback_llm.py` の3段fallback/cache_control を ModelRegistry に一般化（gpt-4o ハードコード/anthropic既定は撤去）。
+## G. FeedbackLLM（内分泌系・遅延許容・非同期）【実装済 2026-06-21・F4】
+- **実装**: `eve/feedback/`（`prediction_state.py` / `parser.py` / `prompts.py` / `feedback_llm.py` / `worker.py`）。各応答後に `FeedbackWorker`（single-flight サイドカー）が非同期起動。出力 = summary / emotion / user-emotion / next-prediction / **prediction-diff(0-100)** / reason / tags。応答クリティカルパスに乗らない（トリガは O(1)・worker は別タスク）。
+- **watermark/span 方式（ユーザ裁定）**: 入力は「前回フィードバック地点〜最新」のスパンを必ずカバー＝**未フィードバックの会話＝記憶喪失を作らない**。watermark は RAG 書込成功時のみ前進・起動時 catch-up・shutdown 未完は未前進で次回回収。
+- **関わり**: `PredictionState`(diff=surprise をメソッド API で書込・単一書込) / RAG(`add_chunk` で 1チャンク=FB1+応答1・圧縮埋め込み/展開注入) / ContextAssembler(`last_feedback` を build 時に同期読み)。
+- **F5 へ繰越**: 沈黙時の話題提案は発話判定LLM側へ。多生産者 `SurpriseBus`(FB diff + VLM screen-diff) は F5（F4 は単一生産者 `PredictionState`・surprise はメソッド API なので2生産者化で呼出側不変）。
+- **PORT 方針の実際**: v1 `feedback_llm.py` の3段 fallback は**採用せず**（lean・サイドカーは失敗を no-op で許容し次 run で回復）。cache_control も現状不要。モデルは ModelRegistry role="feedback"（gpt-4o ハードコード/anthropic 既定は持ち込まない）。出力は JSON でなく**タグ付きテキスト**（小モデルの部分出力に頑健・parser は raise しない）。
 
 ---
 

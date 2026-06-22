@@ -1,0 +1,169 @@
+"""VoiceLoop — フルループ組み立て（mic→STT→応答LLM→TTS→再生）。
+
+F0–F2.5 の部品を結線する本体。UI(F6) はこれを包む想定。レイテンシ重視:
+- 起動時ウォームアップで cold-start を消す。
+- 全段 asyncio タスク（ブロッキングI/Oのみ executor）。
+- barge-in は MicSttInputSource が発話開始で audio.interrupt()。
+"""
+from __future__ import annotations
+
+import asyncio
+import logging
+from typing import Optional
+
+from .context_assembler import ContextAssembler
+from .feedback import FeedbackLLM, FeedbackWorker, PredictionState
+from .memory import ConversationCache, RagStore
+from .memory.embed import make_embedder
+from .model_registry import ModelRegistry
+from .pipeline.audio_play_queue import AudioPlayQueue
+from .pipeline.orchestrator import PipelineRunner
+from .pipeline.stimulus import StimulusKind
+from .pipeline.stimulus_queue import StimulusQueue
+from .response.input_source import MicSttInputSource
+from .response.orchestrator import ResponseOrchestrator
+from .response.player import RealAudioPlayer
+from .response.style import SPEECH_STYLE
+from .response.tts import VoicevoxTTS
+from .speech import SilenceMonitor, SpeechDecider, SpeechState, make_decide_fn
+from .stt import make_stt
+
+logger = logging.getLogger(__name__)
+
+
+class VoiceLoop:
+    def __init__(self) -> None:
+        self.registry = ModelRegistry()
+        self.player = RealAudioPlayer()
+        self.audio = AudioPlayQueue(play_fn=self.player.play_fn)
+        self.queue = StimulusQueue()
+        self.tts = VoicevoxTTS()
+        self.stt = make_stt()
+        self.cache = ConversationCache()  # 短期記憶（会話ログ・直近注入・実発話記録）
+        self.rag = RagStore(make_embedder())  # 長期記憶（連想想起）
+
+        # F4 内分泌系: 各応答後に非同期で内省 → RAG 書込 + surprise + 直近フィードバック注入。
+        self.prediction = PredictionState()  # loop 所有・単一書込（feedback worker のみ書く）
+        self.feedback = FeedbackLLM(self.registry, rag_store=self.rag, prediction_state=self.prediction)
+        self.feedback_worker = FeedbackWorker(self.feedback, self.cache)
+
+        # F5 発話判定: 5秒沈黙で should_speak → True で AUTONOMOUS_SPEECH を投入。
+        self.speech_state = SpeechState()  # loop 所有 ephemeral（沈黙計測/発話判定ログ）
+        self.speech_decider = SpeechDecider(
+            state=self.speech_state, cache=self.cache, rag=self.rag,
+            prediction_state=self.prediction, queue=self.queue,
+            decide_fn=make_decide_fn(self.registry),  # role=speech_decide
+        )
+
+        async def stream_fn(messages):
+            async for delta in self.registry.stream("response", messages):
+                yield delta
+
+        self.orchestrator = ResponseOrchestrator(
+            # system プロンプト= SPEECH_STYLE（最小スタイル指示・ペルソナではない）。
+            # 空 ContextAssembler() を渡すと system 無しで応答が "システム応答…" と自己ラベル化する
+            # leak が出るため、明示的に SPEECH_STYLE を与える。
+            self.audio, stream_fn, self.tts.generate,
+            ContextAssembler(system_prompt=SPEECH_STYLE),
+            conversation_cache=self.cache, rag_store=self.rag,
+            prediction_state=self.prediction,
+            on_response_complete=self._on_response_complete,  # 正常完了で feedback + 沈黙時計リセット
+        )
+        self.runner = PipelineRunner(self.queue, self.orchestrator, self.audio)
+        # 沈黙監視は応答中(runner busy)/ユーザ発話中は発火しない（is_busy をガードに使う）。
+        self.silence_monitor = SilenceMonitor(
+            state=self.speech_state, decider=self.speech_decider, is_busy_fn=self.runner.is_busy,
+        )
+        self.input = MicSttInputSource(
+            self.queue, self.stt,
+            on_speech_start=self._barge_in,                      # ユーザ発話開始（barge-in）
+            on_utterance=self.speech_state.mark_user_utterance,  # 発話終了→沈黙時計リセット
+        )
+        self._tasks: list[asyncio.Task] = []
+
+    def _barge_in(self) -> None:
+        """発話開始の瞬間: 音声停止＋進行中応答キャンセル（Eve が即譲る）。"""
+        logger.info("⏸ 発話検知（割り込み）")
+        self.audio.interrupt()
+        self.runner.interrupt()  # 進行中応答(自発含む)を cancel＝実発話分のみ記録(C5)
+        # F5: ユーザ優先。判定中の自発発話は seq 変化で自己破棄、キュー済みの自発刺激は削除。
+        self.speech_state.mark_user_speech_start()
+        self.queue.discard_kind(StimulusKind.AUTONOMOUS_SPEECH)
+
+    def _on_response_complete(self) -> None:
+        """応答 正常完了: F4 feedback を起こす + F5 沈黙時計をリセット（Eve が喋った）。"""
+        self.feedback_worker.trigger()
+        self.speech_state.mark_eve_activity()
+
+    async def warmup(self) -> None:
+        """STT/LLM/TTS を1回空打ちして cold-start（初回の数秒遅延）を消す。"""
+        logger.info("ウォームアップ開始")
+        await self.stt.warmup()
+        try:
+            await self.rag.warmup()  # 埋め込みモデルの初回ロードを先に済ませる
+        except Exception as e:
+            logger.warning("RAG ウォームアップ失敗（続行）: %s", e)
+        try:
+            # max_tokens は付けない: reasoning 系(gpt-5.x)は1トークンで完了できず BadRequest 警告に
+            # なる。warmup は一度きり・"hi" への短応答なのでコストは無視できる。
+            await self.registry.complete("response", [{"role": "user", "content": "hi"}])
+        except Exception as e:
+            logger.warning("LLM ウォームアップ失敗（続行）: %s", e)
+        try:
+            await self.tts.generate("。")
+        except Exception as e:
+            logger.warning("TTS ウォームアップ失敗（続行）: %s", e)
+        logger.info("ウォームアップ完了")
+
+    async def run(self) -> None:
+        await self.cache.initialize()  # 既存ログ復元 + 書き込み worker 起動
+        await self.rag.initialize()  # 既存 RAG 記憶を復元 + 書き込み worker 起動
+        # F4 起動時 catch-up: watermark を永続 RAG の最新 timestamp から復元し、
+        # それより新しい復元会話（前回 feedback 途中で落ちた tail）を1回取り戻す。
+        self.prediction.watermark = self.rag.latest_timestamp()
+        self.feedback_worker.start()
+        if self.cache.turns_since(self.prediction.watermark):
+            self.feedback_worker.trigger()
+        await self.warmup()
+        self._tasks.append(asyncio.create_task(self.audio.play_worker()))
+        self._tasks.append(asyncio.create_task(self.runner.run()))
+        # F5: 発話判定 worker + 沈黙監視を起動（沈黙時計の baseline をここでリセット）。
+        self.speech_state.mark_eve_activity()
+        self.speech_decider.start()
+        self.silence_monitor.start()
+        await self.input.start()  # mic + STT 消費タスクを起動
+        logger.info("VoiceLoop 稼働。話しかけてください。")
+        await asyncio.Event().wait()  # キャンセルされるまで稼働
+
+    async def stop(self) -> None:
+        self.input.stop()
+        # F5: 沈黙監視を止め（新規トリガを断つ）→ 発話判定 worker を drain/停止。
+        try:
+            await self.silence_monitor.stop()
+        except Exception:
+            pass
+        try:
+            await self.speech_decider.stop()
+        except Exception:
+            pass
+        # feedback worker を先に drain/停止（進行中 add_chunk を rag.shutdown 前に flush 機会を与える。
+        # 未完分は watermark 未前進なので次回起動の catch-up が回収＝記憶喪失を作らない）。
+        try:
+            await self.feedback_worker.stop()
+        except Exception:
+            pass
+        for t in self._tasks:
+            t.cancel()
+        try:
+            await self.cache.shutdown()  # 書き込みキューをドレイン（記録を取りこぼさない）
+        except Exception:
+            pass
+        try:
+            await self.rag.shutdown()
+        except Exception:
+            pass
+        try:
+            await self.tts.close()
+        except Exception:
+            pass
+        self.player.close()

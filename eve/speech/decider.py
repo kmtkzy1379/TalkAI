@@ -1,0 +1,187 @@
+"""F5 発話判定（should_speak）— 企画書フロー + 中核原理 surprise を「指標」として総合判断。
+
+企画書: ユーザ5秒無言で `…` を発話判定LLMに送る。LLM は「話す/黙る」を判断し、
+True なら(理由+応答LLMへ渡す content)、False なら(理由)を返す（理由は両方で必須＝
+「楽な False」への偏り防止）。
+
+**surprise は数値で判定を絶対決定しない（ユーザ裁定）**: 人間も予想が外れたから必ず話す訳でも、
+当たったから必ず黙る訳でもない（感情/思考が高ぶる/安定するだけ）。よって surprise は **各感情
+(直近フィードバック) と内容と合わせて発話判定LLMが総合判断する「指標(必須入力)」**として渡す。
+唯一の hard ゲートは pending_obligation（予約締切等の事実・将来 Call-Function）。
+
+T2 death-detection（surprise の非装飾性）: surprise は **必須引数**（Optional 化禁止）で decide_fn へ
+配線され、判定を動かしうる。surprise を読む fake decide_fn で値を振ると判定が反転することを検証
+（surprise が決定に効く配線である保証）。解析失敗は silence へ保守的フォールバック。
+"""
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass
+from typing import Awaitable, Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+# 話す判断だが LLM が content を出さなかった時の最小ヒント（応答LLMが文脈から膨らませる）。
+_FALLBACK_CONTENT = "（今の状況に自然に一言）"
+
+
+@dataclass(frozen=True)
+class AutonomousSpeech:
+    """自発発話の刺激 payload（content=応答LLMへ渡す内容 / reason=なぜ話すか）。"""
+
+    content: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class SpeechDecision:
+    speak: bool
+    reason: str
+    content: str = ""
+
+
+# decide_fn の型: 文脈を受けて LLM 判断（SpeechDecision）を返す。テストは fake を注入。
+DecideFn = Callable[..., Awaitable[SpeechDecision]]
+
+
+# ---- 出力パーサ（タグ付きテキスト・raise しない）-------------------------
+def _extract(text: str, *aliases: str) -> str:
+    for a in aliases:
+        m = re.search(rf"^\s*{re.escape(a)}\s*[:：]\s*(.+?)\s*$", text, re.IGNORECASE | re.MULTILINE)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+_YES = re.compile(r"(yes|true|話す|はい|y\b|1)", re.IGNORECASE)
+
+
+def parse_speech_decision(text: Optional[str]) -> SpeechDecision:
+    """発話判定LLM の出力 → SpeechDecision。raise しない・不明瞭は保守的に silence。"""
+    text = text or ""
+    raw_speak = _extract(text, "speak", "判定", "話す")
+    reason = _extract(text, "reason", "理由")
+    content = _extract(text, "content", "内容", "発話")
+    if raw_speak:
+        speak = bool(_YES.search(raw_speak)) and "no" not in raw_speak.lower() and "黙" not in raw_speak
+    else:
+        # 保守的: speak タグが無ければ黙る（content の有無で speak と推定しない＝不明瞭は silence）。
+        speak = False
+    if not (raw_speak or reason or content):
+        return SpeechDecision(False, "発話判定の出力を解析できず沈黙（保守）", "")
+    return SpeechDecision(speak=speak, reason=reason or "(理由なし)", content=content)
+
+
+# ---- 本体（pending だけ hard・surprise は指標として LLM が総合判断）----------
+async def should_speak(
+    *,
+    surprise: int,  # 必須・非 Optional（中核原理: surprise を装飾化させない・指標として配線）
+    silence_seconds: float,
+    recent_turns,
+    topic_seeds,
+    decide_fn: DecideFn,
+    last_feedback: Optional[str] = None,  # イブの今の感情/要約（直近フィードバック）
+    pending_obligation: bool = False,
+) -> SpeechDecision:
+    if pending_obligation:
+        # 唯一の hard ゲート（事実: 予約締切等。感情でないのでここだけ確定で沈黙）。
+        # 将来 Call-Function/task が締切近接を計算して渡す（今は常に False）。
+        return SpeechDecision(False, "保留中の予約/義務があるため沈黙", "")
+    # surprise + 感情(last_feedback) + 会話 + 話題の種 を渡し、LLM が総合判断（数値で強制しない）。
+    d = await decide_fn(
+        surprise=surprise,
+        silence_seconds=silence_seconds,
+        recent_turns=recent_turns,
+        topic_seeds=topic_seeds,
+        last_feedback=last_feedback,
+    )
+    if d.speak and not (d.content or "").strip():
+        # 話す判断だが content が空 → 全 speak 経路で最小ヒントを保証（応答LLMが膨らませる）。
+        return SpeechDecision(True, d.reason, _FALLBACK_CONTENT)
+    return d
+
+
+# ---- 本番 decide_fn（ModelRegistry role=speech_decide）---------------------
+_SPEAKER_LABEL = {"user": "ユーザ", "eve": "イブ"}
+
+SPEECH_DECIDE_SYSTEM = """\
+あなたはAI VTuber「イブ」の発話判定モジュールです。今は誰も話していない沈黙状態。
+直近の会話・話題の種・イブの今の感情(直近フィードバック)・予測差(surprise)を**総合的に**見て、
+イブが今"自分から"話すべきか黙るべきかを判断します。
+- **surprise(予測差)は強い指標だが絶対ではない**: 高くても必ず話すわけではなく感情/思考が高ぶるだけ、
+  低くても必ず黙るわけではなく感情/思考が安定するだけ。最終判断は文脈と内容で行う。
+- 話すべき: 文脈的に話す内容がある／場をつなぐ／気になることがある等。**挨拶の繰り返しはしない**。
+- 黙るべき: 特に言うことがない／ユーザの間を尊重すべき。
+必ず次の形式で1行ずつ出力（**理由は話す/黙る どちらでも必須**）:
+speak: yes または no
+reason: なぜそう判断したか（1文）
+content: 話すなら、イブが実際に話す内容のたたき台（1文）。黙るなら空でよい。"""
+
+
+def _render_turns(turns) -> str:
+    lines = []
+    for t in turns or []:
+        label = _SPEAKER_LABEL.get(getattr(t, "speaker", ""), getattr(t, "speaker", ""))
+        lines.append(f"[{label}] {getattr(t, 'text', '')}")
+    return "\n".join(lines) or "（直近の会話なし）"
+
+
+def _render_seeds(seeds) -> str:
+    lines = [f"・{getattr(c, 'text', '')}" for c in (seeds or [])]
+    return "\n".join(lines) or "（なし）"
+
+
+def build_decide_messages(
+    *, surprise: int, silence_seconds: float, recent_turns, topic_seeds, last_feedback: Optional[str] = None
+) -> list[dict]:
+    fb = (last_feedback or "").strip() or "（なし）"
+    user = (
+        "…\n\n"
+        f"# 直近の会話\n{_render_turns(recent_turns)}\n\n"
+        f"# 話題の種（新しい話を振る材料・思い出話に縛られない）\n{_render_seeds(topic_seeds)}\n\n"
+        f"# イブの今の状態（直近フィードバック: 感情/要約）\n{fb}\n\n"
+        f"# 状況\n沈黙{silence_seconds:.0f}秒 / 予測差(surprise)={surprise}"
+        "（指標。高=思考/感情が高ぶる・低=安定。これだけで決めない）"
+    )
+    return [
+        {"role": "system", "content": SPEECH_DECIDE_SYSTEM},
+        {"role": "user", "content": user},
+    ]
+
+
+def make_decide_fn(registry) -> DecideFn:
+    """ModelRegistry role=speech_decide を叩く本番 decide_fn を作る。"""
+
+    async def decide_fn(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None) -> SpeechDecision:
+        messages = build_decide_messages(
+            surprise=surprise, silence_seconds=silence_seconds,
+            recent_turns=recent_turns, topic_seeds=topic_seeds, last_feedback=last_feedback,
+        )
+        try:
+            resp = await registry.complete("speech_decide", messages)
+        except Exception:
+            logger.exception("発話判定LLM 呼び出し失敗（沈黙にフォールバック）")
+            return SpeechDecision(False, "発話判定LLM 失敗のため沈黙（保守）", "")
+        return parse_speech_decision(_content(resp))
+
+    return decide_fn
+
+
+def _content(resp: object) -> str:
+    try:
+        c = resp.choices[0].message.content  # type: ignore[attr-defined]
+        if isinstance(c, str):
+            return c
+    except (AttributeError, IndexError, KeyError, TypeError):
+        pass
+    if isinstance(resp, dict):
+        try:
+            c = resp["choices"][0]["message"]["content"]
+            if isinstance(c, str):
+                return c
+        except (KeyError, IndexError, TypeError):
+            pass
+    if isinstance(resp, str):
+        return resp
+    return ""
