@@ -10,8 +10,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from eve.vlm import ChangeDetector, parse_vision  # noqa: E402
+from eve.feedback import NEUTRAL_SURPRISE, PredictionState  # noqa: E402
+from eve.vlm import ChangeDetector, Frame, VisionState, parse_vision  # noqa: E402
 from eve.vlm.change_detector import hamming  # noqa: E402
+
+
+def _frame(fid: int, blank: bool = False) -> Frame:
+    return Frame(frame_id=fid, mono_ts=float(fid), jpeg_b64=f"b64-{fid}", blank=blank)
 
 _passed = 0
 _failed = 0
@@ -99,6 +104,51 @@ def t_hamming() -> bool:
     return hamming(0b1010, 0b0001) == 3
 
 
+# ===== VisionState（ring / snapshot）=====
+def t_ring_cap_drop_oldest() -> bool:
+    vs = VisionState(ring_max=3)
+    for i in range(5):
+        vs.add_frame(_frame(i))
+    ids = [f.frame_id for f in vs.ring]
+    return len(vs.ring) == 3 and ids == [2, 3, 4]  # 最古(0,1)が drop
+
+
+def t_snapshot_last_k() -> bool:
+    vs = VisionState(ring_max=6)
+    for i in range(5):
+        vs.add_frame(_frame(i))
+    snap = vs.snapshot(2)
+    return [f.frame_id for f in snap] == [3, 4] and isinstance(snap, list)
+
+
+# ===== surprise 合成（most-recent-wins・A4/Q2）=====
+def t_surprise_cold_neutral() -> bool:
+    return PredictionState().surprise == NEUTRAL_SURPRISE
+
+
+def t_surprise_vlm_only() -> bool:
+    s = PredictionState()
+    s.note_vlm_surprise(80)
+    return s.surprise == 80
+
+
+def t_surprise_most_recent_wins() -> bool:
+    s = PredictionState()
+    s.note_vlm_surprise(80)
+    a = s.surprise  # 80
+    s.note_feedback_surprise(10)
+    b = s.surprise  # feedback が最新 → 10（max なら 80 のはず）
+    s.note_vlm_surprise(70)
+    c = s.surprise  # vlm が最新 → 70
+    return a == 80 and b == 10 and c == 70
+
+
+def t_surprise_vlm_clamp() -> bool:
+    s = PredictionState()
+    s.note_vlm_surprise(150)
+    return s.surprise == 100  # 上限クランプ
+
+
 def main() -> None:
     check("parse valid", t_parse_valid())
     check("parse garbage 安全(raise しない)", t_parse_garbage_safe())
@@ -112,6 +162,12 @@ def main() -> None:
     check("gate 微小変化(<閾値)→False", t_gate_small_change_below_threshold())
     check("gate periodic 強制", t_gate_periodic_forced())
     check("hamming 距離", t_hamming())
+    check("ring 上限 drop-oldest", t_ring_cap_drop_oldest())
+    check("snapshot 直近k枚 value-copy", t_snapshot_last_k())
+    check("surprise cold→NEUTRAL", t_surprise_cold_neutral())
+    check("surprise vlm 単独", t_surprise_vlm_only())
+    check("A4 surprise most-recent-wins(maxでない)", t_surprise_most_recent_wins())
+    check("surprise vlm クランプ", t_surprise_vlm_clamp())
 
 
 if __name__ == "__main__":

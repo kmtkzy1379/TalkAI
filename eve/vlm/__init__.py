@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from .change_detector import ChangeDetector, hamming
 from .parser import parse_vision
+from .state import VisionState
 from .types import Frame, VisionResult
 
 __all__ = [
@@ -17,4 +18,5 @@ __all__ = [
     "parse_vision",
     "ChangeDetector",
     "hamming",
+    "VisionState",
 ]

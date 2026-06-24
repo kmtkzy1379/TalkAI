@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from ..clock import now_mono
+
 # 予測対象が無い/不明な時の中立 surprise（cold start・初期値）。
 # 0 は「完璧に予測できた」を意味し沈黙を不当に誘発するため使わない（surprise を装飾化させない）。
 NEUTRAL_SURPRISE = 20
@@ -35,16 +37,36 @@ class PredictionState:
         self.last_prediction: Optional[str] = None
         self.last_feedback: Optional[str] = None
         self.watermark: Optional[str] = None  # iso（排他）。これより後のターンが未 feedback
-        self._surprise: int = NEUTRAL_SURPRISE
+        # surprise は2生産者（F4 feedback / F6 VLM screen-diff）。各 source を ts 付きで保持し
+        # **most-recent-source-wins** で読む（max でない＝過去の画面フラッシュが高値固定する
+        # staleness/数値ゲート化を避ける。surprise は「今どれだけ意外か」）。
+        self._fb_surprise: Optional[int] = None
+        self._fb_ts: float = 0.0
+        self._vlm_surprise: Optional[int] = None
+        self._vlm_ts: float = 0.0
 
     @property
     def surprise(self) -> int:
-        """直近の予測差(0-100)。F4 は feedback 寄与をそのまま返す。
+        """直近の予測差(0-100)。feedback / VLM のうち**最後に書いた source の値**を返す。
 
-        F5 で VLM が加わったら per-source を合成して返すよう拡張する（呼出側は不変）。
+        両 source 未書込なら NEUTRAL。max でなく most-recent-wins なのは、古い高 surprise が
+        固定化して「今」を歪めるのを防ぐため（T2 death-detection は live source 反転で維持）。
         """
-        return self._surprise
+        fb, vlm = self._fb_surprise, self._vlm_surprise
+        if fb is None and vlm is None:
+            return NEUTRAL_SURPRISE
+        if vlm is None:
+            return fb  # type: ignore[return-value]
+        if fb is None:
+            return vlm
+        return vlm if self._vlm_ts >= self._fb_ts else fb
 
     def note_feedback_surprise(self, diff: object) -> None:
-        """FeedbackLLM からの予測差を反映（唯一の surprise writer）。"""
-        self._surprise = clamp_surprise(diff)
+        """FeedbackLLM(F4) からの予測差を反映（feedback source・most-recent 比較用に ts 記録）。"""
+        self._fb_surprise = clamp_surprise(diff)
+        self._fb_ts = now_mono()
+
+    def note_vlm_surprise(self, diff: object) -> None:
+        """VLM(F6) screen-diff からの予測差を反映（第2生産者・most-recent 比較用に ts 記録）。"""
+        self._vlm_surprise = clamp_surprise(diff)
+        self._vlm_ts = now_mono()
