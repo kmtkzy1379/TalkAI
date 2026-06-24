@@ -421,6 +421,56 @@ async def t_notable_guarded_trigger() -> bool:
     return res == [0, 1]  # guard False→0回 / True→1回
 
 
+# ===== capture / capture_thread（grab は注入・mss 不使用）=====
+def t_capture_blank_and_valid() -> bool:
+    import numpy as np
+
+    from eve.vlm.capture import ScreenCapture
+    black = np.zeros((40, 60, 3), dtype=np.uint8)
+    noisy = np.random.RandomState(0).randint(0, 255, (40, 60, 3)).astype(np.uint8)
+    fb, _ = ScreenCapture(grab_fn=lambda: black, blank_std_threshold=6.0).capture_one()
+    fn, ph = ScreenCapture(grab_fn=lambda: noisy, blank_std_threshold=6.0).capture_one()
+    return fb.blank and (not fn.blank) and len(fn.jpeg_b64) > 0 and isinstance(ph, int)
+
+
+def t_capture_thread_step_delivers() -> bool:
+    from eve.vlm.capture_thread import CaptureThread
+    delivered: list = []
+    seq = iter([(_frame(0), 0x0), (_frame(1), (1 << 64) - 1)])
+
+    class FakeCap:
+        def capture_one(self):
+            return next(seq)
+
+        def close(self):
+            pass
+
+    ct = CaptureThread(
+        capture=FakeCap(), change_detector=ChangeDetector(phash_threshold=12),
+        deliver=lambda f, c: delivered.append((f.frame_id, c)), loop=None,
+        schedule=lambda fn, *a: fn(*a),  # 橋渡しを同期実行（call_soon_threadsafe 相当）
+    )
+    s1, s2 = ct._step(), ct._step()
+    return s1 and s2 and delivered == [(0, True), (1, True)]
+
+
+def t_capture_thread_a10_safe_stop() -> bool:
+    from eve.vlm.capture_thread import CaptureThread
+
+    class BoomCap:
+        def capture_one(self):
+            raise RuntimeError("mss 初期化失敗(headless)")
+
+        def close(self):
+            pass
+
+    ct = CaptureThread(
+        capture=BoomCap(), change_detector=ChangeDetector(),
+        deliver=lambda f, c: None, loop=None, schedule=lambda fn, *a: fn(*a),
+    )
+    return ct._step() is False  # 例外を投げず安全停止シグナル（A10）
+
+
 async def main() -> None:
     check("parse valid", t_parse_valid())
     check("parse garbage 安全(raise しない)", t_parse_garbage_safe())
@@ -457,6 +507,10 @@ async def main() -> None:
     check("build_decide_messages の画面ブロック", t_build_decide_vision_block())
     check("T2 vlm: vlm surprise で should_speak 反転", await t_t2_vlm_surprise_flips())
     check("vision を応答文脈に注入(# 画面)", await t_vision_injected_into_messages())
+    # capture / capture_thread
+    check("capture: 黒→blank / 通常→有効 b64+phash", t_capture_blank_and_valid())
+    check("capture_thread step: gate→deliver 橋渡し", t_capture_thread_step_delivers())
+    check("A10 capture 失敗→安全停止(例外投げない)", t_capture_thread_a10_safe_stop())
 
 
 if __name__ == "__main__":

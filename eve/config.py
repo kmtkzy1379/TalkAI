@@ -112,6 +112,20 @@ class Config:
     # 発話判定ログ（True/False とも記録・ロケット鉛筆・処理には関与しない＝観測専用）。
     SPEECH_LOG_MAX = int(os.getenv("SPEECH_LOG_MAX", "10"))
 
+    # 画面認識（F6・snapshot モード）。**すべてインフラ/コスト knob（Eve の挙動を数値で決めない）**。
+    VLM_ENABLED = os.getenv("VLM_ENABLED", "0") == "1"  # 既定 off（実機で明示 on）
+    VLM_MONITOR = int(os.getenv("VLM_MONITOR", "1"))  # mss モニタ番号（1=主）
+    VLM_TARGET_FPS = float(os.getenv("VLM_TARGET_FPS", "2.0"))  # キャプチャ頻度
+    VLM_RING_MAX = int(os.getenv("VLM_RING_MAX", "6"))  # リング上限（=レイテンシ bound・drop-oldest）
+    VLM_MAX_FRAMES_PER_CALL = int(os.getenv("VLM_MAX_FRAMES_PER_CALL", "4"))  # 1呼び出しの枚数（窓≈枚/fps≈2s）
+    VLM_PHASH_THRESHOLD = int(os.getenv("VLM_PHASH_THRESHOLD", "12"))  # 変化ゲート hamming 閾値
+    VLM_PERIODIC_FRAMES = int(os.getenv("VLM_PERIODIC_FRAMES", "0"))  # 静止 N フレームで強制再評価（0=無効）
+    VLM_MIN_INTERVAL_SEC = float(os.getenv("VLM_MIN_INTERVAL_SEC", "1.0"))  # コスト floor（自己再トリガを律速・A9）
+    VLM_DEDUP_RATIO = float(os.getenv("VLM_DEDUP_RATIO", "0.85"))  # 同一実況とみなす類似度（再トリガ抑制）
+    VLM_DOWNSCALE_MAX = int(os.getenv("VLM_DOWNSCALE_MAX", "1280"))  # 長辺上限（トークン/レイテンシ削減）
+    VLM_JPEG_QUALITY = int(os.getenv("VLM_JPEG_QUALITY", "70"))  # 送信 JPEG 品質
+    VLM_BLANK_STD_THRESHOLD = float(os.getenv("VLM_BLANK_STD_THRESHOLD", "6.0"))  # 黒/空白検出（std 未満=取得不可・A11）
+
     @classmethod
     def validate(cls) -> list[str]:
         """不足している必須設定を列挙。空リストなら起動可（Start ゲートで使う）。"""
