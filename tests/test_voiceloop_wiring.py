@@ -55,6 +55,13 @@ try:
     check("runner に orchestrator を配線", vl.runner._orch is vl.orchestrator)
     check("runner と input が同じ queue を共有", vl.runner._queue is vl.queue and vl.input._queue is vl.queue)
     check("input に barge-in callback を結線", callable(vl.input._on_speech_start))
+    # F6: 画面認識(VLM)の配線
+    check("orchestrator に VisionState を配線", vl.orchestrator._vision_state is vl.vision_state)
+    check("SpeechDecider に VisionState を配線", vl.speech_decider._vision_state is vl.vision_state)
+    check("VlmWorker に vision_state/prediction を配線",
+          vl.vlm_worker._vs is vl.vision_state and vl.vlm_worker._pred is vl.prediction)
+    check("VlmWorker の発話トリガ=speech_decider.trigger", vl.vlm_worker._speak_trigger == vl.speech_decider.trigger)
+    check("VLM 既定 off では capture スレッド未生成(構築は可)", vl.capture_thread is None)
     # play_fn が should_stop を取れる＝文途中 barge-in(B3) の配線が生きている
     check("audio が mid-sentence stop 対応 play_fn を保持", vl.audio._play_takes_stop is True)
 except Exception as e:  # 構築自体が落ちたら配線ドリフト＝即失敗

@@ -11,6 +11,7 @@ import asyncio
 import logging
 from typing import Optional
 
+from .config import Config
 from .context_assembler import ContextAssembler
 from .feedback import FeedbackLLM, FeedbackWorker, PredictionState
 from .memory import ConversationCache, RagStore
@@ -27,6 +28,9 @@ from .response.style import SPEECH_STYLE
 from .response.tts import VoicevoxTTS
 from .speech import SilenceMonitor, SpeechDecider, SpeechState, make_decide_fn
 from .stt import make_stt
+from .vlm import ChangeDetector, VisionState, VlmWorker, make_narrate_fn
+from .vlm.capture import ScreenCapture
+from .vlm.capture_thread import CaptureThread
 
 logger = logging.getLogger(__name__)
 
@@ -43,9 +47,12 @@ class VoiceLoop:
         self.rag = RagStore(make_embedder())  # 長期記憶（連想想起）
 
         # F4 内分泌系: 各応答後に非同期で内省 → RAG 書込 + surprise + 直近フィードバック注入。
-        self.prediction = PredictionState()  # loop 所有・単一書込（feedback worker のみ書く）
+        self.prediction = PredictionState()  # loop 所有・単一書込（feedback/VLM が書く）
         self.feedback = FeedbackLLM(self.registry, rag_store=self.rag, prediction_state=self.prediction)
         self.feedback_worker = FeedbackWorker(self.feedback, self.cache)
+
+        # F6 画面認識: loop 所有 VisionState（ring=全キャプチャ・latest_vision）。
+        self.vision_state = VisionState(ring_max=Config.VLM_RING_MAX)
 
         # F5 発話判定: 5秒沈黙で should_speak → True で AUTONOMOUS_SPEECH を投入。
         self.speech_state = SpeechState()  # loop 所有 ephemeral（沈黙計測/発話判定ログ）
@@ -53,7 +60,28 @@ class VoiceLoop:
             state=self.speech_state, cache=self.cache, rag=self.rag,
             prediction_state=self.prediction, queue=self.queue,
             decide_fn=make_decide_fn(self.registry),  # role=speech_decide
+            vision_state=self.vision_state,  # F6: 発話判定に直近画面を入れる
         )
+
+        # F6 VLM サイドカー: 専用スレッドが capture→gate→on_frame、single-flight worker が
+        # 1回の multi-frame 呼び出しで実況化→latest_vision/note_vlm_surprise→ガード付き発話トリガ。
+        self.vlm_worker = VlmWorker(
+            vision_state=self.vision_state, prediction_state=self.prediction,
+            narrate_fn=make_narrate_fn(self.registry),  # role=vlm_leaf
+            speak_trigger=self.speech_decider.trigger,
+            speak_guard=self._vision_can_speak,  # A5/Q4: busy/ユーザ発話中/decider 処理中なら叩かない
+            frames_per_call=Config.VLM_MAX_FRAMES_PER_CALL,
+            min_interval_sec=Config.VLM_MIN_INTERVAL_SEC,
+            dedup_ratio=Config.VLM_DEDUP_RATIO,
+        )
+        self.vlm_capture = ScreenCapture(
+            monitor=Config.VLM_MONITOR, downscale_max=Config.VLM_DOWNSCALE_MAX,
+            jpeg_quality=Config.VLM_JPEG_QUALITY, blank_std_threshold=Config.VLM_BLANK_STD_THRESHOLD,
+        )
+        self.vlm_change_detector = ChangeDetector(
+            phash_threshold=Config.VLM_PHASH_THRESHOLD, periodic_frames=Config.VLM_PERIODIC_FRAMES,
+        )
+        self.capture_thread: Optional[CaptureThread] = None  # run() で loop 取得後に生成（VLM_ENABLED 時）
 
         async def stream_fn(messages):
             async for delta in self.registry.stream("response", messages):
@@ -68,6 +96,7 @@ class VoiceLoop:
             conversation_cache=self.cache, rag_store=self.rag,
             prediction_state=self.prediction,
             on_response_complete=self._on_response_complete,  # 正常完了で feedback + 沈黙時計リセット
+            vision_state=self.vision_state,  # F6: 応答文脈に直近画面を注入
         )
         self.runner = PipelineRunner(self.queue, self.orchestrator, self.audio)
         # 沈黙監視は応答中(runner busy)/ユーザ発話中は発火しない（is_busy をガードに使う）。
@@ -94,6 +123,14 @@ class VoiceLoop:
         """応答 正常完了: F4 feedback を起こす + F5 沈黙時計をリセット（Eve が喋った）。"""
         self.feedback_worker.trigger()
         self.speech_state.mark_eve_activity()
+
+    def _vision_can_speak(self) -> bool:
+        """F6 画面起因の発話ガード（A5/Q4）: 応答中/ユーザ発話中/判定処理中なら起こさない。"""
+        return (
+            not self.runner.is_busy()
+            and not self.speech_state.user_speaking
+            and self.speech_decider.is_idle()
+        )
 
     async def warmup(self) -> None:
         """STT/LLM/TTS を1回空打ちして cold-start（初回の数秒遅延）を消す。"""
@@ -131,12 +168,32 @@ class VoiceLoop:
         self.speech_state.mark_eve_activity()
         self.speech_decider.start()
         self.silence_monitor.start()
+        # F6: 画面認識を起動（既定 off）。capture スレッドは loop 確定後に生成し on_frame を橋渡し。
+        if Config.VLM_ENABLED:
+            self.vlm_worker.start()
+            self.capture_thread = CaptureThread(
+                capture=self.vlm_capture, change_detector=self.vlm_change_detector,
+                deliver=self.vlm_worker.on_frame, loop=asyncio.get_running_loop(),
+                target_fps=Config.VLM_TARGET_FPS,
+            )
+            self.capture_thread.start()
+            logger.info("画面認識(VLM) 稼働")
         await self.input.start()  # mic + STT 消費タスクを起動
         logger.info("VoiceLoop 稼働。話しかけてください。")
         await asyncio.Event().wait()  # キャンセルされるまで稼働
 
     async def stop(self) -> None:
         self.input.stop()
+        # F6 A3: capture スレッドを**最初に**止める（閉じるループへフレームを送らない）→ vlm worker drain。
+        if self.capture_thread is not None:
+            try:
+                await asyncio.to_thread(self.capture_thread.stop)  # join をループ外で
+            except Exception:
+                pass
+        try:
+            await self.vlm_worker.stop()
+        except Exception:
+            pass
         # F5: 沈黙監視を止め（新規トリガを断つ）→ 発話判定 worker を drain/停止。
         try:
             await self.silence_monitor.stop()
