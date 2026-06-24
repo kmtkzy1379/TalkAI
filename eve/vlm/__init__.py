@@ -8,9 +8,11 @@ drop-oldest ring で構造的に回避。詳細は docs/COMPONENT_LOGIC.md §H�
 from __future__ import annotations
 
 from .change_detector import ChangeDetector, hamming
+from .narrator import build_messages, make_narrate_fn
 from .parser import parse_vision
 from .state import VisionState
 from .types import Frame, VisionResult
+from .worker import BLANK_MARKER, VlmWorker
 
 __all__ = [
     "Frame",
@@ -19,4 +21,8 @@ __all__ = [
     "ChangeDetector",
     "hamming",
     "VisionState",
+    "make_narrate_fn",
+    "build_messages",
+    "VlmWorker",
+    "BLANK_MARKER",
 ]

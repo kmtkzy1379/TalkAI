@@ -1,0 +1,63 @@
+"""narrator — 複数フレームを1回の VLM 呼び出しで実況(VisionResult)化する。
+
+`vlm_leaf`(既定 gemini-2.5-flash) に **時系列の連続フレーム**（古い順・最後が今）を base64 JPEG の
+multimodal message で渡し、タグ付きテキストを `parse_vision` で頑健に読む。`narrate_fn` を注入できる
+（テストは litellm 抜き）。ハルシネ防止(A11): プロンプトで「黒/判読不能なら推測せず visible: no」。
+"""
+from __future__ import annotations
+
+import logging
+from typing import Awaitable, Callable
+
+from .parser import parse_vision
+from .types import Frame, VisionResult
+
+logger = logging.getLogger(__name__)
+
+NarrateFn = Callable[[list[Frame]], Awaitable[VisionResult]]
+
+VLM_SYSTEM = (
+    "あなたはユーザのPC画面を見ている『目』です。渡される複数枚の画像は時系列の連続スクリーン"
+    "ショット（古い順・**最後の1枚が今この瞬間**）。最後を『今』として、画面で何が起きているか・"
+    "直前から何が変化/移動したかを日本語で簡潔に1〜2文で述べてください。\n"
+    "画面が真っ黒・判読不能・取得できない場合は**推測せず** visible: no と返す（決して捏造しない）。\n"
+    "出力は次のタグのみ:\n"
+    "narration: <実況を1〜2文>\n"
+    "notable: <yes/no＝今わざわざ言及する価値がある変化か>\n"
+    "surprise: <0-100＝直前の予想からの外れ具合>\n"
+    "visible: <yes/no＝画面の内容を読み取れたか>"
+)
+
+
+def build_messages(frames: list[Frame]) -> list[dict]:
+    """litellm multimodal messages（OpenAI 形式; gemini 経路で inline_data に変換される）。"""
+    content: list[dict] = [{
+        "type": "text",
+        "text": f"連続スクリーンショット {len(frames)} 枚（古い順・最後が今）。今の画面を実況して。",
+    }]
+    for f in frames:
+        content.append({
+            "type": "image_url",
+            "image_url": {"url": f"data:image/jpeg;base64,{f.jpeg_b64}"},
+        })
+    return [
+        {"role": "system", "content": VLM_SYSTEM},
+        {"role": "user", "content": content},
+    ]
+
+
+def _content_of(resp: object) -> str:
+    """litellm 応答からテキストを頑健に取り出す（壊れ形は空文字）。"""
+    try:
+        return resp.choices[0].message.content or ""  # type: ignore[attr-defined]
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return ""
+
+
+def make_narrate_fn(registry) -> NarrateFn:
+    """ModelRegistry の `vlm_leaf` を叩く本番 narrate_fn。"""
+    async def narrate(frames: list[Frame]) -> VisionResult:
+        resp = await registry.complete("vlm_leaf", build_messages(frames))
+        return parse_vision(_content_of(resp))
+
+    return narrate

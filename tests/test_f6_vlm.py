@@ -5,18 +5,64 @@
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eve.feedback import NEUTRAL_SURPRISE, PredictionState  # noqa: E402
-from eve.vlm import ChangeDetector, Frame, VisionState, parse_vision  # noqa: E402
+from eve.vlm import (  # noqa: E402
+    BLANK_MARKER,
+    ChangeDetector,
+    Frame,
+    VisionResult,
+    VisionState,
+    VlmWorker,
+    parse_vision,
+)
 from eve.vlm.change_detector import hamming  # noqa: E402
 
 
 def _frame(fid: int, blank: bool = False) -> Frame:
     return Frame(frame_id=fid, mono_ts=float(fid), jpeg_b64=f"b64-{fid}", blank=blank)
+
+
+async def _pump(n: int = 12) -> None:
+    """イベントループを n 回回して worker を進める。"""
+    for _ in range(n):
+        await asyncio.sleep(0)
+
+
+class FakeNarrator:
+    """注入用 narrate_fn。並行度を計測し、gate で完了タイミングを制御できる。"""
+
+    def __init__(self, gate: asyncio.Event | None = None, result_fn=None):
+        self.calls: list[list[int]] = []  # 各呼び出しに渡ったフレームID列
+        self.concurrent = 0
+        self.max_concurrent = 0
+        self._gate = gate
+        self._result_fn = result_fn or (
+            lambda frames: VisionResult(narration=f"画面{frames[-1].frame_id}番", notable=True, surprise_diff=50)
+        )
+
+    async def __call__(self, frames: list[Frame]) -> VisionResult:
+        self.concurrent += 1
+        self.max_concurrent = max(self.max_concurrent, self.concurrent)
+        self.calls.append([f.frame_id for f in frames])
+        try:
+            if self._gate is not None:
+                await self._gate.wait()
+            return self._result_fn(frames)
+        finally:
+            self.concurrent -= 1
+
+
+def _mkworker(vs, pred, narr, **kw):
+    kw.setdefault("frames_per_call", 4)
+    kw.setdefault("min_interval_sec", 0.0)
+    kw.setdefault("dedup_ratio", 1.1)  # 既定は dedup 無効（dedup テストのみ有効化）
+    return VlmWorker(vision_state=vs, prediction_state=pred, narrate_fn=narr, **kw)
 
 _passed = 0
 _failed = 0
@@ -149,7 +195,166 @@ def t_surprise_vlm_clamp() -> bool:
     return s.surprise == 100  # 上限クランプ
 
 
-def main() -> None:
+# ===== VlmWorker（single-flight / backpressure / A1 / A9 / A11 / dedup / guard）=====
+async def t_backpressure_one_call_freshest() -> bool:
+    vs, pred = VisionState(ring_max=6), PredictionState()
+    gate = asyncio.Event()
+    narr = FakeNarrator(gate=gate)
+    w = _mkworker(vs, pred, narr)
+    w.start()
+    w.on_frame(_frame(0), True)
+    await _pump()  # narrate([0]) が gate 待ちに入る
+    for i in range(1, 6):  # 処理中に5枚 変化が到着
+        w.on_frame(_frame(i), True)
+    await _pump()
+    gate.set()
+    await _pump()
+    await w.stop()
+    # 呼び出しは 2回のみ（[0] と 最新ウィンドウ）・stale バックログを1枚ずつ処理しない・最新(5)を含む
+    return (
+        len(narr.calls) == 2
+        and narr.calls[0] == [0]
+        and 5 in narr.calls[1]
+        and narr.max_concurrent == 1
+    )
+
+
+async def t_single_flight_max_one() -> bool:
+    vs, pred = VisionState(), PredictionState()
+    gate = asyncio.Event()
+    narr = FakeNarrator(gate=gate)
+    w = _mkworker(vs, pred, narr)
+    w.start()
+    w.on_frame(_frame(0), True)
+    await _pump()
+    for i in range(1, 4):  # 処理中に複数トリガ
+        w.on_frame(_frame(i), True)
+    await _pump()
+    gate.set()
+    await _pump()
+    await w.stop()
+    return narr.max_concurrent == 1
+
+
+async def t_last_frame_never_stranded() -> bool:
+    # A1: narrate 中に来た最後のフレームを取り残さない（自己再トリガ・外部トリガ無しで最新に追いつく）
+    vs, pred = VisionState(), PredictionState()
+    gate = asyncio.Event()
+    narr = FakeNarrator(gate=gate)
+    w = _mkworker(vs, pred, narr)
+    w.start()
+    w.on_frame(_frame(0), True)
+    await _pump()  # narrate([0]) gate 待ち
+    w.on_frame(_frame(1), True)  # 処理中に新フレーム B
+    await _pump()
+    gate.set()
+    await _pump()
+    await w.stop()
+    # 2回目の呼び出しが自己再トリガで起き（窓は[0,1]＝変化前アンカー込み・A8）、latest が最新1を反映
+    return (
+        len(narr.calls) == 2
+        and narr.calls[1][-1] == 1  # 最新ウィンドウの末尾＝今のフレーム
+        and vs.latest_vision == "画面1番"
+    )
+
+
+async def t_latest_vision_written() -> bool:
+    vs, pred = VisionState(), PredictionState()
+    narr = FakeNarrator(result_fn=lambda f: VisionResult(narration="ブラウザ閲覧中", surprise_diff=40))
+    w = _mkworker(vs, pred, narr)
+    w.start()
+    w.on_frame(_frame(0), True)
+    await _pump()
+    await w.stop()
+    return vs.latest_vision == "ブラウザ閲覧中" and pred.surprise == 40
+
+
+async def t_min_interval_paces() -> bool:
+    # A9: min_interval 内は ≤1 呼び出し（deferred で律速・fake clock で確定的に）
+    clock = [0.0]
+    async def fsleep(d):
+        clock[0] += d
+    vs, pred = VisionState(), PredictionState()
+    narr = FakeNarrator()  # 即時完了
+    w = _mkworker(vs, pred, narr, min_interval_sec=2.0, now_fn=lambda: clock[0], sleep_fn=fsleep)
+    w.start()
+    w.on_frame(_frame(0), True)  # t=0 で1回目
+    await _pump()
+    for i in range(1, 6):  # 連続変化（同一 fake 時刻で殺到）
+        w.on_frame(_frame(i), True)
+    await _pump(20)
+    await w.stop()
+    # 連続変化でも呼び出しは律速され少数（≤2）・2回目は clock>=2.0 に進む
+    return len(narr.calls) <= 2 and clock[0] >= 2.0
+
+
+async def t_dedup_no_retrigger() -> bool:
+    # 同一ナレーションの連続 → latest は更新するが発話は再トリガしない
+    spk = []
+    vs, pred = VisionState(), PredictionState()
+    narr = FakeNarrator(result_fn=lambda f: VisionResult(narration="同じ実況です", notable=True, surprise_diff=50))
+    w = _mkworker(vs, pred, narr, dedup_ratio=0.85, speak_trigger=lambda: spk.append(1))
+    w.start()
+    w.on_frame(_frame(0), True)
+    await _pump()
+    w.on_frame(_frame(1), True)  # 2回目（同一ナレーション）
+    await _pump()
+    await w.stop()
+    return len(narr.calls) == 2 and len(spk) == 1  # 発話トリガは初回のみ
+
+
+async def t_narrate_exception_safe() -> bool:
+    async def boom(frames):
+        raise RuntimeError("VLM down")
+    vs, pred = VisionState(), PredictionState()
+    w = _mkworker(vs, pred, boom)
+    w.start()
+    w.on_frame(_frame(0), True)
+    await _pump()
+    alive = w.is_idle()  # 例外後も worker は生存・idle に戻る
+    # 後続も処理できる
+    w._narrate = FakeNarrator(result_fn=lambda f: VisionResult(narration="復活", surprise_diff=30))
+    w.on_frame(_frame(1), True)
+    await _pump()
+    await w.stop()
+    return alive and vs.latest_vision == "復活"
+
+
+async def t_blank_honest() -> bool:
+    # A11: blank フレーム → VLM を呼ばず正直マーカ・surprise/発話に触れない
+    spk = []
+    vs, pred = VisionState(), PredictionState()
+    narr = FakeNarrator()
+    w = _mkworker(vs, pred, narr, speak_trigger=lambda: spk.append(1))
+    w.start()
+    w.on_frame(_frame(0, blank=True), True)
+    await _pump()
+    await w.stop()
+    return (
+        len(narr.calls) == 0
+        and vs.latest_vision == BLANK_MARKER
+        and pred.surprise == NEUTRAL_SURPRISE
+        and len(spk) == 0
+    )
+
+
+async def t_notable_guarded_trigger() -> bool:
+    # A5/Q4: guard False なら notable でも発話を叩かない / True なら叩く
+    res = []
+    for guard in (False, True):
+        spk = []
+        vs, pred = VisionState(), PredictionState()
+        narr = FakeNarrator(result_fn=lambda f: VisionResult(narration="変化あり", notable=True, surprise_diff=60))
+        w = _mkworker(vs, pred, narr, speak_trigger=lambda: spk.append(1), speak_guard=(lambda g=guard: g))
+        w.start()
+        w.on_frame(_frame(0), True)
+        await _pump()
+        await w.stop()
+        res.append(len(spk))
+    return res == [0, 1]  # guard False→0回 / True→1回
+
+
+async def main() -> None:
     check("parse valid", t_parse_valid())
     check("parse garbage 安全(raise しない)", t_parse_garbage_safe())
     check("parse 全角コロン", t_parse_fullwidth_colon())
@@ -168,9 +373,19 @@ def main() -> None:
     check("surprise vlm 単独", t_surprise_vlm_only())
     check("A4 surprise most-recent-wins(maxでない)", t_surprise_most_recent_wins())
     check("surprise vlm クランプ", t_surprise_vlm_clamp())
+    # VlmWorker（async）
+    check("⭐backpressure: 最新ウィンドウ1回・累積なし", await t_backpressure_one_call_freshest())
+    check("⭐single-flight ≤1", await t_single_flight_max_one())
+    check("⭐A1 最後フレーム非取り残し(自己再トリガ)", await t_last_frame_never_stranded())
+    check("latest_vision 書込 + surprise 反映", await t_latest_vision_written())
+    check("A9 min-interval で連続変化を律速", await t_min_interval_paces())
+    check("dedup: 同一実況は発話再トリガしない", await t_dedup_no_retrigger())
+    check("narrate 例外→no-op・worker 生存", await t_narrate_exception_safe())
+    check("⭐A11 blank→VLM呼ばず正直マーカ・surprise/発話不変", await t_blank_honest())
+    check("A5/Q4 notable は guard 付きで発話トリガ", await t_notable_guarded_trigger())
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
     print(f"\n合計: PASS {_passed} / FAIL {_failed}")
     sys.exit(1 if _failed else 0)
