@@ -46,6 +46,7 @@ class ResponseOrchestrator:
         rag_store: Optional["RagStore"] = None,
         prediction_state: Optional["PredictionState"] = None,
         on_response_complete: Optional[Callable[[], None]] = None,
+        vision_state=None,  # F6 任意: 直近の画面ナレーション源（latest_vision を文脈へ注入）
     ) -> None:
         self._audio = audio
         self._stream_fn = stream_fn
@@ -60,6 +61,8 @@ class ResponseOrchestrator:
         self._state = prediction_state
         # 任意注入(F4): 正常完了時に feedback worker を起こすトリガ（O(1)・非ブロッキング）。
         self._on_complete = on_response_complete
+        # 任意注入(F6): 直近の画面ナレーション（latest_vision）を build 時に同期読みして注入。
+        self._vision_state = vision_state
         self.last_response = ""  # 生成済み全文（自然さの目視・テスト用。記憶には使わない＝C5）
 
     def _build_messages(
@@ -69,6 +72,7 @@ class ResponseOrchestrator:
         rag_chunks: Optional[list[RagChunk]] = None,
     ) -> list[dict]:
         last_feedback = self._state.last_feedback if self._state is not None else None
+        vision = self._vision_state.latest_vision if self._vision_state is not None else None
         # F5 自発発話: payload は AutonomousSpeech(content, reason)。content は**ユーザ発話でなく
         # イブ自身の下書き**として autonomous_content へ（ユーザ枠に入れると応答LLMが自分の発話に
         # 返事して話者を取り違える＝Fix3）。reason は発話判定理由。USER 等は従来どおり user_text。
@@ -88,6 +92,7 @@ class ResponseOrchestrator:
             recent_turns=recent_turns,
             rag_chunks=rag_chunks,
             last_feedback=last_feedback,
+            vision=vision,
             speech_decision_reason=speech_reason,
         )
 

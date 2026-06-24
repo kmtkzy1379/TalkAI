@@ -377,6 +377,22 @@ def t_build_decide_vision_block() -> bool:
     return "# 画面（今この瞬間）" in uw and "ブラウザ閲覧中" in uw and "# 画面" not in un
 
 
+async def t_vision_injected_into_messages() -> bool:
+    # ResponseOrchestrator が latest_vision を「# 画面（今この瞬間）」として注入する
+    from eve.pipeline import AudioPlayQueue, Stimulus, StimulusKind
+    from eve.response import ResponseOrchestrator
+    vs = VisionState()
+    vs.latest_vision = "メモ帳に文章を書いている"
+    async def stream_fn(m):
+        yield "ok"
+    async def tts(s):
+        return b"x"
+    orch = ResponseOrchestrator(AudioPlayQueue(), stream_fn, tts, vision_state=vs)
+    msgs = orch._build_messages(Stimulus(StimulusKind.USER_UTTERANCE, "やあ"))
+    sysmsg = msgs[0]["content"]
+    return "# 画面（今この瞬間）" in sysmsg and "メモ帳に文章を書いている" in sysmsg
+
+
 async def t_t2_vlm_surprise_flips() -> bool:
     # T2 を vlm 生産者へ拡張: note_vlm_surprise→pred.surprise→should_speak が反転
     async def reader(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None, vision=None):
@@ -440,6 +456,7 @@ async def main() -> None:
     check("should_speak surprise 必須/vision 任意(signature)", t_should_speak_surprise_required())
     check("build_decide_messages の画面ブロック", t_build_decide_vision_block())
     check("T2 vlm: vlm surprise で should_speak 反転", await t_t2_vlm_surprise_flips())
+    check("vision を応答文脈に注入(# 画面)", await t_vision_injected_into_messages())
 
 
 if __name__ == "__main__":
