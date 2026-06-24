@@ -126,6 +126,8 @@ class VlmWorker:
         snap_id = frames[-1].frame_id
         # A11: 最新が blank → 視認不可。VLM に語らせず正直マーカ。surprise/発話に触れない。
         if frames[-1].blank:
+            if self._vs.latest_vision != BLANK_MARKER:
+                logger.info("👁 視認不可（画面を取得できず）")
             self._vs.latest_vision = BLANK_MARKER
             return
         self._last_call_ts = self._now()  # 呼び出し開始＝pacing 起点
@@ -150,6 +152,7 @@ class VlmWorker:
         if self._is_dup(result.narration):
             self._vs.latest_vision = result.narration  # 最新性のため更新するが再トリガしない
             return
+        logger.info("👁 %s", result.narration)  # 画面実況（実機で VLM 稼働を可視化）
         self._vs.latest_vision = result.narration
         self._last_narration = result.narration
         if result.surprise_diff is not None:
