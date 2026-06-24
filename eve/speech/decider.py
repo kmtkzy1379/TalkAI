@@ -82,20 +82,25 @@ async def should_speak(
     topic_seeds,
     decide_fn: DecideFn,
     last_feedback: Optional[str] = None,  # イブの今の感情/要約（直近フィードバック）
+    vision: Optional[str] = None,  # F6 直近の画面ナレーション（あれば判定材料に・None なら無し）
     pending_obligation: bool = False,
 ) -> SpeechDecision:
     if pending_obligation:
         # 唯一の hard ゲート（事実: 予約締切等。感情でないのでここだけ確定で沈黙）。
         # 将来 Call-Function/task が締切近接を計算して渡す（今は常に False）。
         return SpeechDecision(False, "保留中の予約/義務があるため沈黙", "")
-    # surprise + 感情(last_feedback) + 会話 + 話題の種 を渡し、LLM が総合判断（数値で強制しない）。
-    d = await decide_fn(
+    # surprise + 感情(last_feedback) + 会話 + 話題の種 (+ 画面) を渡し、LLM が総合判断。
+    # vision は **非 None の時だけ** 転送する（A6: vision を受けない既存 decide_fn を壊さない）。
+    kwargs = dict(
         surprise=surprise,
         silence_seconds=silence_seconds,
         recent_turns=recent_turns,
         topic_seeds=topic_seeds,
         last_feedback=last_feedback,
     )
+    if vision is not None:
+        kwargs["vision"] = vision
+    d = await decide_fn(**kwargs)
     if d.speak and not (d.content or "").strip():
         # 話す判断だが content が空 → 全 speak 経路で最小ヒントを保証（応答LLMが膨らませる）。
         return SpeechDecision(True, d.reason, _FALLBACK_CONTENT)
@@ -133,14 +138,18 @@ def _render_seeds(seeds) -> str:
 
 
 def build_decide_messages(
-    *, surprise: int, silence_seconds: float, recent_turns, topic_seeds, last_feedback: Optional[str] = None
+    *, surprise: int, silence_seconds: float, recent_turns, topic_seeds,
+    last_feedback: Optional[str] = None, vision: Optional[str] = None,
 ) -> list[dict]:
     fb = (last_feedback or "").strip() or "（なし）"
+    screen = (vision or "").strip()
+    screen_block = f"\n\n# 画面（今この瞬間）\n{screen}" if screen else ""
     user = (
         "…\n\n"
         f"# 直近の会話\n{_render_turns(recent_turns)}\n\n"
         f"# 話題の種（新しい話を振る材料・思い出話に縛られない）\n{_render_seeds(topic_seeds)}\n\n"
-        f"# イブの今の状態（直近フィードバック: 感情/要約）\n{fb}\n\n"
+        f"# イブの今の状態（直近フィードバック: 感情/要約）\n{fb}"
+        f"{screen_block}\n\n"
         f"# 状況\n沈黙{silence_seconds:.0f}秒 / 予測差(surprise)={surprise}"
         "（指標。高=思考/感情が高ぶる・低=安定。これだけで決めない）"
     )
@@ -153,10 +162,10 @@ def build_decide_messages(
 def make_decide_fn(registry) -> DecideFn:
     """ModelRegistry role=speech_decide を叩く本番 decide_fn を作る。"""
 
-    async def decide_fn(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None) -> SpeechDecision:
+    async def decide_fn(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None, vision=None) -> SpeechDecision:
         messages = build_decide_messages(
             surprise=surprise, silence_seconds=silence_seconds,
-            recent_turns=recent_turns, topic_seeds=topic_seeds, last_feedback=last_feedback,
+            recent_turns=recent_turns, topic_seeds=topic_seeds, last_feedback=last_feedback, vision=vision,
         )
         try:
             resp = await registry.complete("speech_decide", messages)

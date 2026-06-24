@@ -85,6 +85,7 @@ class SpeechDecider:
         queue,
         decide_fn: DecideFn,
         rag_random_k: Optional[int] = None,
+        vision_state=None,  # F6 任意: 直近の画面ナレーション源（latest_vision を読む）
     ) -> None:
         self._state = state
         self._cache = cache
@@ -92,6 +93,7 @@ class SpeechDecider:
         self._pred = prediction_state
         self._queue = queue
         self._decide_fn = decide_fn
+        self._vision_state = vision_state
         self._k = rag_random_k if rag_random_k is not None else Config.RAG_RANDOM_K
         self._event = asyncio.Event()
         self._task: Optional[asyncio.Task] = None
@@ -146,6 +148,7 @@ class SpeechDecider:
         seeds = self._rag.random(self._k) if self._rag is not None else []
         surprise = int(self._pred.surprise)  # 必須・int（指標として渡す）
         last_feedback = getattr(self._pred, "last_feedback", None)  # イブの今の感情/要約
+        vision = getattr(self._vision_state, "latest_vision", None) if self._vision_state else None
         silence = self._state.silence_seconds()
         seq0 = self._state.user_activity_seq  # 判定中にユーザが話したか検出する基準
         self._idle.clear()
@@ -153,7 +156,7 @@ class SpeechDecider:
             decision = await should_speak(
                 surprise=surprise, silence_seconds=silence,
                 recent_turns=recent, topic_seeds=seeds, decide_fn=self._decide_fn,
-                last_feedback=last_feedback,
+                last_feedback=last_feedback, vision=vision,
             )
         finally:
             self._idle.set()

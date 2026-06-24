@@ -21,6 +21,11 @@ from eve.vlm import (  # noqa: E402
     VlmWorker,
     parse_vision,
 )
+from eve.speech.decider import (  # noqa: E402
+    SpeechDecision,
+    build_decide_messages,
+    should_speak,
+)
 from eve.vlm.change_detector import hamming  # noqa: E402
 
 
@@ -338,6 +343,52 @@ async def t_blank_honest() -> bool:
     )
 
 
+# ===== should_speak への vision 配線（A6 非回帰 + T2 vlm）=====
+async def t_vision_forwarded_when_set() -> bool:
+    seen = {}
+    async def fake(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None, vision=None):
+        seen["vision"] = vision
+        return SpeechDecision(True, "r", "c")
+    d = await should_speak(surprise=50, silence_seconds=5, recent_turns=[], topic_seeds=[], decide_fn=fake, vision="画面X")
+    return seen.get("vision") == "画面X" and d.speak
+
+
+async def t_vision_none_legacy_fake_ok() -> bool:
+    # A6: vision を受けない既存型 fake。vision=None なら転送されず壊れない（F5 非回帰の核）。
+    async def legacy(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None):
+        return SpeechDecision(False, "r")
+    d = await should_speak(surprise=10, silence_seconds=5, recent_turns=[], topic_seeds=[], decide_fn=legacy, vision=None)
+    return not d.speak
+
+
+def t_should_speak_surprise_required() -> bool:
+    import inspect
+    sig = inspect.signature(should_speak)
+    return (
+        sig.parameters["surprise"].default is inspect.Parameter.empty  # surprise は必須のまま
+        and sig.parameters["vision"].default is None  # vision は任意
+    )
+
+
+def t_build_decide_vision_block() -> bool:
+    with_v = build_decide_messages(surprise=20, silence_seconds=5, recent_turns=[], topic_seeds=[], vision="ブラウザ閲覧中")
+    without = build_decide_messages(surprise=20, silence_seconds=5, recent_turns=[], topic_seeds=[])
+    uw, un = with_v[-1]["content"], without[-1]["content"]
+    return "# 画面（今この瞬間）" in uw and "ブラウザ閲覧中" in uw and "# 画面" not in un
+
+
+async def t_t2_vlm_surprise_flips() -> bool:
+    # T2 を vlm 生産者へ拡張: note_vlm_surprise→pred.surprise→should_speak が反転
+    async def reader(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None, vision=None):
+        return SpeechDecision(surprise >= 50, "by surprise", "c" if surprise >= 50 else "")
+    pred = PredictionState()
+    pred.note_vlm_surprise(80)
+    hi = await should_speak(surprise=pred.surprise, silence_seconds=5, recent_turns=[], topic_seeds=[], decide_fn=reader)
+    pred.note_vlm_surprise(10)
+    lo = await should_speak(surprise=pred.surprise, silence_seconds=5, recent_turns=[], topic_seeds=[], decide_fn=reader)
+    return hi.speak and not lo.speak
+
+
 async def t_notable_guarded_trigger() -> bool:
     # A5/Q4: guard False なら notable でも発話を叩かない / True なら叩く
     res = []
@@ -383,6 +434,12 @@ async def main() -> None:
     check("narrate 例外→no-op・worker 生存", await t_narrate_exception_safe())
     check("⭐A11 blank→VLM呼ばず正直マーカ・surprise/発話不変", await t_blank_honest())
     check("A5/Q4 notable は guard 付きで発話トリガ", await t_notable_guarded_trigger())
+    # should_speak への vision 配線（A6 非回帰 + T2 vlm）
+    check("vision は set 時のみ decide_fn へ転送", await t_vision_forwarded_when_set())
+    check("A6 vision=None は legacy fake を壊さない", await t_vision_none_legacy_fake_ok())
+    check("should_speak surprise 必須/vision 任意(signature)", t_should_speak_surprise_required())
+    check("build_decide_messages の画面ブロック", t_build_decide_vision_block())
+    check("T2 vlm: vlm surprise で should_speak 反転", await t_t2_vlm_surprise_flips())
 
 
 if __name__ == "__main__":
