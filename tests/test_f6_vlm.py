@@ -172,6 +172,16 @@ def t_snapshot_last_k() -> bool:
     return [f.frame_id for f in snap] == [3, 4] and isinstance(snap, list)
 
 
+def t_fresh_vision_ttl() -> bool:
+    # 鮮度 TTL: 新しければ返す・古ければ None（明らか過去を参照させない）
+    vs = VisionState()
+    vs.set_latest("画面の内容", mono=100.0)
+    fresh = vs.fresh_vision(ttl=7.0, now=105.0)   # 5s 前 → 返す
+    stale = vs.fresh_vision(ttl=7.0, now=109.0)   # 9s 前 → None
+    none0 = VisionState().fresh_vision(ttl=7.0, now=0.0)  # 未設定 → None
+    return fresh == "画面の内容" and stale is None and none0 is None
+
+
 # ===== surprise 合成（most-recent-wins・A4/Q2）=====
 def t_surprise_cold_neutral() -> bool:
     return PredictionState().surprise == NEUTRAL_SURPRISE
@@ -382,7 +392,7 @@ async def t_vision_injected_into_messages() -> bool:
     from eve.pipeline import AudioPlayQueue, Stimulus, StimulusKind
     from eve.response import ResponseOrchestrator
     vs = VisionState()
-    vs.latest_vision = "メモ帳に文章を書いている"
+    vs.set_latest("メモ帳に文章を書いている")  # 時刻付き（鮮度 TTL 内）
     async def stream_fn(m):
         yield "ok"
     async def tts(s):
@@ -486,6 +496,7 @@ async def main() -> None:
     check("hamming 距離", t_hamming())
     check("ring 上限 drop-oldest", t_ring_cap_drop_oldest())
     check("snapshot 直近k枚 value-copy", t_snapshot_last_k())
+    check("鮮度TTL: 新しい→返す/古い→None", t_fresh_vision_ttl())
     check("surprise cold→NEUTRAL", t_surprise_cold_neutral())
     check("surprise vlm 単独", t_surprise_vlm_only())
     check("A4 surprise most-recent-wins(maxでない)", t_surprise_most_recent_wins())

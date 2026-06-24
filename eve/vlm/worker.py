@@ -128,7 +128,7 @@ class VlmWorker:
         if frames[-1].blank:
             if self._vs.latest_vision != BLANK_MARKER:
                 logger.info("👁 視認不可（画面を取得できず）")
-            self._vs.latest_vision = BLANK_MARKER
+            self._vs.set_latest(BLANK_MARKER, self._now())
             return
         self._last_call_ts = self._now()  # 呼び出し開始＝pacing 起点
         self._idle.clear()
@@ -145,15 +145,15 @@ class VlmWorker:
     def _apply(self, result: VisionResult) -> None:
         if not result.visible:
             # A11: 視認不可（黒/判読不能）→ 正直マーカ・surprise/発話に触れない。
-            self._vs.latest_vision = BLANK_MARKER
+            self._vs.set_latest(BLANK_MARKER, self._now())
             return
         if not result.narration:
             return  # 空（パース失敗等）→ no-op（落とさない）
         if self._is_dup(result.narration):
-            self._vs.latest_vision = result.narration  # 最新性のため更新するが再トリガしない
+            self._vs.set_latest(result.narration, self._now())  # 鮮度は更新するが再トリガしない
             return
         logger.info("👁 %s", result.narration)  # 画面実況（実機で VLM 稼働を可視化）
-        self._vs.latest_vision = result.narration
+        self._vs.set_latest(result.narration, self._now())
         self._last_narration = result.narration
         if result.surprise_diff is not None:
             self._pred.note_vlm_surprise(result.surprise_diff)  # 指標（数値ゲートにしない）

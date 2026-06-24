@@ -67,7 +67,10 @@ class ContextAssembler:
             ]
             parts.append("# 参照（今の会話に絡める。思い出話に逸れない）\n" + "\n".join(lines))
         if vision:
-            parts.append(f"# 画面（今この瞬間）\n{vision}")
+            parts.append(
+                f"# 画面（今この瞬間）\n{vision}\n"
+                "（会話に必要なら自然に織り込む。話題と無関係なら無理に触れなくてよい＝画面に引っ張られすぎない）"
+            )
         if last_feedback:
             parts.append(f"# 直近フィードバック\n{last_feedback}")
         if speech_decision_reason:

@@ -122,8 +122,11 @@ class Config:
     VLM_PERIODIC_FRAMES = int(os.getenv("VLM_PERIODIC_FRAMES", "0"))  # 静止 N フレームで強制再評価（0=無効）
     VLM_MIN_INTERVAL_SEC = float(os.getenv("VLM_MIN_INTERVAL_SEC", "1.0"))  # コスト floor（自己再トリガを律速・A9）
     VLM_DEDUP_RATIO = float(os.getenv("VLM_DEDUP_RATIO", "0.85"))  # 同一実況とみなす類似度（再トリガ抑制）
+    # 軽量化(1024/Q60/3枚)は実機で遅延に効かず(遅延は Gemini API 変動)・OCR を悪化させたので 1280/70/4 へ戻した。
     VLM_DOWNSCALE_MAX = int(os.getenv("VLM_DOWNSCALE_MAX", "1280"))  # 長辺上限（トークン/レイテンシ削減）
     VLM_JPEG_QUALITY = int(os.getenv("VLM_JPEG_QUALITY", "70"))  # 送信 JPEG 品質
+    # 画面情報の鮮度上限。これより古い latest_vision は応答/判定に渡さない（「明らか過去を参照しない」を構造保証）。
+    VLM_VISION_TTL_SEC = float(os.getenv("VLM_VISION_TTL_SEC", "7.0"))
     VLM_BLANK_STD_THRESHOLD = float(os.getenv("VLM_BLANK_STD_THRESHOLD", "6.0"))  # 黒/空白検出（std 未満=取得不可・A11）
 
     @classmethod

@@ -72,7 +72,8 @@ class ResponseOrchestrator:
         rag_chunks: Optional[list[RagChunk]] = None,
     ) -> list[dict]:
         last_feedback = self._state.last_feedback if self._state is not None else None
-        vision = self._vision_state.latest_vision if self._vision_state is not None else None
+        # 鮮度 TTL 内の画面のみ注入（古い画面は渡さない＝明らか過去を参照させない）。
+        vision = self._vision_state.fresh_vision(Config.VLM_VISION_TTL_SEC) if self._vision_state is not None else None
         # F5 自発発話: payload は AutonomousSpeech(content, reason)。content は**ユーザ発話でなく
         # イブ自身の下書き**として autonomous_content へ（ユーザ枠に入れると応答LLMが自分の発話に
         # 返事して話者を取り違える＝Fix3）。reason は発話判定理由。USER 等は従来どおり user_text。

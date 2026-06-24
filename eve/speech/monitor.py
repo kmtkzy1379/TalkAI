@@ -148,7 +148,7 @@ class SpeechDecider:
         seeds = self._rag.random(self._k) if self._rag is not None else []
         surprise = int(self._pred.surprise)  # 必須・int（指標として渡す）
         last_feedback = getattr(self._pred, "last_feedback", None)  # イブの今の感情/要約
-        vision = getattr(self._vision_state, "latest_vision", None) if self._vision_state else None
+        vision = self._vision_state.fresh_vision(Config.VLM_VISION_TTL_SEC) if self._vision_state else None
         silence = self._state.silence_seconds()
         seq0 = self._state.user_activity_seq  # 判定中にユーザが話したか検出する基準
         self._idle.clear()
