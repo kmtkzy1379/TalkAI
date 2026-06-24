@@ -4,14 +4,16 @@
 > **食い違いはコードが正。** 本書は 4 エージェント並列監査＋一次ソース（実コード行）確認で作成。
 
 ## 現在地
-- ブランチ: `feat/f5-speech`（`feat/f4-feedback` から分岐・main 未マージ）。
-- 実装済（実装順）: **F0 / F1 / F2 / F2.5 / F3 / F3.5 / P2 スレッド掃除 / F4 FeedbackLLM / 応答プロンプト leak 修正 / F5 発話判定(沈黙→自発発話)**。
-- 未実装: SurpriseBus(多生産者集約・VLM 時) / (b)文脈不整合の自己懐疑(タスク管理隣接) / VLM / Call-Function(task/search/screen-op) / YouTube / UI / 配線層PORT(vts/run/launcher/app)。
+- ブランチ: `feat/f6-vlm-snapshot`（main から分岐・**main 未マージ**・F5 までは main 統合済）。
+- 実装済（実装順）: **F0 / F1 / F2 / F2.5 / F3 / F3.5 / P2 / F4 FeedbackLLM / 応答プロンプト leak 修正 / F5 発話判定 / Fix1-4 話者取り違え修正 / F6 画面認識VLM(snapshot モード)**。
+- 未実装: (b)文脈不整合の自己懐疑(タスク管理隣接) / 多生産者 SurpriseBus(VLM は現状 PredictionState 第2生産者で直結) / Call-Function(task/search/screen-op) / YouTube / UI / 配線層PORT(vts/run/launcher/app) / VLM の Gemini Live ストリーム mode(将来)。
+  - **F6 で実装（snapshot モード・`eve/vlm/`・既定 off＝`VLM_ENABLED=1`）**: 採択は **単発・複数フレーム VLM**（旧 ×3 self-consistency は探索で廃止＝動き不可/高コスト）。専用スレッド capture→pHash ゲート→`VisionState.ring`(全キャプチャ=変化前アンカー込み A8)→single-flight `VlmWorker` が直近K枚を1回の `vlm_leaf` 呼び出しで実況→`latest_vision`/`note_vlm_surprise`→ガード付き should_speak。**staleness 解= latest-window + single-flight + A1 自己再トリガ + A9 min-interval**。**A11 ハルシネ防止**: 黒/空白/grab失敗は「視認不可」正直マーカ（VLM に語らせない）。発話は F5 経由（v1 nudge スパム回避）。詳細 COMPONENT_LOGIC §H。
+  - **未検証（実機のみ）**: 実 mss キャプチャ + 実 Gemini への multi-frame 画像送信（litellm の `image_url`→Gemini `inline_data` 変換）。`tests/test_f6_vlm.py` は grab/narrate を注入し決定論で配線検証済（実 mss/GPU/API は不使用）。
   - **F5 で実装**: 5秒沈黙→`should_speak`→ True で `AUTONOMOUS_SPEECH` 刺激。**surprise は指標（Fix2 裁定）**＝数値の強制ゲート(HI/LO)は撤廃し、surprise+感情(直近FB)+内容を発話判定LLMが総合判断。唯一の hard ゲートは pending_obligation。T2 は「surprise が必須引数として判定に効く配線」（Optional 化禁止・surprise を読む fake で反転）。**Fix1: ユーザ発話が自発発話を中止・削除**（判定中は user_activity_seq で破棄 / barge-in で queue.discard_kind）。発話判定ログ(True/False+理由・deque10・観測専用)。**Q3: バックオフ/再挨拶抑制/沈黙カテゴリ不採用**（5秒連続評価は意図的）。`eve/speech/{decider,monitor}.py`。
   - **Fix3/Fix4（話者取り違えの構造的修正・実機で解消確認）**: 会話を1個の user ブロブに詰めるとモデルが「自分=イブ」を見失い**自分の発話に自答**していた。ContextAssembler を **native チャットロール messages**（system[スタイル+ロールアンカー+RAG/FB等] / user・assistant ターン列 / 最終 user=発話 or 自発指示）へ作り替え。`assemble(...)` は messages リストを返す（旧 AssembledContext/render は廃止）。自発は「返事でなく自分から一言」指示。Fix4b: 直近ターンの相対時刻前置きは応答LLMが復唱する leak のため撤去（接地は RAG 側 timestamp）。
   - **既知の今後課題（未対処）**: (b)自己懐疑＝急な話題転換/同質問の繰り返し等に自分から疑問を持たない（surprise ゲート＋タスク管理フェーズで）。日本語のぎこちなさ＝モデル依存（差し替え/廉価モデル待ち・コード不変）。モデルは `.env` の `RESPONSE_MODEL`/`DECIDE_MODEL`/`FEEDBACK_MODEL` で差替（評価: `tools/f5_model_eval.py`）。
   - **F5 へ繰越（VLM/タスク時）**: 多生産者 `SurpriseBus`（FB diff + VLM screen-diff・現状は `PredictionState.surprise` 単一生産者を直接読む）/ (b)自己懐疑（応答経路・タスク管理隣接）/ 締切近接抑制（`pending_obligation` no-op フック）。
-- テスト: **Tier-1 11ファイル 158件 2回連続 PASS**（API不要・決定論）。flaky なし。F5 は `tests/test_f5_speech.py`（29件・T2/Fix1/Fix3 含む）。実機自然さ評価は `tools/f5_model_eval.py`（複数モデル組合せ）。
+- テスト: **Tier-1 12ファイル 199件 5回連続 PASS**（API不要・決定論）。flaky なし。F6 は `tests/test_f6_vlm.py`（36件・backpressure/single-flight/A1/A11 ⭐含む）。F5 は `tests/test_f5_speech.py`（29件）。実機自然さ評価は `tools/f5_model_eval.py`。
 - venv は v1 のものを流用: `C:\Users\tester\Desktop\portfolio8-VLM-AI\venv`（`sentence-transformers` 導入済＝Ruri 用）。
 
 ## 実行コマンド

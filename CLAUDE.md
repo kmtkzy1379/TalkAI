@@ -11,8 +11,8 @@ Eve v2 = AI VTuber + 画面認識(VLM) 統合のデスクトップアプリ。v1
 
 ## 実装状況（2026-06-20・コードが正）
 
-実装順に **F0 / F1 / F2 / F2.5 / F3 / F3.5 / P2 スレッド掃除(裁定a) / F4 FeedbackLLM / F5 発話判定(沈黙→自発発話)** まで完了。
-Tier-1 決定論テスト **158件が2回連続 PASS**。未実装: SurpriseBus(多生産者集約・VLM時)・(b)自己懐疑(タスク隣接)・VLM・Call-Function・YouTube・UI・配線層PORT(vts/run/launcher/app)。**中核原理 surprise は生産者(F4 `PredictionState`)+消費(F5 `should_speak`)が両方稼働**。**surprise は数値で発話を絶対決定せず「指標」として発話判定LLMが感情/内容と総合判断**（Fix2 裁定・HI/LO 強制ゲート撤廃）。T2 は「surprise が必須引数として判定に効く配線」。**応答文脈は native チャットロール(system+user/assistant ターン列)で組む＝話者取り違え防止(Fix4・`context_assembler.assemble` は messages リストを返す)**。多生産者 SurpriseBus は VLM 時に。
+実装順に **F0 / F1 / F2 / F2.5 / F3 / F3.5 / P2 スレッド掃除(裁定a) / F4 FeedbackLLM / F5 発話判定(沈黙→自発発話) / F6 画面認識VLM(snapshot モード)** まで完了。
+Tier-1 決定論テスト **199件が5回連続 PASS**。未実装: (b)自己懐疑(タスク隣接)・Call-Function・YouTube・UI・配線層PORT(vts/run/launcher/app)・VLM の Gemini Live mode(将来)。**中核原理 surprise は生産者(F4 `PredictionState` feedback + F6 VLM screen-diff・most-recent-wins 合成)+消費(F5 `should_speak`)が稼働**。**surprise は数値で発話を絶対決定せず「指標」として発話判定LLMが感情/内容と総合判断**（Fix2 裁定）。**応答文脈は native チャットロール(system+user/assistant)で組む＝話者取り違え防止(Fix4・`assemble` は messages リスト)**。**F6 = 単発・複数フレーム VLM**（旧×3案は廃止）: 専用スレッド capture→単一フレームでなく直近 N 枚を1回の `vlm_leaf` 呼び出しで実況→latest-window+single-flight+A1 で staleness 回避・A11 で黒/取得不可は「視認不可」と正直報告（捏造しない）・既定 off(`VLM_ENABLED=1`)・`eve/vlm/`。
 - **引き継ぎ・未対応問題(P1-P3)・docs訂正は `docs/HANDOFF.md` に集約**（新セッションは最初に読む）。
 - 現状は**単一 asyncio ループ前提**（mic read=executor／VAD 推論=ループ上同期）。cross-thread 機構は **P2 裁定(a)で削除済**＝loop が全共有 state の唯一所有者。将来 OS スレッドは `PIPELINE_DESIGN.md §9.3` の橋渡し契約経由（VAD 別スレッド化＝最初の利用候補）。
 - 埋め込みは `eve/memory/embed/make_embedder(ruri|openai)`（**ModelRegistry とは別系統**・`make_stt` と同方式）。Ruri v3-310m 既定。

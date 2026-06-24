@@ -75,10 +75,15 @@
 
 ---
 
-## H. 画面認識VLM（capture→Gemini×3→統合）【確定/裁定済】
-- **挙動**: 画面変化時(pHash→SSIM ゲートで静止画はスキップ)にスクショ → **同一フレームを Gemini Flash 2.5 ×3 の self-consistency**（誤読を平均化=YOLO起因ハルシネの代替）→ より賢いモデルで統合ナレーション。重量級CV(YOLO/tracking/analysis/aggregation/saliency)は全廃。
-- **関わり**: SurpriseBus(screen-diff 書込) / StimulusQueue(vision刺激, 複数はmerge) / ContextAssembler(画面認識) / screen-op(責務分離: VLM=読む / screen-op=作用する)。
-- **PORT**: `vlm/capture/screen.py`(mss+pHash) + `change_detector.py`(変化ゲート, 2値に簡素化)。**OSS**: Open-LLM-VTuber の視覚認識アーキが設計参考。
+## H. 画面認識VLM（単発・複数フレーム / snapshot モード）【実装済 2026-06-24・F6】
+- **採択の変更（探索で覆る）**: 旧案 `同一フレーム×3 self-consistency→統合`(LLM4回/更新・単一フレームで動き不可) は廃止。**直近 N 枚の連続フレームを1回の multi-frame VLM 呼び出し**で実況化（動き理解 + コスト1/4 + 低レイテンシ）。Gemini/Qwen ともネイティブの multi-frame 対応を一次確認。重量級CV(YOLO/tracking/analysis/aggregation/saliency)は全廃のまま。
+- **実装**: `eve/vlm/`。専用 OS スレッド `CaptureThread`(dumb: mss grab→pHash→変化ゲート→`call_soon_threadsafe(on_frame)`・§9.3 means-1) → loop 所有 `VisionState.ring`(全キャプチャ・変化前アンカー込み=A8・drop-oldest) → single-flight `VlmWorker` が直近 K 枚を1回の `vlm_leaf`(gemini-2.5-flash) 呼び出しで `parse_vision`→`latest_vision`/`note_vlm_surprise`→ガード付き発話トリガ。
+- **staleness/backpressure 解**: latest-window + single-flight → 遅延≤推論1回・stale バックログ非蓄積。A1 自己再トリガ（最後フレーム非取り残し）/ A9 min-interval pacing（連続変化のコスト上限）/ A2 await前 value-copy snapshot。
+- **ハルシネ防止(A11)**: 黒/空白フレーム(std 閾値) や grab 失敗(A10) は **VLM に語らせず**「視認不可」正直マーカを latest_vision に置く（surprise/発話に触れない）。narrator プロンプトも「黒/判読不能なら visible:no・推測しない」。
+- **発話は F5 経由（v1 nudge スパム回避）**: vision は刺激化せず、context(# 画面) + surprise(指標・most-recent-wins) + **ガード付き should_speak トリガ**(busy/ユーザ発話中/decider 処理中なら叩かない=A5/Q4)。実際に話すかは LLM が総合判断。
+- **関わり**: `PredictionState`(note_vlm_surprise・第2生産者) / `ContextAssembler(vision=)` / `SpeechDecider`(vision を判定入力に) / `ResponseOrchestrator`(応答へ注入)。`StimulusKind.VISION_UPDATE` は予約(snapshot では未使用)。
+- **既定 off**: `VLM_ENABLED=1` で起動。インフラ knob は `config.py` の `VLM_*`。**将来**: ゲーム等の激しい動きは Gemini Live ストリーム mode（骨格共有・別 mode）。
+- **PORT 元**: v1 `vlm/capture/screen.py`(mss+pHash) / `change_detector.py`(pHash ゲート・SSIM/4段は廃) / `vlm_bridge.py`(dedup)。
 
 ---
 
