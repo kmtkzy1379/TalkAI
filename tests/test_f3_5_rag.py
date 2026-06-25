@@ -139,6 +139,24 @@ async def t_random() -> bool:
     return len(res) == 2 and all(c.as_topic_seed for c in res)
 
 
+def t_topic_importance() -> bool:
+    # 予測差(surprise)が大きいほど話題重要度が高い・pd 無しは importance フォールバック
+    hi = RagStore._topic_importance({"prediction_diff": 90})
+    lo = RagStore._topic_importance({"prediction_diff": 5})
+    none = RagStore._topic_importance({"importance": 0.5})
+    return hi > lo and abs(hi - 0.9) < 0.01 and abs(none - 0.5) < 0.01
+
+
+async def t_topic_candidates() -> bool:
+    # 自律発話の話題の種: k 件・as_topic_seed=True・空ストアは []・relevance 不要(同期)
+    store = _store()
+    for i in range(8):
+        await store.add_chunk(text=f"記憶{i}", search_text="夏", prediction_diff=(90 if i == 0 else 5))
+    res = store.topic_candidates(2)
+    empty = _store().topic_candidates(2)
+    return len(res) == 2 and all(c.as_topic_seed for c in res) and empty == []
+
+
 async def t_persistence_roundtrip() -> bool:
     path = _tmp()
     s1 = _store(rag_file=path)
@@ -193,6 +211,8 @@ async def main() -> None:
     check("MMR: 近重複を排除し多様な記憶を入れる", await t_dedup_diversity())
     check("件数上限: top_k 以下", await t_count_cap())
     check("random: k件・話題の種フラグ", await t_random())
+    check("topic 重要度=予測差由来", t_topic_importance())
+    check("topic_candidates: k件・話題の種・空安全", await t_topic_candidates())
     check("JSONL 永続化往復（embedding込み・復元）", await t_persistence_roundtrip())
     check("配線: 応答に「過去の記憶」が注入される", await t_orch_injects_rag())
 

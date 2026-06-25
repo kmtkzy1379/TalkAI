@@ -115,8 +115,8 @@ class ResponseOrchestrator:
         if self._rag is not None:
             try:
                 if stimulus.kind == StimulusKind.AUTONOMOUS_SPEECH:
-                    # 自発発話は「話題の種」＝ランダム RAG（search でない・同期・思い出話に縛られない）。
-                    rag_chunks = self._rag.random(Config.RAG_RANDOM_K)
+                    # 自発発話は「話題の種」＝重要度優遇＋バラけ（search でない・新しい切り口・思い出話に縛られない）。
+                    rag_chunks = self._rag.topic_candidates(Config.RAG_RANDOM_K)
                 else:
                     rag_chunks = await self._rag.search(str(stimulus.payload))
             except Exception:

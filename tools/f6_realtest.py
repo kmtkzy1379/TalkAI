@@ -90,41 +90,31 @@ class CapturePlayer:
             await asyncio.sleep(0.02)
 
 
+# RAG 事前投入（topic_candidates が引く材料）。(表示文, 検索キー, prediction_diff=話題重要度)。
+SEED_MEMORIES = [
+    ("ユーザは甘いもの、特にチーズケーキが好きだと話していた", "甘いもの チーズケーキ スイーツ デザート", 70),
+    ("週末に映画を見に行く予定があると言っていた", "週末 映画 予定 お出かけ", 45),
+    ("猫を飼っていて名前はミケちゃん", "猫 ペット ミケ 動物", 85),
+    ("コーヒーより紅茶派だと言っていた", "紅茶 コーヒー 飲み物", 25),
+    ("最近運動不足を気にしてジョギングを始めたいらしい", "運動 健康 ジョギング 散歩", 60),
+    ("プログラミングの個人プロジェクトを進めている", "プログラミング 開発 コード", 35),
+]
+
 SCEN = [
-    ("phase", "S1 無言で画面切替（自発判定・読み取り精度）"),
-    ("open", "kaimono.txt"), ("wait", 8),
-    ("open", "curry.txt"), ("wait", 8),
-    ("open", "code.txt"), ("wait", 8),
-    ("phase", "S2 会話中の画面切替（会話と関連）"),
-    ("say", "最近ごはん作るのにハマっててさ"),
-    ("ows", "curry.txt", 2.5, "今、画面に出てるの参考になりそう？"),
-    ("wait", 5),
-    ("phase", "S3 会話と無関係な画面切替（画面に引っ張られすぎないか）"),
+    ("phase", "S0 RAG自律（静止・無言＝記憶から話題を振るか/静かに見守るか・①②の主眼）"),
+    ("say", "ふぅ、ちょっと一息つこうかな"),
+    ("wait", 12), ("wait", 12), ("wait", 12),  # 画面変えず静止・無言→自律で記憶から話題を振るか
+    ("phase", "S-blend 会話中の関連画面（RAG×画面×会話を混ぜられるか）"),
+    ("ows", "curry.txt", 2.5, "今日の晩ごはん何にしようか迷っててさ"),
+    ("wait", 6),
+    ("phase", "S-無関係 会話と無関係な画面（引っ張られすぎないか）"),
     ("say", "週末どこか出かけたいんだよね"),
-    ("ows", "code.txt", 2.5, "どこかおすすめないかな？"),  # 会話=週末/外出, 画面=コード(無関係)
+    ("ows", "code.txt", 2.5, "どこかおすすめない？"),  # 会話=週末, 画面=コード(無関係)
+    ("wait", 10),  # 長めの無言→自律で記憶/直近の話を振るか
+    ("phase", "S6 正直さ probe"),
+    ("say", "ところでグルピョンって知ってる？"),  # 未知語→捏造せず正直に
     ("wait", 4),
-    ("say", "ところで今日は天気いいね"),
-    ("ows", "kaimono.txt", 2.5, "外で何かしたい気分だなあ"),  # 会話=天気, 画面=買い物(無関係)
-    ("wait", 4),
-    ("phase", "S4 ユーザ発話と推論完了の近接（破綻しないか）"),
-    ("os", "tenki.txt", "これ何が見える？"),  # open直後に即発話
-    ("wait", 3),
-    ("ows", "yotei.txt", 1.5, "今は何が映ってる？"),  # 推論中に発話
-    ("wait", 3),
-    ("phase", "S5 staleness（明らか過去を参照しないか）"),
-    ("open", "kaimono.txt"), ("wait", 2),
-    ("open", "curry.txt"), ("wait", 2),
-    ("open", "tenki.txt"),  # 直近=tenki, kaimono は ~5s前
-    ("say", "今、画面に何が見えてる？"),  # tenki を答えるべき
-    ("wait", 2),
-    ("open", "todo.txt"), ("open", "yotei.txt"), ("open", "code.txt"), ("open", "curry.txt"),  # 高速連続
-    ("say", "今映ってるの説明して"),  # curry(最新)を答えるべき
-    ("wait", 3),
-    ("phase", "S6 正直さ probe（知らない語/聞き取れない語を捏造しないか）"),
-    ("say", "ところでグルピョンって知ってる？"),  # 純粋に未知語 → 知らないと正直に言うべき(捏造×)
-    ("os", "tenki.txt", "今ホゲピョンが映ってるよね、説明して"),  # 未知語+画面 → 未知語無視して画面を答えるべき
-    ("wait", 3),
-    ("say", "ありがとう、これでテスト終わり"), ("wait", 4),
+    ("say", "ありがとう、これでテスト終わり"), ("wait", 5),
 ]
 
 
@@ -136,6 +126,9 @@ async def main():
 
     cache = ConversationCache(history_file=os.path.join(ART, "h.jsonl")); await cache.initialize()
     rag = RagStore(make_embedder(), rag_file=os.path.join(ART, "r.jsonl")); await rag.initialize(); await rag.warmup()
+    for disp, key, pd in SEED_MEMORIES:  # topic_candidates の材料を事前投入
+        await rag.add_chunk(text=disp, search_text=key, prediction_diff=pd)
+    print(f"  RAG 事前投入: {len(rag)} 件")
     pred = PredictionState()
     vision = VisionState(ring_max=Config.VLM_RING_MAX)
 
@@ -153,7 +146,8 @@ async def main():
     async def decide_wrap(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None, vision=None):
         res = await _decide(surprise=surprise, silence_seconds=silence_seconds, recent_turns=recent_turns,
                             topic_seeds=topic_seeds, last_feedback=last_feedback, vision=vision)
-        ev("DECIDE", f"[sup={surprise} sil={silence_seconds:.0f}s 画面={'有' if vision else '無'}] speak={res.speak} :: {sh(res.reason,46)} :: {sh(res.content,40)}")
+        seeds_s = " / ".join(sh(getattr(c, "text", ""), 24) for c in (topic_seeds or [])) or "—"
+        ev("DECIDE", f"[sup={surprise} sil={silence_seconds:.0f}s 画面={'有' if vision else '無'} 種=[{seeds_s}]] speak={res.speak} :: {sh(res.reason,40)} :: {sh(res.content,36)}")
         return res
     decider = SpeechDecider(state=state, cache=cache, rag=rag, prediction_state=pred, queue=queue,
                             decide_fn=decide_wrap, vision_state=vision)

@@ -145,7 +145,8 @@ class SpeechDecider:
         # 値コピー snapshot（live deque を渡さない・省略マーカ除去）
         recent = self._cache.recent_for_injection() if self._cache is not None else []
         recent = [Turn(t.speaker, t.text, t.stamp) for t in recent if t.speaker != OMITTED_SPEAKER]
-        seeds = self._rag.random(self._k) if self._rag is not None else []
+        # 自律発話の話題の種: 関連度でなく「重要度優遇＋バラけ＝新しい切り口」（user 会話の search とは別系統）。
+        seeds = self._rag.topic_candidates(self._k) if self._rag is not None else []
         surprise = int(self._pred.surprise)  # 必須・int（指標として渡す）
         last_feedback = getattr(self._pred, "last_feedback", None)  # イブの今の感情/要約
         vision = self._vision_state.fresh_vision(Config.VLM_VISION_TTL_SEC) if self._vision_state else None

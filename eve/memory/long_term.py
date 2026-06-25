@@ -300,6 +300,29 @@ class RagStore:
         picked = random.sample(chunks, min(k, len(chunks)))
         return [self._to_chunk(c, as_topic_seed=True) for c in picked]
 
+    @staticmethod
+    def _topic_importance(c: dict) -> float:
+        """話題提起用の重要度。予測差(surprise)が大きい記憶ほど印象的＝重要とみなす（0-1）。
+        importance フィールドは現状一様(0.5)なので prediction_diff を主信号に使う（user 検索は不変）。"""
+        pd = c.get("prediction_diff")
+        if isinstance(pd, (int, float)):
+            return min(1.0, abs(float(pd)) / 100.0)
+        return float(c.get("importance", 0.5))
+
+    def topic_candidates(self, k: int = 2, *, jitter: Optional[float] = None) -> list[RagChunk]:
+        """無言時の自律発話用「話題の種」。**重要度を優遇しつつ少しバラけさせて新しい切り口**を出す
+        （埋め込み不要・同期）。ユーザ会話の `search`（関連度重視）とは別系統＝relevance を使わず、
+        重要度(予測差) + ランダム jitter で並べる（random の「過去に逸れない/新しい話題」狙いを保ちつつ
+        重要な記憶を少し優遇）。"""
+        chunks = list(self._chunks)
+        if not chunks:
+            return []
+        jit = jitter if jitter is not None else Config.RAG_TOPIC_JITTER
+        scored = sorted(chunks, key=lambda c: self._topic_importance(c) + jit * random.random(), reverse=True)
+        pool = scored[: max(k * 3, 6)]
+        random.shuffle(pool)  # プール内で更にバラけさせる（同じ重要記憶ばかりにしない）
+        return [self._to_chunk(c, as_topic_seed=True) for c in pool[:k]]
+
     # --- 背景書き込み -----------------------------------------------------
 
     async def _write_worker(self) -> None:
