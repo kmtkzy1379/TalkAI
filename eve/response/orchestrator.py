@@ -115,8 +115,10 @@ class ResponseOrchestrator:
         if self._rag is not None:
             try:
                 if stimulus.kind == StimulusKind.AUTONOMOUS_SPEECH:
-                    # 自発発話は「話題の種」＝重要度優遇＋バラけ（search でない・新しい切り口・思い出話に縛られない）。
-                    rag_chunks = self._rag.topic_candidates(Config.RAG_RANDOM_K)
+                    # 自発発話: 今の画面/内容に**関連する記憶** ＋ **新しい切り口** を混ぜる（user search とは別系統）。
+                    vis = self._vision_state.fresh_vision(Config.VLM_VISION_TTL_SEC) if self._vision_state is not None else None
+                    content = stimulus.payload.content if isinstance(stimulus.payload, AutonomousSpeech) else None
+                    rag_chunks = await self._rag.autonomous_memories(" ".join(filter(None, [vis, content])), Config.RAG_RANDOM_K)
                 else:
                     rag_chunks = await self._rag.search(str(stimulus.payload))
             except Exception:

@@ -145,11 +145,16 @@ class SpeechDecider:
         # 値コピー snapshot（live deque を渡さない・省略マーカ除去）
         recent = self._cache.recent_for_injection() if self._cache is not None else []
         recent = [Turn(t.speaker, t.text, t.stamp) for t in recent if t.speaker != OMITTED_SPEAKER]
-        # 自律発話の話題の種: 関連度でなく「重要度優遇＋バラけ＝新しい切り口」（user 会話の search とは別系統）。
-        seeds = self._rag.topic_candidates(self._k) if self._rag is not None else []
         surprise = int(self._pred.surprise)  # 必須・int（指標として渡す）
         last_feedback = getattr(self._pred, "last_feedback", None)  # イブの今の感情/要約
         vision = self._vision_state.fresh_vision(Config.VLM_VISION_TTL_SEC) if self._vision_state else None
+        # 自律発話の材料: 今の画面/直近に**関連する記憶** ＋ **新しい切り口**（user 会話の search とは別系統）。
+        # 「甘いもの検索→前のチーズケーキの話」のように画面↔記憶を結べるよう、画面+直近をクエリに引く。
+        if self._rag is not None:
+            q = " ".join(filter(None, [vision, recent[-1].text if recent else None]))
+            seeds = await self._rag.autonomous_memories(q, self._k)
+        else:
+            seeds = []
         silence = self._state.silence_seconds()
         seq0 = self._state.user_activity_seq  # 判定中にユーザが話したか検出する基準
         self._idle.clear()

@@ -323,6 +323,24 @@ class RagStore:
         random.shuffle(pool)  # プール内で更にバラけさせる（同じ重要記憶ばかりにしない）
         return [self._to_chunk(c, as_topic_seed=True) for c in pool[:k]]
 
+    async def autonomous_memories(self, query: Optional[str], k: int = 3) -> list[RagChunk]:
+        """自律発話用: **今の画面/直近に関連する記憶(search)** ＋ **新しい切り口(topic_candidates)** を混ぜる。
+        前者で「今の画面↔過去の話」を結べ（例: 甘いもの検索→前のチーズケーキの話）、後者で会話の幅を出す。"""
+        out: list[RagChunk] = []
+        seen: set[str] = set()
+        if query and query.strip():
+            for c in await self.search(query, max(1, k // 2)):  # 関連記憶（重複は後で除外）
+                if c.text not in seen:
+                    out.append(c)
+                    seen.add(c.text)
+        for c in self.topic_candidates(k):  # 新しい切り口（重要度優遇）で残りを埋める
+            if len(out) >= k:
+                break
+            if c.text not in seen:
+                out.append(c)
+                seen.add(c.text)
+        return out
+
     # --- 背景書き込み -----------------------------------------------------
 
     async def _write_worker(self) -> None:

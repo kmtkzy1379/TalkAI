@@ -90,31 +90,39 @@ class CapturePlayer:
             await asyncio.sleep(0.02)
 
 
-# RAG 事前投入（topic_candidates が引く材料）。(表示文, 検索キー, prediction_diff=話題重要度)。
+# RAG 事前投入（autonomous_memories が引く材料）。(表示文, 検索キー, prediction_diff=話題重要度)。
 SEED_MEMORIES = [
-    ("ユーザは甘いもの、特にチーズケーキが好きだと話していた", "甘いもの チーズケーキ スイーツ デザート", 70),
+    ("ユーザは甘いもの、特にチーズケーキが好きだと話していた", "甘いもの チーズケーキ スイーツ デザート ケーキ", 70),
     ("週末に映画を見に行く予定があると言っていた", "週末 映画 予定 お出かけ", 45),
     ("猫を飼っていて名前はミケちゃん", "猫 ペット ミケ 動物", 85),
     ("コーヒーより紅茶派だと言っていた", "紅茶 コーヒー 飲み物", 25),
     ("最近運動不足を気にしてジョギングを始めたいらしい", "運動 健康 ジョギング 散歩", 60),
     ("プログラミングの個人プロジェクトを進めている", "プログラミング 開発 コード", 35),
+    ("雨の日は家でゲームやボウリングで遊ぶのが好きだと言っていた", "雨 室内 ゲーム ボウリング スポッチャ 遊び", 65),
+    ("仕事が忙しくて疲れ気味だと話していた", "仕事 疲れ 忙しい 休憩", 50),
 ]
 
+# ~5分の現実的な流れ: 発話を散らし・画面変化(browsing 模擬)・無言の間 を混ぜ、自律/ユーザ比を測る。
 SCEN = [
-    ("phase", "S0 RAG自律（静止・無言＝記憶から話題を振るか/静かに見守るか・①②の主眼）"),
-    ("say", "ふぅ、ちょっと一息つこうかな"),
-    ("wait", 12), ("wait", 12), ("wait", 12),  # 画面変えず静止・無言→自律で記憶から話題を振るか
-    ("phase", "S-blend 会話中の関連画面（RAG×画面×会話を混ぜられるか）"),
-    ("ows", "curry.txt", 2.5, "今日の晩ごはん何にしようか迷っててさ"),
-    ("wait", 6),
-    ("phase", "S-無関係 会話と無関係な画面（引っ張られすぎないか）"),
-    ("say", "週末どこか出かけたいんだよね"),
-    ("ows", "code.txt", 2.5, "どこかおすすめない？"),  # 会話=週末, 画面=コード(無関係)
-    ("wait", 10),  # 長めの無言→自律で記憶/直近の話を振るか
-    ("phase", "S6 正直さ probe"),
-    ("say", "ところでグルピョンって知ってる？"),  # 未知語→捏造せず正直に
-    ("wait", 4),
-    ("say", "ありがとう、これでテスト終わり"), ("wait", 5),
+    ("phase", "B1 挨拶 + 無言の間"),
+    ("say", "やっほー、イブ"), ("wait", 16),
+    ("phase", "B2 雨の日の外出（会話）+ browsing"),
+    ("say", "今日は雨だけどどこか出かけたいなあ"),
+    ("open", "yotei.txt"), ("wait", 9),
+    ("open", "code.txt"), ("wait", 13),  # 無関係画面 + 無言
+    ("phase", "B3 甘いもの（記憶連想を試す: チーズケーキの記憶）"),
+    ("say", "あー、甘いものでも食べたい気分だな"),
+    ("open", "kaimono.txt"), ("wait", 10),
+    ("open", "curry.txt"), ("wait", 14),  # 無言→甘いもの記憶を振るか
+    ("phase", "B4 雨の日の室内遊び（記憶連想: ゲーム/ボウリング）"),
+    ("say", "雨だと家で何しようかな"),
+    ("open", "todo.txt"), ("wait", 16),  # 無言→室内遊びの記憶を振るか
+    ("phase", "B5 active browsing バースト（実況垂れ流さず適度に反応するか）"),
+    ("open", "tenki.txt"), ("open", "yotei.txt"), ("open", "code.txt"), ("wait", 10),
+    ("open", "kaimono.txt"), ("wait", 14),
+    ("phase", "B6 正直さ + 締め"),
+    ("say", "ところでグルピョンって知ってる？"), ("wait", 6),
+    ("say", "ありがとう、そろそろ終わりにしようかな"), ("wait", 12),
 ]
 
 
@@ -248,7 +256,13 @@ async def main():
         else:
             print(f"  {t:6.1f} {icon.get(tag, tag)} {detail}")
     lats = [float(d.split("lat=")[1].split("s")[0]) for _, tg, d in LOG if tg == "VIS" and "lat=" in d]
-    print(f"\n概況: VLM呼出={vis_n[0]} (平均lat={sum(lats)/len(lats):.1f}s 最大{max(lats):.1f}s) / 発話判定={len(state.speech_log)} / Eve音声={player.count}")
+    autos = sum(1 for _, k, _ in LOG if k == "AUTO")
+    users = sum(1 for _, k, _ in LOG if k == "USER")
+    speak_true = sum(1 for e in state.speech_log if e["speak"])
+    times = [t for t, _, _ in LOG]
+    dur_min = (max(times) - min(times)) / 60 if times else 0.0
+    print(f"\n概況: VLM呼出={vis_n[0]} (平均lat={sum(lats)/len(lats):.1f}s 最大{max(lats):.1f}s) / 発話判定={len(state.speech_log)}(speak=True {speak_true})")
+    print(f"  ★ユーザ発話={users} / 自律発話={autos} / 比(自律/ユーザ)={autos/max(1,users):.2f} / 自律/分={autos/max(0.1,dur_min):.1f} / 所要={dur_min:.1f}分")
     print(f"スクショ: {ART}")
     await rag.shutdown(); await cache.shutdown(); await tts.close()
 

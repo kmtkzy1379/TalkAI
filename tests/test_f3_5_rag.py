@@ -157,6 +157,27 @@ async def t_topic_candidates() -> bool:
     return len(res) == 2 and all(c.as_topic_seed for c in res) and empty == []
 
 
+async def t_autonomous_memories() -> bool:
+    # 自律発話用: 関連記憶(search) + 新しい切り口(topic_candidates) を混ぜる
+    store = _store()
+    for txt, key, pd in [("夏の話", "夏 スイカ", 30), ("旅行の話", "旅行", 80),
+                         ("音楽の話", "音楽", 20), ("仕事の話", "仕事", 50)]:
+        await store.add_chunk(text=txt, search_text=key, prediction_diff=pd)
+    res = await store.autonomous_memories("夏 スイカ", 3)
+    texts = [c.text for c in res]
+    # 関連(夏の話)が含まれる + k件以下 + 重複なし
+    return "夏の話" in texts and len(res) <= 3 and len(set(texts)) == len(texts)
+
+
+async def t_autonomous_memories_no_query() -> bool:
+    # クエリ無し → topic_candidates のみ（新しい切り口）で埋める
+    store = _store()
+    for i in range(5):
+        await store.add_chunk(text=f"記憶{i}", search_text="夏", prediction_diff=50)
+    res = await store.autonomous_memories("", 2)
+    return len(res) == 2 and all(c.as_topic_seed for c in res)
+
+
 async def t_persistence_roundtrip() -> bool:
     path = _tmp()
     s1 = _store(rag_file=path)
@@ -213,6 +234,8 @@ async def main() -> None:
     check("random: k件・話題の種フラグ", await t_random())
     check("topic 重要度=予測差由来", t_topic_importance())
     check("topic_candidates: k件・話題の種・空安全", await t_topic_candidates())
+    check("autonomous_memories: 関連+新しい切り口を混合", await t_autonomous_memories())
+    check("autonomous_memories: クエリ無し→種のみ", await t_autonomous_memories_no_query())
     check("JSONL 永続化往復（embedding込み・復元）", await t_persistence_roundtrip())
     check("配線: 応答に「過去の記憶」が注入される", await t_orch_injects_rag())
 

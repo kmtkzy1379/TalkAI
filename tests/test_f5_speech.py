@@ -254,7 +254,7 @@ async def t_autonomous_injection() -> bool:
         and "天気の話を振ってみる" in last["content"]       # content は最終 user 指示に入る
         and "返事ではなく" in last["content"]               # Fix3/4: 自分から話す指示（返事でない）
         and "# 発話判定理由" in joined and "間が空いたから" in joined  # reason は system
-        and "話題の種" in joined                            # rag.random は as_topic_seed=True
+        and "夏祭り" in joined                              # autonomous_memories の記憶材料が注入される
         and users_after == users_before                     # メモリ非汚染: user ターン増えない
         and any("やあ、最近どう" in t for t in eve_turns)   # eve 発話は記録される
     )
