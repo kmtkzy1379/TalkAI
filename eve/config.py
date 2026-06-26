@@ -107,8 +107,9 @@ class Config:
     SILENCE_THRESHOLD_SEC = float(os.getenv("SILENCE_THRESHOLD_SEC", "5.0"))
     # surprise は数値で発話を絶対決定しない（指標）。発話判定LLM が surprise+感情+内容を総合判断する
     # （ユーザ裁定）。よって SURPRISE_SPEAK_FORCE/FLOOR の数値ゲートは廃止。
-    # 沈黙時の「話題の種」取得件数（自律発話用・search でなく topic_candidates）。
-    RAG_RANDOM_K = int(os.getenv("RAG_RANDOM_K", "2"))
+    # 沈黙時の「話題の種」取得件数（自律発話用）。沈黙時はコンテキストに余裕があるので 3
+    # （関連1 + 完全ランダム1 + 重要度1 の構成＝毎回同じ記憶ばかりにせず新しい切り口を混ぜる）。
+    RAG_RANDOM_K = int(os.getenv("RAG_RANDOM_K", "3"))
     # 話題の種のバラけ具合（0=重要度順のみ / 大きいほどランダム性増＝新しい切り口を出す）。
     RAG_TOPIC_JITTER = float(os.getenv("RAG_TOPIC_JITTER", "0.4"))
     # 発話判定ログ（True/False とも記録・ロケット鉛筆・処理には関与しない＝観測専用）。

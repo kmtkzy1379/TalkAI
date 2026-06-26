@@ -49,6 +49,18 @@ SCRIPT = [
 ]
 
 
+class FakeVision:
+    """常に同じ「代わり映えしない画面」を返す vision_state スタブ（実機の静止画面を再現）。"""
+    def __init__(self, text):
+        self._t = text
+    def fresh_vision(self, ttl, now=None):
+        return self._t
+
+
+# 実機の静止 PowerShell ログ画面を模した「退屈で代わり映えしない」ナレーション。
+BORING_VISION = "Windows PowerShellのウィンドウが最前面に表示され、AI関連のログが流れている。直前のフレームから画面に変化はない。"
+
+
 def sh(s, n=60):
     return (str(s) if s is not None else "—")[:n].replace("\n", " ")
 
@@ -63,16 +75,21 @@ def mem_hit(content):
 
 async def main():
     model = sys.argv[1] if len(sys.argv) > 1 else "gpt-4o-mini"
+    vmode = sys.argv[2] if len(sys.argv) > 2 else "none"  # none ＝画面なし / static ＝退屈な静止画面
+    vision_state = FakeVision(BORING_VISION) if vmode == "static" else None
     reg = ModelRegistry(overrides={"speech_decide": f"openai/{model}"})
-    print(f"decide model -> {reg.resolve('speech_decide')}  (vision=None ＝純 RAG 自律のみ)\n")
+    print(f"decide model -> {reg.resolve('speech_decide')}  vision={vmode}"
+          f"{'（退屈な静止画面を常時注入＝実機の静止再現）' if vmode == 'static' else '（画面なし＝純 RAG）'}\n")
 
     clock = [1000.0]
     state = SpeechState(now_fn=lambda: clock[0])
-    cache = ConversationCache(history_file=os.path.join(os.environ.get("TEMP", "/tmp"), "ras_h.jsonl"))
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="ras_")  # 毎回新規ディレクトリ＝前回履歴の混入を防ぐ
+    cache = ConversationCache(history_file=os.path.join(tmp, "h.jsonl"))
     await cache.initialize()
-    rag = RagStore(make_embedder(), rag_file=os.path.join(os.environ.get("TEMP", "/tmp"), "ras_r.jsonl"))
+    rag = RagStore(make_embedder(), rag_file=os.path.join(tmp, "r.jsonl"))
     await rag.warmup()
-    # 既存ファイルを汚さないよう毎回新規（initialize はせず空から seed）
+    # 空から seed（initialize で過去ファイルを読まない）
     for disp, key, pd in SEED:
         await rag.add_chunk(text=disp, search_text=key, prediction_diff=pd)
     pred = PredictionState()
@@ -89,7 +106,7 @@ async def main():
         return res
 
     decider = SpeechDecider(state=state, cache=cache, rag=rag, prediction_state=pred,
-                            queue=queue, decide_fn=decide_wrap, vision_state=None)
+                            queue=queue, decide_fn=decide_wrap, vision_state=vision_state)
 
     users = 0
     autos = 0

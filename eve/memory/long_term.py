@@ -324,21 +324,32 @@ class RagStore:
         return [self._to_chunk(c, as_topic_seed=True) for c in pool[:k]]
 
     async def autonomous_memories(self, query: Optional[str], k: int = 3) -> list[RagChunk]:
-        """自律発話用: **今の画面/直近に関連する記憶(search)** ＋ **新しい切り口(topic_candidates)** を混ぜる。
-        前者で「今の画面↔過去の話」を結べ（例: 甘いもの検索→前のチーズケーキの話）、後者で会話の幅を出す。"""
+        """自律発話用: **関連記憶(search)** ＋ **完全ランダム1件** ＋ **重要度(topic_candidates)** を混ぜる。
+        - 関連: 「今の画面↔過去の話」を結ぶ（例: 甘いもの検索→前のチーズケーキの話）。
+        - ランダム1件: 関連度/重要度だけだと**毎回同じ記憶が選ばれて単調**になるため、関連度に依らない
+          1件を必ず混ぜて新しい切り口・意外性を出す（ユーザ案。沈黙時はコンテキストに余裕がある）。
+        - 重要度: 残り枠を予測差の大きい印象的な記憶で埋める。"""
         out: list[RagChunk] = []
         seen: set[str] = set()
+
+        def _add(c: RagChunk) -> None:
+            if c.text not in seen and len(out) < k:
+                out.append(c)
+                seen.add(c.text)
+
         if query and query.strip():
-            for c in await self.search(query, max(1, k // 2)):  # 関連記憶（重複は後で除外）
-                if c.text not in seen:
-                    out.append(c)
-                    seen.add(c.text)
-        for c in self.topic_candidates(k):  # 新しい切り口（重要度優遇）で残りを埋める
+            for c in await self.search(query, max(1, k // 3)):  # 関連記憶（k=3→1件）
+                _add(c)
+        for c in self.random(2):  # 完全ランダム1件（関連度エコーチェンバーを破る）
             if len(out) >= k:
                 break
             if c.text not in seen:
-                out.append(c)
-                seen.add(c.text)
+                _add(c)
+                break  # ランダムは1件だけ
+        for c in self.topic_candidates(k):  # 残りを重要度+jitter で埋める
+            if len(out) >= k:
+                break
+            _add(c)
         return out
 
     # --- 背景書き込み -----------------------------------------------------
