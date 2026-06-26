@@ -61,10 +61,14 @@ def render_last_feedback(r: FeedbackResult) -> str:
 
 
 def render_chunk_text(r: FeedbackResult) -> str:
-    """RAG 注入時に解凍される完全版テキスト（展開注入）。"""
+    """RAG 注入時に解凍される完全版テキスト（展開注入）。
+
+    先頭はエピソード記憶（出来事の事実）を**ラベルなし**で置く。注入側が
+    `[過去の記憶/N分前] …` と既に銘打つため「要約:」等の前置きは重複＝省く。
+    """
     lines: list[str] = []
     if r.summary:
-        lines.append(f"要約: {r.summary}")
+        lines.append(r.summary)
     affect = []
     if r.emotions:
         affect.append(f"イブ={r.emotions}")

@@ -230,6 +230,12 @@ def t_prompt_cold_sentinel() -> bool:
     return "初回・前回の予測なし" in u and "[イブ] ひとりごと" in u
 
 
+def t_prompt_summary_is_episodic() -> bool:
+    """summary は「出来事の記憶（事実）」を促し、手続き型メタ要約を避ける指示が入っている。"""
+    sys_msg = build_messages([_turn("user", "x")], None)[0]["content"]
+    return "出来事の記憶" in sys_msg and "手続き" in sys_msg
+
+
 # ========== B4 FeedbackLLM.run ==========
 async def t_fb_cold_start() -> bool:
     fb = FeedbackLLM(_reg_const(_FULL))  # rag 無し・state 新規(last_prediction None)
@@ -283,7 +289,8 @@ async def t_fb_rag_write() -> bool:
         return False
     rec = store._chunks[0]
     diff_ok = rec["prediction_diff"] == 35
-    text_ok = "要約" in rec["text"] and "夏祭り" in rec["text"]
+    # 展開注入テキストは先頭にエピソード記憶（要約の事実）をラベルなしで置く。
+    text_ok = rec["text"].startswith("夏祭りの思い出話") and "夏祭り" in rec["text"]
     res = await store.search("夏")  # 埋め込みターゲット=summary+tags＝「夏」でヒット
     search_ok = len(res) >= 1 and "夏祭り" in res[0].text
     return diff_ok and text_ok and search_ok and fb.state.surprise == 35
@@ -501,6 +508,7 @@ async def main() -> None:
     # B3
     check("B3 prompt 前回予測+会話を含む", t_prompt_includes_prediction_and_turns())
     check("B3 prompt cold センチネル", t_prompt_cold_sentinel())
+    check("B3 prompt summary はエピソード記憶を促す", t_prompt_summary_is_episodic())
     # B4
     check("B4 cold start(surprise 中立・next 繰越)", await t_fb_cold_start())
     check("B4 FEP ループ閉(last_prediction 更新)", await t_fb_fep_close())
