@@ -4,6 +4,10 @@
 > **食い違いはコードが正。** 本書は 4 エージェント並列監査＋一次ソース（実コード行）確認で作成。
 
 ## 現在地
+
+> **実装ステップ③決定（2026-06-27）: 残り機能の着手は Call-Function（J-0 read-only 能力 + J-1 task）から。** パイプライン/スレッド破綻リスク最小（再投入 plumbing は `stimulus.py` に既存＝`CALLFUNCTION_RESULT`+`dedup_key`／task/search/screen-op は §9.2 で loop サイドカー＝新スレッド0／UI は唯一の新スレッド境界で後段）。詳細・根拠 = `COMPONENT_LOGIC.md §N`。次はステップ④（実装プランニング）で `model_registry.stream` の tool_calls 対応が主論点。
+> **原契約=`KIKAKUSHO.md`（原文）／確定設計=`COMPONENT_LOGIC.md`（J=Call-Function核心・ddgs+Scrapling 等）。**
+
 - ブランチ: `feat/f6-vlm-snapshot`（main から分岐・**main 未マージ**・F5 までは main 統合済）。
 - 実装済（実装順）: **F0 / F1 / F2 / F2.5 / F3 / F3.5 / P2 / F4 FeedbackLLM / 応答プロンプト leak 修正 / F5 発話判定 / Fix1-4 話者取り違え修正 / F6 画面認識VLM(snapshot モード)**。
 - 未実装: (b)文脈不整合の自己懐疑(タスク管理隣接) / 多生産者 SurpriseBus(VLM は現状 PredictionState 第2生産者で直結) / Call-Function(task/search/screen-op) / YouTube / UI / 配線層PORT(vts/run/launcher/app) / VLM の Gemini Live ストリーム mode(将来)。

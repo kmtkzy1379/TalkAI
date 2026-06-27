@@ -224,3 +224,27 @@ Scrapling 一次調査の結論: Scrapling は「**取得+パース+Markdown抽�
 - **実行係=コード / 完了→StimulusQueue 経由** をユーザ質問に回答し確定。
 - **deadline=通常タスク統合 / search=ddgs+Scrapling** 確定。**screen-op=仮決定C拡張**(実装時に task/search と合わせ再議論=ユーザ明言)。
 - 「その他機能はおおむね同意・実装時に詰める」(ユーザ) → **ステップ③(実装優先順位)へ進める状態**。
+
+---
+
+## N. 実装優先順位（ステップ③・破綻リスク評価込み）【決定 2026-06-27】
+
+> ユーザ要請「現状システム + docs を再参照し、**パイプライン/スレッド破綻リスクが最小**で効率的・きれいに着手できる順」を一次ソース確認で再考した結論。F0–F6（エンジン）完了後の残り機能の着手順。
+
+### 結論: **Call-Function（J-0 read-only 能力 + J-1 task）から着手**。リスク最小かつ効率最大。
+
+**なぜ低リスクか（現コードの一次ソース根拠）**:
+- **再投入プラミングは既に存在**: `pipeline/stimulus.py` に `StimulusKind.CALLFUNCTION_RESULT=1`（優先度 USER0 > CF1 > AUTO2 > VISION3 既定義）+ `Stimulus.dedup_key`（コメントに「CallFunction 結果の重複・二次注入対策」と明記）。`stimulus_queue.py` は「**CallFunction 逐次**」drain を実装済。→ doc J §192「特に密結合で要注意（再投入が再挨拶/nudge/二次注入を誘発）」の対策は**設計・実装済**。task executor は「**Stimulus を作るだけ**」（stimulus.py docstring 明記）。
+- **新 OS スレッド ゼロ**: `PIPELINE_DESIGN.md §9.2` が task executor / search / screen-op を **(i) loop サイドカー（§9.4）**と分類（「いずれも awaitable・**新 OS スレッド不要**・ブロッキング部分のみ (ii) executor」）。§9.4 契約（single-flight + 単一書込 + トリガ + 背圧）の **precedent が既に3つ**（`ConversationCache/RagStore._write_worker`・`FeedbackWorker`・`VlmWorker`）。＝確立済パターンの再利用で**スレッド破綻リスク極小**。
+- **唯一の新タッチポイント** = 応答 stream からの `tool_calls` 取得（`model_registry.stream` + `response/orchestrator`）。content streaming は **native tool-calling** で不変に保てる＝クリティカルパス影響を局所化（これがステップ④の主設計論点）。
+
+**リスク最小の内部順序**:
+1. **Call-Function 配線 + J-1 task ストア（JSONL async write=既存形）/ executor（サイドカー）+ J-0 read-only 能力**（`pc_status`/`self_status`/`window列挙`＝OS変更なし）→ 「応答 → tool_call → executor → `CALLFUNCTION_RESULT` 再投入」の**全フローを無害な能力で先に通す**（企画書「簡易実装で処理フロー確認」に合致）。
+2. **J-2 search**（ddgs + Scrapling。ブロッキング I/O は (ii) executor）。
+3. **J-3 screen-op の OS 変更系**（サンドボックス・**最後**＝既に「task/search 確定後に再議論」で deferred）。
+
+**他案を先にしない理由（同じ軸＝破綻リスク）**:
+- **UI を先にしない**: Tkinter メインスレッド ↔ asyncio スレッドの**新スレッド境界**を導入＝残ロードマップで唯一の真の新スレッド risk（§9 で未着手の audio callback と並ぶ）。スレッド破綻の観点で**最悪**＝後段（§L）。
+- **整理・反芻フィードバックを先にしない（が任意で並行可）**: 既存 feedback サイドカーの延長で**リスクは最小**だが、フローを通さない“寄り道”で Call-Function を de-risk しない。低リスクな小増分として 1 と**並行/直前に差し込む選択肢はあり**。
+
+→ 次は **ステップ④（Call-Function の実装プランニング）**。`model_registry.stream` の `tool_calls` 対応が唯一の設計論点。
