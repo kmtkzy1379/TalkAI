@@ -178,6 +178,32 @@ async def t_autonomous_memories_no_query() -> bool:
     return len(res) == 2 and all(c.as_topic_seed for c in res)
 
 
+async def t_autonomous_memories_empty() -> bool:
+    # 空ストア（新規ユーザ・cold）でも例外を出さず空を返す（破綻しない）
+    store = _store()
+    a = await store.autonomous_memories("夏 スイカ", 3)
+    b = await store.autonomous_memories(None, 3)  # query=None も安全
+    return a == [] and b == []
+
+
+async def t_autonomous_memories_cold_one() -> bool:
+    # 記憶1件のみ → その1件を返す（ランダム枠/重要度枠が空でも壊れない）
+    store = _store()
+    await store.add_chunk(text="夏祭りの記憶", search_text="夏", prediction_diff=50)
+    res = await store.autonomous_memories("夏", 3)
+    return len(res) == 1 and res[0].text == "夏祭りの記憶"
+
+
+async def t_autonomous_memories_bounds_dedup() -> bool:
+    # 重複テキストが大量でも k 件以下・重複なし（関連+ランダム+重要度の合流で二重に出さない）
+    store = _store()
+    for i in range(12):
+        await store.add_chunk(text=f"記憶{i % 3}", search_text="夏", prediction_diff=50)  # 3種が各4件
+    res = await store.autonomous_memories("夏", 3)
+    texts = [c.text for c in res]
+    return len(res) <= 3 and len(set(texts)) == len(texts)
+
+
 async def t_persistence_roundtrip() -> bool:
     path = _tmp()
     s1 = _store(rag_file=path)
@@ -236,6 +262,9 @@ async def main() -> None:
     check("topic_candidates: k件・話題の種・空安全", await t_topic_candidates())
     check("autonomous_memories: 関連+新しい切り口を混合", await t_autonomous_memories())
     check("autonomous_memories: クエリ無し→種のみ", await t_autonomous_memories_no_query())
+    check("autonomous_memories: 空ストア/None でも破綻しない", await t_autonomous_memories_empty())
+    check("autonomous_memories: 記憶1件(cold)でも返す", await t_autonomous_memories_cold_one())
+    check("autonomous_memories: k件以下・重複なし(合流dedup)", await t_autonomous_memories_bounds_dedup())
     check("JSONL 永続化往復（embedding込み・復元）", await t_persistence_roundtrip())
     check("配線: 応答に「過去の記憶」が注入される", await t_orch_injects_rag())
 
