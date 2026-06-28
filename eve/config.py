@@ -132,6 +132,9 @@ class Config:
     VLM_VISION_TTL_SEC = float(os.getenv("VLM_VISION_TTL_SEC", "7.0"))
     VLM_BLANK_STD_THRESHOLD = float(os.getenv("VLM_BLANK_STD_THRESHOLD", "6.0"))  # 黒/空白検出（std 未満=取得不可・A11）
 
+    # Call-Function（J-0 即時 Call-Function・increment 1 は read-only 能力のみ）。
+    CALLFUNCTION_ENABLED = os.getenv("CALLFUNCTION_ENABLED", "0") == "1"  # 既定 off（実機で明示 on）
+
     @classmethod
     def validate(cls) -> list[str]:
         """不足している必須設定を列挙。空リストなら起動可（Start ゲートで使う）。"""

@@ -54,7 +54,8 @@ class ContextAssembler:
     def __init__(self, system_prompt: str = "") -> None:
         self.system_prompt = system_prompt
 
-    def _build_system(self, *, rag_chunks, last_feedback, vision, speech_decision_reason, now) -> str:
+    def _build_system(self, *, rag_chunks, last_feedback, vision, speech_decision_reason, now,
+                      callfunction_result=None, tools_active=False) -> str:
         parts: list[str] = []
         if self.system_prompt:
             parts.append(self.system_prompt)
@@ -75,6 +76,15 @@ class ContextAssembler:
             parts.append(f"# 直近フィードバック\n{last_feedback}")
         if speech_decision_reason:
             parts.append(f"# 発話判定理由\n{speech_decision_reason}")
+        if callfunction_result:
+            # 再投入された機能実行結果（ユーザ発話ではない＝user 枠に入れない）。これを読んで報告する。
+            parts.append(f"# 機能実行結果\n{callfunction_result}")
+        if tools_active:
+            parts.append(
+                "# 機能（Call-Function）の使い方\n"
+                "必要なら提供された関数を呼んでよい。呼ぶ前に「ちょっと調べるね」等の短い前置きを一言"
+                "添えてよい。関数名・引数・JSON は読み上げない（呼び出しは自動で発話されない）。"
+            )
         return "\n\n".join(parts)
 
     def _build_conversation(self, recent_turns) -> list[dict]:
@@ -109,6 +119,8 @@ class ContextAssembler:
         last_feedback: str | None = None,
         vision: str | None = None,
         speech_decision_reason: str | None = None,
+        callfunction_result: str | None = None,
+        tools_active: bool = False,
         now: Stamp | None = None,
     ) -> list[dict]:
         now = now or Stamp.now()
@@ -118,6 +130,7 @@ class ContextAssembler:
                 "content": self._build_system(
                     rag_chunks=rag_chunks, last_feedback=last_feedback, vision=vision,
                     speech_decision_reason=speech_decision_reason, now=now,
+                    callfunction_result=callfunction_result, tools_active=tools_active,
                 ),
             }
         ]

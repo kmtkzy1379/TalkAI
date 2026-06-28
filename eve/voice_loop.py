@@ -21,6 +21,8 @@ from .pipeline.audio_play_queue import AudioPlayQueue
 from .pipeline.orchestrator import PipelineRunner
 from .pipeline.stimulus import StimulusKind
 from .pipeline.stimulus_queue import StimulusQueue
+from .capability import CapabilityRegistry
+from .response.function_dispatcher import FunctionDispatcher
 from .response.input_source import MicSttInputSource
 from .response.orchestrator import ResponseOrchestrator
 from .response.player import RealAudioPlayer
@@ -83,9 +85,23 @@ class VoiceLoop:
         )
         self.capture_thread: Optional[CaptureThread] = None  # run() で loop 取得後に生成（VLM_ENABLED 時）
 
-        async def stream_fn(messages):
-            async for delta in self.registry.stream("response", messages):
-                yield delta
+        # J Call-Function: read-only Capability 層 + 実行 Dispatcher（既定 off）。
+        # self_status の live 値は runner/queue を lazy lambda で読む（runner はこの後で生成）。
+        self.capabilities = CapabilityRegistry(
+            is_busy=lambda: self.runner.is_busy(),
+            qsize=lambda: self.queue.qsize(),
+        )
+        self.dispatcher = FunctionDispatcher(registry=self.capabilities, queue=self.queue)
+
+        async def stream_fn(messages, *, tools=None, tool_sink=None):
+            if tools:
+                async for delta in self.registry.stream_with_tools(
+                    "response", messages, tools=tools, tool_sink=tool_sink
+                ):
+                    yield delta
+            else:
+                async for delta in self.registry.stream("response", messages):
+                    yield delta
 
         self.orchestrator = ResponseOrchestrator(
             # system プロンプト= SPEECH_STYLE（最小スタイル指示・ペルソナではない）。
@@ -97,6 +113,7 @@ class VoiceLoop:
             prediction_state=self.prediction,
             on_response_complete=self._on_response_complete,  # 正常完了で feedback + 沈黙時計リセット
             vision_state=self.vision_state,  # F6: 応答文脈に直近画面を注入
+            dispatcher=self.dispatcher,  # J: tool_calls を応答完了後に submit（gate は CALLFUNCTION_ENABLED）
         )
         self.runner = PipelineRunner(self.queue, self.orchestrator, self.audio)
         # 沈黙監視は応答中(runner busy)/ユーザ発話中は発火しない（is_busy をガードに使う）。
@@ -168,6 +185,10 @@ class VoiceLoop:
         self.speech_state.mark_eve_activity()
         self.speech_decider.start()
         self.silence_monitor.start()
+        # J: Call-Function 実行サイドカー（既定 off）。read-only 能力のみ。
+        if Config.CALLFUNCTION_ENABLED:
+            self.dispatcher.start()
+            logger.info("Call-Function 稼働（read-only 能力）")
         # F6: 画面認識を起動（既定 off）。capture スレッドは loop 確定後に生成し on_frame を橋渡し。
         if Config.VLM_ENABLED:
             self.vlm_worker.start()
@@ -201,6 +222,11 @@ class VoiceLoop:
             pass
         try:
             await self.speech_decider.stop()
+        except Exception:
+            pass
+        # J: Call-Function 実行サイドカーを drain/停止（進行中の能力実行を取りこぼさない）。
+        try:
+            await self.dispatcher.stop()
         except Exception:
             pass
         # feedback worker を先に drain/停止（進行中 add_chunk を rag.shutdown 前に flush 機会を与える。

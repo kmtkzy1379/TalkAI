@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable, Optional
 from ..config import Config
 from ..context_assembler import ContextAssembler, RagChunk, Turn
 from ..pipeline.audio_play_queue import AudioPlayQueue
-from ..pipeline.stimulus import Stimulus, StimulusKind
+from ..pipeline.stimulus import CallFunctionResult, Stimulus, StimulusKind
 from ..speech.decider import AutonomousSpeech
 from .splitter import JapaneseSentenceSplitter
 from .style import SPEECH_STYLE, sanitize_for_speech
@@ -47,6 +47,7 @@ class ResponseOrchestrator:
         prediction_state: Optional["PredictionState"] = None,
         on_response_complete: Optional[Callable[[], None]] = None,
         vision_state=None,  # F6 任意: 直近の画面ナレーション源（latest_vision を文脈へ注入）
+        dispatcher=None,  # J 任意: FunctionDispatcher（tool_calls を応答完了後に submit）
     ) -> None:
         self._audio = audio
         self._stream_fn = stream_fn
@@ -63,7 +64,20 @@ class ResponseOrchestrator:
         self._on_complete = on_response_complete
         # 任意注入(F6): 直近の画面ナレーション（latest_vision）を build 時に同期読みして注入。
         self._vision_state = vision_state
+        # 任意注入(J): Call-Function の実行サイドカー。tool_calls を応答完了後に submit（非ブロッキング）。
+        self._dispatcher = dispatcher
         self.last_response = ""  # 生成済み全文（自然さの目視・テスト用。記憶には使わない＝C5）
+
+    def _tools_enabled_for(self, stimulus: Stimulus) -> bool:
+        """この刺激の応答で tool（Call-Function）を有効にするか。
+
+        USER 発話のみ＝CALLFUNCTION_RESULT/自発発話には渡さない（1ホップ抑制＝二次注入/無限ループ防止）。
+        """
+        return (
+            self._dispatcher is not None
+            and Config.CALLFUNCTION_ENABLED
+            and stimulus.kind == StimulusKind.USER_UTTERANCE
+        )
 
     def _build_messages(
         self,
@@ -81,9 +95,13 @@ class ResponseOrchestrator:
         speech_reason = None
         user_text = None
         autonomous_content = None
+        callfunction_result = None
         if stimulus.kind == StimulusKind.AUTONOMOUS_SPEECH and isinstance(payload, AutonomousSpeech):
             autonomous_content = payload.content
             speech_reason = payload.reason
+        elif stimulus.kind == StimulusKind.CALLFUNCTION_RESULT and isinstance(payload, CallFunctionResult):
+            # 機能実行結果はユーザ発話ではない＝user 枠でなく「# 機能実行結果」ブロックへ（誤話者防止）。
+            callfunction_result = payload.content
         else:
             user_text = str(payload)
         # native ロール messages（system + user/assistant ターン列 + 最終 user発話/自発指示）。
@@ -95,6 +113,8 @@ class ResponseOrchestrator:
             last_feedback=last_feedback,
             vision=vision,
             speech_decision_reason=speech_reason,
+            callfunction_result=callfunction_result,
+            tools_active=self._tools_enabled_for(stimulus),
         )
 
     def _notify_complete(self) -> None:
@@ -124,6 +144,9 @@ class ResponseOrchestrator:
             except Exception:
                 logger.exception("RAG 取得に失敗（記憶なしで継続）")
         messages = self._build_messages(stimulus, recent, rag_chunks)
+        # J Call-Function: USER ターンのみ tools を渡す。tool_calls はここに溜め、応答完了後に submit。
+        tools = self._dispatcher.tool_schemas() if self._tools_enabled_for(stimulus) else None
+        tool_sink: list = []
         # ユーザ発話なら user ターンを記録（自律/vision/callfunction には user ターンは無い）。
         if self._cache is not None and stimulus.kind == StimulusKind.USER_UTTERANCE:
             self._cache.add_turn("user", str(stimulus.payload))
@@ -171,7 +194,12 @@ class ResponseOrchestrator:
 
         try:
             try:
-                async for delta in self._stream_fn(messages):
+                # tools 有効時のみ tool 対応 stream（content は従来どおり TTS・tool_calls は sink へ）。
+                stream = (
+                    self._stream_fn(messages, tools=tools, tool_sink=tool_sink)
+                    if tools is not None else self._stream_fn(messages)
+                )
+                async for delta in stream:
                     if self._audio.current_generation() != gen:
                         break  # barge-in(世代変化): 生成停止（残りの文は出さない）
                     for sentence in splitter.feed(delta):
@@ -193,6 +221,10 @@ class ResponseOrchestrator:
             # F4: 正常完了時のみ feedback をトリガ（barge-in=CancelledError 経路では呼ばない）。
             # 直近の eve ターンが記録された後なので、worker のスパンに今回応答が含まれる。
             self._notify_complete()
+            # J Call-Function: 応答完了後に tool_calls を実行へ submit（O(1)・非ブロッキング＝Eve は即解放）。
+            # 実行は背景サイドカーで進む。barge-in(CancelledError)経路はここに到達しない＝submit しない。
+            if tool_sink and self._dispatcher is not None:
+                self._dispatcher.submit(tool_sink)
         except asyncio.CancelledError:
             # barge-in: ここまでに**実際に喋った分だけ**を記憶に記録（生成途中の文は残さない）。
             _record_eve()

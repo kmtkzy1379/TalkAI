@@ -35,3 +35,16 @@ class Stimulus:
     @property
     def base_priority(self) -> int:
         return int(self.kind)
+
+
+@dataclass(frozen=True)
+class CallFunctionResult:
+    """Call-Function 実行結果の刺激 payload（AutonomousSpeech と同形）。
+
+    content = 応答LLM へ渡す**人間可読**の結果文（再投入時に「# 機能実行結果」へそのまま入る）。
+    function_name = 実行した能力名（ログ/文脈用）。ok = 成否（失敗も正直に伝えるため保持）。
+    """
+
+    function_name: str
+    content: str
+    ok: bool = True

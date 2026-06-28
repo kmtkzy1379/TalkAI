@@ -27,6 +27,43 @@ CompletionFn = Callable[..., Awaitable[object]]
 StreamFn = Callable[..., AsyncIterator[str]]  # (model=, messages=, **kw) -> 文字列デルタの async iter
 
 
+def _g(o: object, k: str):
+    """dict / オブジェクト両対応の属性取り出し（litellm の chunk は object・fake は dict）。"""
+    return o.get(k) if isinstance(o, dict) else getattr(o, k, None)
+
+
+def merge_tool_call_deltas(fragments) -> list[dict]:
+    """streaming の tool_calls 断片（index 毎に id/name/arguments が分割）を1件ずつに結合する。
+
+    各 fragment は `.index / .id / .function.{name,arguments}` を持つ（object or dict）。
+    arguments は連結（JSON 文字列の断片）。name の無い空 slot は捨てる。raise しない。
+    """
+    acc: dict[int, dict] = {}
+    for f in fragments or []:
+        idx = _g(f, "index") or 0
+        slot = acc.setdefault(int(idx), {"id": "", "name": "", "arguments": ""})
+        fid = _g(f, "id")
+        if fid:
+            slot["id"] = fid
+        fn = _g(f, "function")
+        if fn is not None:
+            nm = _g(fn, "name")
+            if nm:
+                slot["name"] = nm
+            ar = _g(fn, "arguments")
+            if ar:
+                slot["arguments"] += ar
+    out: list[dict] = []
+    for idx in sorted(acc):
+        s = acc[idx]
+        if s["name"]:
+            out.append(
+                {"id": s["id"] or f"call_{idx}",
+                 "function": {"name": s["name"], "arguments": s["arguments"] or "{}"}}
+            )
+    return out
+
+
 class ModelRegistry:
     """役割名から具体モデルIDを解決し、統一インターフェースで完了を呼ぶ。"""
 
@@ -85,3 +122,36 @@ class ModelRegistry:
                 delta = None
             if delta:
                 yield delta
+
+    async def stream_with_tools(
+        self, role: str, messages: list[dict], *, tools: list[dict], tool_sink: list, **kwargs
+    ) -> AsyncIterator[str]:
+        """content デルタを yield しつつ、streamed tool_calls を index 毎に結合して `tool_sink` に積む。
+
+        litellm は tool_calls をチャンクで断片配信する（`delta.tool_calls[i]` の id/name/arguments が
+        複数チャンクに分かれる）。終端で完成した tool_calls（dict）を `tool_sink` へ追記する。
+        Call-Function 有効ターンでのみ呼ぶ（content streaming は従来どおり＝発話順/barge-in 不変）。
+        """
+        model = self.resolve(role)
+        if self._stream_fn is not None:  # テスト注入（tool path は tools/tool_sink を受ける fn を渡す）
+            async for piece in self._stream_fn(
+                model=model, messages=messages, tools=tools, tool_sink=tool_sink, **kwargs
+            ):
+                yield piece
+            return
+        from litellm import acompletion  # 遅延 import
+
+        resp = await acompletion(model=model, messages=messages, stream=True, tools=tools, **kwargs)
+        frags: list = []
+        async for chunk in resp:
+            try:
+                delta = chunk.choices[0].delta
+            except (AttributeError, IndexError, KeyError, TypeError):
+                continue
+            content = getattr(delta, "content", None)
+            if content:
+                yield content
+            tcs = getattr(delta, "tool_calls", None)
+            if tcs:
+                frags.extend(tcs)
+        tool_sink.extend(merge_tool_call_deltas(frags))
