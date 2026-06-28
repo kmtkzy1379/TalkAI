@@ -79,6 +79,21 @@ class FakeDispatcher:
         self.submitted.append(list(tool_calls))
 
 
+class FakeRag:
+    """orchestrator 用: 検索クエリを記録する fake RagStore。"""
+
+    def __init__(self) -> None:
+        self.queries: list[tuple[str, str]] = []
+
+    async def search(self, q, k=None):
+        self.queries.append(("search", q))
+        return []
+
+    async def autonomous_memories(self, q, k=3):
+        self.queries.append(("auto", q))
+        return []
+
+
 # ========== Capability ==========
 def t_capability_readonly() -> bool:
     reg = CapabilityRegistry(is_busy=lambda: False, qsize=lambda: 2)
@@ -103,6 +118,18 @@ def t_capability_exception() -> bool:
     return "失敗" in reg.execute("boom", {})
 
 
+def t_capability_failure_reason() -> bool:
+    # 失敗時に「何で失敗したか」を結果文に含める（ユーザ要望: 失敗理由も話せるように）。
+    reg = CapabilityRegistry()
+
+    def boom(a):
+        raise ValueError("disk full")
+
+    reg.register(Capability("boom", "x", {}, boom))
+    r = reg.execute("boom", {})
+    return "失敗" in r and "disk full" in r
+
+
 def t_parse_tool_call_robust() -> bool:
     name, args, cid = parse_tool_call(_tc("x", "self_status", '{"a": 1}'))
     bad_name, bad_args, _ = parse_tool_call(_tc("y", "f", "not-json"))  # 壊れた JSON → {}
@@ -122,6 +149,17 @@ def t_merge_tool_call_deltas() -> bool:
         and out[0]["function"]["name"] == "self_status"
         and out[0]["function"]["arguments"] == '{"a":1}'
     )
+
+
+def t_merge_multitool() -> bool:
+    # マルチツール: index 0/1 の2件を取り違えず別々に結合（「時刻とシステム両方」のケース）。
+    frags = [
+        {"index": 0, "id": "a", "function": {"name": "pc_status", "arguments": "{}"}},
+        {"index": 1, "id": "b", "function": {"name": "self_status", "arguments": ""}},
+        {"index": 1, "function": {"arguments": "{}"}},
+    ]
+    out = merge_tool_call_deltas(frags)
+    return len(out) == 2 and [o["function"]["name"] for o in out] == ["pc_status", "self_status"]
 
 
 # ========== Dispatcher ==========
@@ -281,6 +319,22 @@ async def t_orch_toolonly_no_content() -> bool:
         Config.CALLFUNCTION_ENABLED = False
 
 
+async def t_orch_result_rag_uses_content() -> bool:
+    # CALLFUNCTION_RESULT は payload の repr でなく content で RAG 検索する（干渉/誤クエリ防止）。
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    rag = FakeRag()
+
+    async def stream_fn(messages):
+        yield "報告するね。"
+
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, rag_store=rag)
+    w = asyncio.create_task(audio.play_worker())
+    payload = CallFunctionResult("self_status", "今は手が空いている", True)
+    await orch.handle(Stimulus(StimulusKind.CALLFUNCTION_RESULT, payload))
+    w.cancel()
+    return rag.queries == [("search", "今は手が空いている")]
+
+
 async def t_orch_no_dispatcher_unchanged() -> bool:
     # dispatcher 無し＝従来挙動。旧 stream_fn シグネチャ (messages) のまま動く。
     audio = AudioPlayQueue(play_fn=_noop_play)
@@ -300,8 +354,10 @@ async def t_orch_no_dispatcher_unchanged() -> bool:
 async def main() -> None:
     check("Capability: read-only 実行/未対応/schema", t_capability_readonly())
     check("Capability: 例外は「失敗」文字列", t_capability_exception())
+    check("Capability: 失敗理由を結果に含める", t_capability_failure_reason())
     check("parse_tool_call: 頑健(壊れJSON→{})", t_parse_tool_call_robust())
     check("merge_tool_call_deltas: 断片を1件に結合", t_merge_tool_call_deltas())
+    check("merge: マルチツール(index別)を別々に結合", t_merge_multitool())
     check("Dispatcher: submit 非ブロッキング・逐次・dedup_key", await t_dispatcher_nonblocking_sequential())
     check("Dispatcher: 同 call_id は dedup", await t_dispatcher_dedup())
     check("Dispatcher: 未対応は ok=False", await t_dispatcher_unknown())
@@ -309,6 +365,7 @@ async def main() -> None:
     check("Orch: 結果は「# 機能実行結果」へ・1ホップ抑制", await t_orch_result_render_and_suppress())
     check("Orch: barge-in では submit しない", await t_orch_bargein_no_submit())
     check("Orch: tool のみ(無発話)でも無クラッシュ・submit", await t_orch_toolonly_no_content())
+    check("Orch: 結果は content で RAG 検索(repr 不使用)", await t_orch_result_rag_uses_content())
     check("Orch: dispatcher=None で従来挙動(旧シグネチャ)", await t_orch_no_dispatcher_unchanged())
 
 

@@ -87,9 +87,11 @@ class CapabilityRegistry:
             return f"（未対応の機能「{name}」のため実行しませんでした）"
         try:
             return cap.handler(args or {})
-        except Exception:
+        except Exception as e:
             logger.exception("Capability 実行で例外: %s", name)
-            return f"（機能「{name}」の実行に失敗しました）"
+            reason = f"{type(e).__name__}: {e}".strip()
+            # 失敗理由を短く同梱（応答LLM が「○○が理由で失敗した」と正直に言えるように）。
+            return f"（機能「{name}」の実行に失敗しました: {reason[:120]}）"
 
     # --- read-only handlers -------------------------------------------------
 

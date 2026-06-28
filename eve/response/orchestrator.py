@@ -139,6 +139,9 @@ class ResponseOrchestrator:
                     vis = self._vision_state.fresh_vision(Config.VLM_VISION_TTL_SEC) if self._vision_state is not None else None
                     content = stimulus.payload.content if isinstance(stimulus.payload, AutonomousSpeech) else None
                     rag_chunks = await self._rag.autonomous_memories(" ".join(filter(None, [vis, content])), Config.RAG_RANDOM_K)
+                elif stimulus.kind == StimulusKind.CALLFUNCTION_RESULT and isinstance(stimulus.payload, CallFunctionResult):
+                    # 機能実行結果は **content** で関連記憶を引く（payload の repr 文字列で検索しない）。
+                    rag_chunks = await self._rag.search(stimulus.payload.content)
                 else:
                     rag_chunks = await self._rag.search(str(stimulus.payload))
             except Exception:
