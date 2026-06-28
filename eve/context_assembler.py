@@ -77,8 +77,9 @@ class ContextAssembler:
         if speech_decision_reason:
             parts.append(f"# 発話判定理由\n{speech_decision_reason}")
         if callfunction_result:
-            # 再投入された機能実行結果（ユーザ発話ではない＝user 枠に入れない）。これを読んで報告する。
-            parts.append(f"# 機能実行結果\n{callfunction_result}")
+            # 再投入された機能実行結果（ユーザ発話ではない＝user 枠に入れない）。会話が無くても
+            # この結果を必ず一言で報告させる（予約タスクが沈黙中に完了した時の挨拶化を防ぐ）。
+            parts.append(f"# 機能実行結果（この結果をユーザに一言で報告して）\n{callfunction_result}")
         if tools_active:
             parts.append(
                 "# 機能（Call-Function）の使い方\n"
