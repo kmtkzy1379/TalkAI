@@ -1,0 +1,227 @@
+"""タスク管理 inc1（土台ハーネス）の決定論テスト（API 不要・fake registry/clock）。
+
+検証:
+- Store: add/JSONL 往復・**terminal-stays-terminal**・due_now(when≤now)・claim_due(atomic)・孤児 age-out。
+- Executor: due を逐次実行→決定論 verdict→status 確定→CALLFUNCTION_RESULT(dedup_key=task:id)・single-flight。
+- Scheduler: fake clock で when 到来→trigger・executor idle ガード。
+- capabilities: create_task(非ブロッキング)・cancel(Pending のみ)・remind(message)・mutates_state/offered マーカ。
+
+実行: $env:PYTHONIOENCODING="utf-8"; python tests\test_task_phase1.py
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import sys
+import tempfile
+from datetime import datetime, timedelta, timezone
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+logging.disable(logging.CRITICAL)
+
+from eve.capability import CapabilityRegistry  # noqa: E402
+from eve.pipeline.stimulus import StimulusKind  # noqa: E402
+from eve.pipeline.stimulus_queue import StimulusQueue  # noqa: E402
+from eve.task import (  # noqa: E402
+    CANCELLED, DONE, FAILED, PENDING, RUNNING,
+    ReconcileTimer, Task, TaskExecutor, TaskStore, register_task_capabilities,
+)
+
+_passed = 0
+_failed = 0
+_dir = tempfile.mkdtemp(prefix="eve_task_")
+_n = 0
+BASE = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def check(name, cond):
+    global _passed, _failed
+    if cond:
+        _passed += 1; print(f"PASS {name}")
+    else:
+        _failed += 1; print(f"FAIL {name}")
+
+
+def _tmp():
+    global _n
+    _n += 1
+    return os.path.join(_dir, f"tasks{_n}.jsonl")
+
+
+def _iso(dt):
+    return dt.isoformat()
+
+
+class FakeRegistry:
+    """name->結果文字列。失敗は「（…」で始める（registry 規約）。has は results のキー。"""
+
+    def __init__(self, results):
+        self.results = results
+        self.calls = []
+
+    def has(self, name):
+        return name in self.results
+
+    def execute(self, name, args):
+        self.calls.append((name, args))
+        return self.results.get(name, f"（未対応「{name}」）")
+
+
+class FakeExec:
+    def __init__(self):
+        self.triggered = 0
+        self._idle = True
+
+    def is_idle(self):
+        return self._idle
+
+    def trigger(self):
+        self.triggered += 1
+
+
+# ========== Store ==========
+async def t_store_roundtrip_terminal():
+    f = _tmp()
+    s = TaskStore(task_file=f, now_fn=lambda: BASE)
+    await s.initialize()
+    s.add(Task(task_id="t1", what="self_status"))
+    a = s.set_status("t1", RUNNING)
+    b = s.set_status("t1", DONE, result="ok")
+    c = s.set_status("t1", PENDING)  # terminal-stays-terminal → False
+    await s.shutdown()
+    s2 = TaskStore(task_file=f, now_fn=lambda: BASE)
+    await s2.initialize()
+    t2 = s2.get("t1")
+    await s2.shutdown()
+    return a and b and (c is False) and t2 is not None and t2.status == DONE and t2.result == "ok"
+
+
+async def t_store_due_now():
+    clock = [BASE]
+    s = TaskStore(task_file=_tmp(), now_fn=lambda: clock[0])
+    await s.initialize()
+    s.add(Task(task_id="now", what="x", when=None))
+    s.add(Task(task_id="past", what="x", when=_iso(BASE - timedelta(seconds=10))))
+    s.add(Task(task_id="future", what="x", when=_iso(BASE + timedelta(seconds=10))))
+    due = {t.task_id for t in s.due_now()}
+    await s.shutdown()
+    return due == {"now", "past"}
+
+
+async def t_store_claim_atomic():
+    s = TaskStore(task_file=_tmp(), now_fn=lambda: BASE)
+    await s.initialize()
+    s.add(Task(task_id="a", what="x", when=None))
+    c1 = s.claim_due()
+    c2 = s.claim_due()  # 既に Running・他に Pending 無し → None
+    await s.shutdown()
+    return c1 is not None and c1.task_id == "a" and c1.status == RUNNING and c2 is None
+
+
+async def t_store_orphan_ageout():
+    f = _tmp()
+    with open(f, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps({"task_id": "r1", "what": "x", "status": "Running",
+                             "created_at": _iso(BASE), "updated_at": _iso(BASE)}) + "\n")
+    s = TaskStore(task_file=f, now_fn=lambda: BASE + timedelta(seconds=10))
+    await s.initialize()
+    t = s.get("r1")
+    await s.shutdown()
+    return t is not None and t.status == FAILED and "孤児" in (t.failure_reason or "")
+
+
+# ========== Executor ==========
+async def t_executor_runs_verdict_reinject():
+    q = StimulusQueue()
+    reg = FakeRegistry({"self_status": "今は手が空いている", "boom": "（失敗しました）"})
+    s = TaskStore(task_file=_tmp(), now_fn=lambda: BASE)
+    await s.initialize()
+    s.add(Task(task_id="ok1", what="self_status", when=None))
+    s.add(Task(task_id="bad1", what="boom", when=None))
+    ex = TaskExecutor(store=s, registry=reg, queue=q)
+    ex.start(); ex.trigger()
+    await asyncio.sleep(0.05)
+    idle = ex.is_idle()
+    await ex.stop()
+    results = [st for st in q.snapshot() if st.kind == StimulusKind.CALLFUNCTION_RESULT]
+    ok = s.get("ok1").status == DONE and s.get("bad1").status == FAILED
+    dedup = len(results) == 2 and all((r.dedup_key or "").startswith("task:") for r in results)
+    content_ok = any("今は手が空いている" in r.payload.content for r in results)
+    await s.shutdown()
+    return ok and dedup and content_ok and idle
+
+
+async def t_executor_skips_future():
+    q = StimulusQueue()
+    reg = FakeRegistry({"self_status": "ok"})
+    clock = [BASE]
+    s = TaskStore(task_file=_tmp(), now_fn=lambda: clock[0])
+    await s.initialize()
+    s.add(Task(task_id="later", what="self_status", when=_iso(BASE + timedelta(seconds=30))))
+    ex = TaskExecutor(store=s, registry=reg, queue=q)
+    ex.start(); ex.trigger()
+    await asyncio.sleep(0.04)
+    await ex.stop()
+    not_run = s.get("later").status == PENDING and q.qsize() == 0  # 未来は実行されない
+    await s.shutdown()
+    return not_run
+
+
+# ========== Scheduler ==========
+async def t_scheduler_triggers_when_due():
+    clock = [BASE]
+    s = TaskStore(task_file=_tmp(), now_fn=lambda: clock[0])
+    await s.initialize()
+    fe = FakeExec()
+    rt = ReconcileTimer(store=s, executor=fe, tick_sec=0.01)
+    s.add(Task(task_id="f1", what="x", when=_iso(BASE + timedelta(seconds=5))))
+    before = rt.tick()  # not due
+    clock[0] = BASE + timedelta(seconds=6)
+    after = rt.tick()  # due → trigger
+    fe._idle = False
+    busy = rt.tick()  # executor busy → no trigger
+    await s.shutdown()
+    return before is False and after is True and busy is False and fe.triggered == 1
+
+
+# ========== capabilities ==========
+async def t_capabilities():
+    s = TaskStore(task_file=_tmp(), now_fn=lambda: BASE)
+    await s.initialize()
+    reg = CapabilityRegistry()
+    register_task_capabilities(reg, s)
+    r_create = reg.execute("create_task", {"action": "self_status", "when_seconds": 300})
+    tid = s.list_all()[0].task_id
+    r_remind = reg.execute("remind", {"message": "休憩しよう"})
+    r_cancel = reg.execute("cancel_task", {"task_id": tid})
+    cancelled = s.get(tid).status == CANCELLED
+    r_cancel2 = reg.execute("cancel_task", {"task_id": tid})  # 既に terminal → 取消不可
+    schemas = {x["function"]["name"] for x in reg.tool_schemas()}
+    create_cap = reg._caps["create_task"]
+    remind_cap = reg._caps["remind"]
+    await s.shutdown()
+    return (
+        "作成" in r_create and len(s) == 1
+        and r_remind == "休憩しよう"
+        and cancelled and "取り消せない" in r_cancel2
+        and create_cap.mutates_state is True and remind_cap.offered is False
+        and "create_task" in schemas and "remind" not in schemas  # 内部能力は tool 非提供
+    )
+
+
+async def main():
+    check("Store: 往復+terminal-stays-terminal", await t_store_roundtrip_terminal())
+    check("Store: due_now(when≤now のみ)", await t_store_due_now())
+    check("Store: claim_due は atomic(Running 化)", await t_store_claim_atomic())
+    check("Store: 起動時 Running 孤児→Failed", await t_store_orphan_ageout())
+    check("Executor: 逐次実行+決定論verdict+再投入(task:)", await t_executor_runs_verdict_reinject())
+    check("Executor: 未来タスクは実行しない", await t_executor_skips_future())
+    check("Scheduler: when 到来で trigger・busy ガード", await t_scheduler_triggers_when_due())
+    check("capabilities: create/cancel/remind/markers", await t_capabilities())
+
+
+asyncio.run(main())
+print(f"\n合計: PASS {_passed} / FAIL {_failed}")
+sys.exit(1 if _failed else 0)

@@ -23,6 +23,7 @@ from .pipeline.stimulus import StimulusKind
 from .pipeline.stimulus_queue import StimulusQueue
 from .capability import CapabilityRegistry
 from .response.function_dispatcher import FunctionDispatcher
+from .task import ReconcileTimer, TaskExecutor, TaskStore, register_task_capabilities
 from .response.input_source import MicSttInputSource
 from .response.orchestrator import ResponseOrchestrator
 from .response.player import RealAudioPlayer
@@ -92,6 +93,22 @@ class VoiceLoop:
             qsize=lambda: self.queue.qsize(),
         )
         self.dispatcher = FunctionDispatcher(registry=self.capabilities, queue=self.queue)
+
+        # J-1 タスク管理（既定 off・CALLFUNCTION_ENABLED 前提）: read-only 能力に予約/自動実行を足す。
+        # create_task/list_tasks/cancel_task は同じ registry に登録＝dispatcher 経由で応答LLM に提示される。
+        self.task_store = None
+        self.task_executor = None
+        self.reconcile_timer = None
+        if Config.TASK_ENABLED:
+            self.task_store = TaskStore(
+                task_file=Config.TASK_FILE, max_tasks=Config.TASK_MAX,
+                orphan_timeout_sec=Config.TASK_ORPHAN_TIMEOUT_SEC,
+            )
+            register_task_capabilities(self.capabilities, self.task_store)
+            self.task_executor = TaskExecutor(store=self.task_store, registry=self.capabilities, queue=self.queue)
+            self.reconcile_timer = ReconcileTimer(
+                store=self.task_store, executor=self.task_executor, tick_sec=Config.TASK_RECONCILE_TICK_SEC,
+            )
 
         async def stream_fn(messages, *, tools=None, tool_sink=None):
             if tools:
@@ -189,6 +206,12 @@ class VoiceLoop:
         if Config.CALLFUNCTION_ENABLED:
             self.dispatcher.start()
             logger.info("Call-Function 稼働（read-only 能力）")
+        # J-1: タスク管理（既定 off）。store 復元 + executor/scheduler 起動。
+        if self.task_store is not None:
+            await self.task_store.initialize()
+            self.task_executor.start()
+            self.reconcile_timer.start()
+            logger.info("タスク管理 稼働（予約タスク）")
         # F6: 画面認識を起動（既定 off）。capture スレッドは loop 確定後に生成し on_frame を橋渡し。
         if Config.VLM_ENABLED:
             self.vlm_worker.start()
@@ -229,6 +252,22 @@ class VoiceLoop:
             await self.dispatcher.stop()
         except Exception:
             pass
+        # J-1: タスク管理を停止（timer 停止→executor drain→store flush の順）。
+        if self.reconcile_timer is not None:
+            try:
+                await self.reconcile_timer.stop()
+            except Exception:
+                pass
+        if self.task_executor is not None:
+            try:
+                await self.task_executor.stop()
+            except Exception:
+                pass
+        if self.task_store is not None:
+            try:
+                await self.task_store.shutdown()
+            except Exception:
+                pass
         # feedback worker を先に drain/停止（進行中 add_chunk を rag.shutdown 前に flush 機会を与える。
         # 未完分は watermark 未前進なので次回起動の catch-up が回収＝記憶喪失を作らない）。
         try:

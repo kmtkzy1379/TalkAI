@@ -25,7 +25,9 @@ class Capability:
     name: str
     description: str
     params_schema: dict  # JSON schema の properties（引数なしなら空 dict）
-    handler: Callable[[dict], str]  # (args) -> 人間可読の結果文字列
+    handler: Callable[[dict], str]  # (args) -> 人間可読の結果
+    mutates_state: bool = False  # 状態を変える書込能力（将来の UI 承認/監査用マーカ）
+    offered: bool = True  # 応答LLM に tool として提示するか（False=executor 専用の内部能力）文字列
 
 
 class CapabilityRegistry:
@@ -68,7 +70,7 @@ class CapabilityRegistry:
         return list(self._caps)
 
     def tool_schemas(self) -> list[dict]:
-        """litellm `tools=`（OpenAI function schema）形式。"""
+        """litellm `tools=`（OpenAI function schema）形式。offered=False（内部能力）は除外。"""
         return [
             {
                 "type": "function",
@@ -79,6 +81,7 @@ class CapabilityRegistry:
                 },
             }
             for c in self._caps.values()
+            if c.offered
         ]
 
     def execute(self, name: str, args: Optional[dict] = None) -> str:

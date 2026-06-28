@@ -135,6 +135,13 @@ class Config:
     # Call-Function（J-0 即時 Call-Function・increment 1 は read-only 能力のみ）。
     CALLFUNCTION_ENABLED = os.getenv("CALLFUNCTION_ENABLED", "0") == "1"  # 既定 off（実機で明示 on）
 
+    # タスク管理（J-1 inc1 = 土台ハーネス・単純な予約タスクのみ）。CALLFUNCTION_ENABLED 前提。
+    TASK_ENABLED = os.getenv("TASK_ENABLED", "0") == "1"  # 既定 off
+    TASK_FILE = os.getenv("TASK_FILE", "tasks.jsonl")  # 永続 JSONL（イベントログ）
+    TASK_MAX = int(os.getenv("TASK_MAX", "500"))  # in-memory 上限（古い terminal を捨てる）
+    TASK_RECONCILE_TICK_SEC = float(os.getenv("TASK_RECONCILE_TICK_SEC", "1.0"))  # スケジューラ周期
+    TASK_ORPHAN_TIMEOUT_SEC = float(os.getenv("TASK_ORPHAN_TIMEOUT_SEC", "3600"))  # 起動時 Running 孤児の age-out
+
     @classmethod
     def validate(cls) -> list[str]:
         """不足している必須設定を列挙。空リストなら起動可（Start ゲートで使う）。"""
