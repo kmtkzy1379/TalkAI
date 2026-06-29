@@ -105,15 +105,19 @@ def t_capability_readonly() -> bool:
     s = reg.execute("self_status", {})
     p = reg.execute("pc_status", {})
     u = reg.execute("nope", {})
-    schemas = reg.tool_schemas()
-    schemas_ok = bool([json.dumps(x) for x in schemas]) and any(
-        x["function"]["name"] == "self_status" for x in schemas
+    # 実行系(self_status/pc_status)は **応答LLM には非提示**・**TaskAgent 向け**に提示（責務分離）。
+    resp_schemas = {x["function"]["name"] for x in reg.tool_schemas()}
+    agent_schemas = {x["function"]["name"] for x in reg.agent_tool_schemas()}
+    scope_ok = (
+        bool([json.dumps(x) for x in reg.agent_tool_schemas()])
+        and "self_status" in agent_schemas and "pc_status" in agent_schemas
+        and "self_status" not in resp_schemas
     )
     return (
         "手が空いている" in s and "刺激は2件" in s
         and "現在時刻" in p
         and "未対応" in u
-        and schemas_ok
+        and scope_ok
     )
 
 

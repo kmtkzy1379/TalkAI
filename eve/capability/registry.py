@@ -27,10 +27,13 @@ class Capability:
     params_schema: dict  # JSON schema の properties（引数なしなら空 dict）
     handler: Callable[[dict], str]  # (args) -> 人間可読の結果
     mutates_state: bool = False  # 状態を変える書込能力（将来の UI 承認/監査用マーカ）
-    offered: bool = True  # 応答LLM に tool として提示するか（False=executor 専用の内部能力）
+    offered: bool = True  # **応答LLM** に tool 提示するか（委譲/管理系=True・実行系/内部=False）
+    agent_tool: bool = False  # **TaskAgent** に tool 提示するか（実行系=True）。＝責務分離の軸:
+    # 応答LLM は delegate_task/create_task/cancel_task/list_tasks だけ（offered）＝何をしたいか振るだけ。
+    # 実行系(self_status/pc_status/将来の検索・画面操作)は agent_tool=True で **TaskAgent 専用**。
     report_result: bool = True  # 即時実行の結果を CALLFUNCTION_RESULT で報告するか。
     # False=create_task 等の「予約しただけ」系（応答ターンの本文が既に確認済＝ack 重複/状態先出しハルシネ防止）。
-    # ※失敗(「（…」マーカ)時は report_result に関係なく報告される（dispatcher 側）。文字列
+    # ※失敗(「（…」マーカ)時は report_result に関係なく報告される（dispatcher 側）。
 
 
 class CapabilityRegistry:
@@ -50,17 +53,18 @@ class CapabilityRegistry:
         self._register_builtins()
 
     def _register_builtins(self) -> None:
+        # 実行系能力＝TaskAgent 専用（応答LLM には提示しない＝offered=False/agent_tool=True）。
         self.register(Capability(
             name="self_status",
             description="イブ自身の今の状態（応答中か / 未処理の刺激数 / 直近のエラー）を確認する。引数なし。",
             params_schema={},
-            handler=self._self_status,
+            handler=self._self_status, offered=False, agent_tool=True,
         ))
         self.register(Capability(
             name="pc_status",
             description="PC の現在状態（現在時刻 / OS / CPUコア数 / メモリ）を確認する。引数なし。",
             params_schema={},
-            handler=self._pc_status,
+            handler=self._pc_status, offered=False, agent_tool=True,
         ))
 
     def register(self, cap: Capability) -> None:
@@ -77,20 +81,24 @@ class CapabilityRegistry:
     def names(self) -> list[str]:
         return list(self._caps)
 
+    @staticmethod
+    def _schema(c: "Capability") -> dict:
+        return {
+            "type": "function",
+            "function": {
+                "name": c.name,
+                "description": c.description,
+                "parameters": {"type": "object", "properties": c.params_schema, "required": []},
+            },
+        }
+
     def tool_schemas(self) -> list[dict]:
-        """litellm `tools=`（OpenAI function schema）形式。offered=False（内部能力）は除外。"""
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": c.name,
-                    "description": c.description,
-                    "parameters": {"type": "object", "properties": c.params_schema, "required": []},
-                },
-            }
-            for c in self._caps.values()
-            if c.offered
-        ]
+        """**応答LLM** 向け（委譲/管理系＝offered=True）。実行系/内部は除外。"""
+        return [self._schema(c) for c in self._caps.values() if c.offered]
+
+    def agent_tool_schemas(self) -> list[dict]:
+        """**TaskAgent** 向け（実行系＝agent_tool=True）。委譲/管理系は含めない（自己再帰防止）。"""
+        return [self._schema(c) for c in self._caps.values() if c.agent_tool]
 
     def execute(self, name: str, args: Optional[dict] = None) -> str:
         cap = self._caps.get(name)

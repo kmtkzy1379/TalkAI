@@ -1,9 +1,10 @@
-"""タスク管理の能力を CapabilityRegistry へ登録（既存 tool-calling 経路に乗る）。
+"""タスク管理の能力を CapabilityRegistry へ登録（**応答LLM はこの委譲/管理系だけ**振る）。
 
-- `create_task(action, when_seconds?, message?)`: 単純な予約タスクを作る（write）。応答LLM が
-  「5分後に〜」「これはタスクにすべき」と**自律判断**して呼ぶ。
-- `remind(message)`: 予約された時に message をそのまま結果へ返す純動作（executor が実行・**tool 非提供**）。
-- `list_tasks` / `cancel_task(task_id)`: 一覧 / 取消（Pending のみ・write）。
+- `delegate_task(goal, when_seconds?)`: 自然文ゴールを TaskAgent に委譲（inc2）。複数段階/調べ物。
+- `create_task(action, when_seconds?, message?)`: 実行系能力1つの単純予約（「5分後に〜」）。
+- `remind(message)`: 予約時に message をそのまま返す純動作（executor 実行・tool 非提供）。
+- `list_tasks` / `cancel_task(task_id?)`: 一覧 / 取消（Pending も Running も・ID 省略で直近）。
+実行系能力(self_status/pc_status/将来の検索・画面操作)は agent_tool=True で **TaskAgent 専用**。
 handler は同期・非ブロッキング（store へ即追加 / 状態は store がコード一本化で持つ）。
 """
 from __future__ import annotations
@@ -19,12 +20,9 @@ _MGMT = {"create_task", "delegate_task", "list_tasks", "cancel_task"}
 
 def register_task_capabilities(registry: CapabilityRegistry, store) -> None:
     def _allowed_actions() -> set:
-        # 予約できる action = 提示中(offered)で状態を変えない能力 + remind（内部）。
-        # 動的＝将来 search/screen-op を能力層に足すと自動で予約可能になる（テストの flaky も同様）。
-        names = {
-            c.name for c in registry._caps.values()
-            if c.offered and not c.mutates_state and c.name not in _MGMT
-        }
+        # 予約できる action = 実行系能力(agent_tool=True) + remind（内部）。
+        # 動的＝将来 search/screen-op を実行系として足すと自動で予約可能になる（テストの flaky も同様）。
+        names = {c.name for c in registry._caps.values() if c.agent_tool}
         names.add("remind")
         return names
 

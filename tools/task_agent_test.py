@@ -84,7 +84,8 @@ async def main():
 
     def flaky(a):
         raise ConnectionError("外部サービスに接続できませんでした")
-    caps.register(Capability("external_service_status", "外部サービスの稼働状況を確認する。引数なし。", {}, flaky))
+    caps.register(Capability("external_service_status", "外部サービスの稼働状況を確認する。引数なし。", {}, flaky,
+                             offered=False, agent_tool=True))
 
     _exec = caps.execute
 

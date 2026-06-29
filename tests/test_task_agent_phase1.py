@@ -93,7 +93,7 @@ class FakeReg:
         self.calls = []
         self._on_exec = on_exec
 
-    def tool_schemas(self):
+    def agent_tool_schemas(self):  # agent はこちらを使う（実行系スコープ）
         return [{"type": "function",
                  "function": {"name": k, "description": "", "parameters": {"type": "object", "properties": {}}}}
                 for k in self.results]
@@ -274,15 +274,20 @@ async def t_delegate_task_capability():
     t = s.list_all()[-1]
     r_empty = reg.execute("delegate_task", {"goal": "  "})
     cap = reg._caps["delegate_task"]
-    schemas = {x["function"]["name"] for x in reg.tool_schemas()}
+    resp = {x["function"]["name"] for x in reg.tool_schemas()}        # 応答LLM 向け（委譲/管理）
+    agent = {x["function"]["name"] for x in reg.agent_tool_schemas()}  # TaskAgent 向け（実行系）
     await s.shutdown()
     return (
         "引き受けた" in r and t.goal == "PCとイブの状態を調べてまとめて" and t.what == "" and t.when is not None
         and "ゴールが空" in r_empty
         and cap.mutates_state is True and cap.report_result is False
-        and "delegate_task" in schemas
+        # 責務分離: 応答LLM は委譲/管理だけ・実行系は見えない。agent は実行系だけ・委譲系は見えない。
+        and resp == {"delegate_task", "create_task", "cancel_task", "list_tasks"}
+        and "self_status" in agent and "pc_status" in agent and "delegate_task" not in agent
         # delegate_task は予約 action に出ない（_MGMT 除外）= create_task で予約できない
         and "予約できない" in reg.execute("create_task", {"action": "delegate_task"})
+        # 実行系は create_task で予約できる（agent_tool）
+        and "作成した" in reg.execute("create_task", {"action": "pc_status"})
     )
 
 

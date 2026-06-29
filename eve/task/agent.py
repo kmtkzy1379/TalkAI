@@ -97,7 +97,7 @@ class TaskAgent:
                 return last_content or "（時間切れで完了できなかった）"
             try:
                 resp = await self._model.complete(
-                    "task", messages, tools=self._registry.tool_schemas(),
+                    "task", messages, tools=self._registry.agent_tool_schemas(),
                 )
             except Exception:
                 logger.exception("TaskAgent LLM 呼び出し失敗 task=%s", task_id)
