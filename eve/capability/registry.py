@@ -27,7 +27,10 @@ class Capability:
     params_schema: dict  # JSON schema の properties（引数なしなら空 dict）
     handler: Callable[[dict], str]  # (args) -> 人間可読の結果
     mutates_state: bool = False  # 状態を変える書込能力（将来の UI 承認/監査用マーカ）
-    offered: bool = True  # 応答LLM に tool として提示するか（False=executor 専用の内部能力）文字列
+    offered: bool = True  # 応答LLM に tool として提示するか（False=executor 専用の内部能力）
+    report_result: bool = True  # 即時実行の結果を CALLFUNCTION_RESULT で報告するか。
+    # False=create_task 等の「予約しただけ」系（応答ターンの本文が既に確認済＝ack 重複/状態先出しハルシネ防止）。
+    # ※失敗(「（…」マーカ)時は report_result に関係なく報告される（dispatcher 側）。文字列
 
 
 class CapabilityRegistry:
@@ -65,6 +68,11 @@ class CapabilityRegistry:
 
     def has(self, name: str) -> bool:
         return name in self._caps
+
+    def report_result(self, name: str) -> bool:
+        """この能力の即時実行結果を報告するか（未知は True＝報告）。"""
+        cap = self._caps.get(name)
+        return cap.report_result if cap is not None else True
 
     def names(self) -> list[str]:
         return list(self._caps)

@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from ..capability.registry import Capability, CapabilityRegistry
-from .schema import CANCELLED, PENDING, Task, new_task_id
+from .schema import CANCELLED, PENDING, RUNNING, TERMINAL, Task, new_task_id
 
 # 予約 action から除外するタスク管理能力（自己再帰/無意味を防ぐ）。
 _MGMT = {"create_task", "list_tasks", "cancel_task"}
@@ -54,13 +54,21 @@ def register_task_capabilities(registry: CapabilityRegistry, store) -> None:
 
     def _cancel_task(args: dict) -> str:
         tid = (args.get("task_id") or "").strip()
-        t = store.get(tid)
-        if t is None:
-            return f"（ID「{tid}」のタスクは見つからなかったよ）"
-        if t.status != PENDING:
+        if not tid:
+            # ID 省略 → 直近の未終了タスク（待機 or 実行中）を取り消す（「さっきの予約キャンセルして」）。
+            actives = [t for t in store.list_all() if t.status in (PENDING, RUNNING)]
+            if not actives:
+                return "（今は取り消せる予約タスクは無いよ）"
+            t = actives[-1]; tid = t.task_id
+        else:
+            t = store.get(tid)
+            if t is None:
+                return f"（ID「{tid}」のタスクは見つからなかったよ）"
+        if t.status in TERMINAL:
             return f"（「{t.what}」は既に {t.status} なので取り消せないよ）"
+        # Pending/Running とも Cancelled へ（実行中に取り消した場合は executor が結果を破棄する）。
         store.set_status(tid, CANCELLED)
-        return f"タスク「{t.what}」(ID:{tid}) を取り消したよ。"
+        return f"予約していた「{t.what}」を取り消したよ。"
 
     registry.register(Capability(
         name="create_task",
@@ -71,7 +79,7 @@ def register_task_capabilities(registry: CapabilityRegistry, store) -> None:
             "when_seconds": {"type": "integer", "description": "何秒後に実行するか（省略=すぐ）"},
             "message": {"type": "string", "description": "action が remind の時に伝える内容"},
         },
-        handler=_create_task, mutates_state=True,
+        handler=_create_task, mutates_state=True, report_result=False,  # 成功 ack は応答本文が担う（重複/先出し防止）
     ))
     registry.register(Capability(
         name="remind", description="（内部）予約された内容を伝える。", params_schema={},
@@ -82,7 +90,9 @@ def register_task_capabilities(registry: CapabilityRegistry, store) -> None:
         handler=_list_tasks,
     ))
     registry.register(Capability(
-        name="cancel_task", description="予約タスクを取り消す（Pending のみ）。",
-        params_schema={"task_id": {"type": "string", "description": "取り消すタスクID"}},
+        name="cancel_task",
+        description="予約・実行中のタスクを取り消す。**task_id は省略可**＝直近の予約を取り消す。"
+                    "『キャンセルして』『やっぱりいい』等と言われたら、list_tasks で確認せず**直接これを1回呼ぶ**。",
+        params_schema={"task_id": {"type": "string", "description": "取り消すタスクID（省略すると直近の予約）"}},
         handler=_cancel_task, mutates_state=True,
     ))

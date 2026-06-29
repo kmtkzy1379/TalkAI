@@ -169,6 +169,45 @@ async def t_executor_skips_future():
     return not_run
 
 
+async def t_executor_discard_on_cancel():
+    # 実行中に取り消されたら executor は結果を再投入しない（破棄）・status は Cancelled のまま。
+    q = StimulusQueue()
+    s = TaskStore(task_file=_tmp(), now_fn=lambda: BASE)
+    await s.initialize()
+    s.add(Task(task_id="c1", what="self_status", when=None))
+
+    class CancelDuringExec:
+        def has(self, name):
+            return True
+
+        def execute(self, name, args):
+            s.set_status("c1", CANCELLED)  # 実行の最中に取消が入ったと仮定
+            return "状態は良好"
+
+    ex = TaskExecutor(store=s, registry=CancelDuringExec(), queue=q)
+    ex.start(); ex.trigger()
+    await asyncio.sleep(0.05)
+    await ex.stop()
+    discarded = q.qsize() == 0 and s.get("c1").status == CANCELLED
+    await s.shutdown()
+    return discarded
+
+
+async def t_cancel_running_and_latest():
+    s = TaskStore(task_file=_tmp(), now_fn=lambda: BASE)
+    await s.initialize()
+    reg = CapabilityRegistry()
+    register_task_capabilities(reg, s)
+    s.add(Task(task_id="run1", what="self_status", when=None))
+    s.claim_due()  # Running
+    r1 = reg.execute("cancel_task", {"task_id": "run1"})  # 実行中も取り消せる
+    running_cancelled = s.get("run1").status == CANCELLED
+    s.add(Task(task_id="p2", what="self_status", when=_iso(BASE + timedelta(seconds=100))))
+    r2 = reg.execute("cancel_task", {})  # ID 省略 → 直近の未終了(p2)
+    await s.shutdown()
+    return running_cancelled and s.get("p2").status == CANCELLED and "取り消した" in r1 and "取り消した" in r2
+
+
 # ========== Scheduler ==========
 async def t_scheduler_triggers_when_due():
     clock = [BASE]
@@ -208,7 +247,7 @@ async def t_capabilities():
         and "予約できない" in r_bad
         and r_remind == "休憩しよう"
         and cancelled and "取り消せない" in r_cancel2
-        and create_cap.mutates_state is True and remind_cap.offered is False
+        and create_cap.mutates_state is True and create_cap.report_result is False and remind_cap.offered is False
         and "create_task" in schemas and "remind" not in schemas  # 内部能力は tool 非提供
     )
 
@@ -220,6 +259,8 @@ async def main():
     check("Store: 起動時 Running 孤児→Failed", await t_store_orphan_ageout())
     check("Executor: 逐次実行+決定論verdict+再投入(task:)", await t_executor_runs_verdict_reinject())
     check("Executor: 未来タスクは実行しない", await t_executor_skips_future())
+    check("Executor: 実行中キャンセルは結果破棄", await t_executor_discard_on_cancel())
+    check("cancel: Running も / ID省略で直近", await t_cancel_running_and_latest())
     check("Scheduler: when 到来で trigger・busy ガード", await t_scheduler_triggers_when_due())
     check("capabilities: create/cancel/remind/markers", await t_capabilities())
 

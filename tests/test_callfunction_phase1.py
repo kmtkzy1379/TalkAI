@@ -49,17 +49,22 @@ def _tc(call_id: str, name: str, args: str = "{}") -> dict:
 
 
 class RecordingRegistry:
-    """実行順序を記録する fake registry。"""
+    """実行順序を記録する fake registry。no_report に入れた名前は report_result=False を返す。"""
 
-    def __init__(self) -> None:
+    def __init__(self, no_report: set | None = None, results: dict | None = None) -> None:
         self.calls: list[str] = []
+        self._no_report = no_report or set()
+        self._results = results or {}
 
     def has(self, name: str) -> bool:
         return name != "unknown_fn"
 
+    def report_result(self, name: str) -> bool:
+        return name not in self._no_report
+
     def execute(self, name: str, args: dict) -> str:
         self.calls.append(name)
-        return f"result:{name}"
+        return self._results.get(name, f"result:{name}")
 
     def tool_schemas(self) -> list[dict]:
         return []
@@ -193,6 +198,23 @@ async def t_dispatcher_dedup() -> bool:
     await d.stop()
     results = [s for s in q.snapshot() if s.kind == StimulusKind.CALLFUNCTION_RESULT]
     return len(results) == 1
+
+
+async def t_dispatcher_report_result_suppress() -> bool:
+    # report_result=False の能力は**成功時は再投入しない**（create_task ack 重複防止）。失敗は報告。
+    q = StimulusQueue()
+    reg = RecordingRegistry(no_report={"create_task"},
+                            results={"create_task": "予約したよ", "bad": "（予約できない）"})
+    d = FunctionDispatcher(registry=reg, queue=q)
+    d.start()
+    d.submit([_tc("a", "create_task")])   # 成功 → 再投入されない
+    await asyncio.sleep(0.03)
+    after_success = q.qsize()
+    d.submit([_tc("b", "bad")])           # 失敗(（…) → 再投入される
+    await asyncio.sleep(0.03)
+    await d.stop()
+    results = [s for s in q.snapshot() if s.kind == StimulusKind.CALLFUNCTION_RESULT]
+    return after_success == 0 and len(results) == 1 and results[0].payload.ok is False
 
 
 async def t_dispatcher_unknown() -> bool:
@@ -360,6 +382,7 @@ async def main() -> None:
     check("merge: マルチツール(index別)を別々に結合", t_merge_multitool())
     check("Dispatcher: submit 非ブロッキング・逐次・dedup_key", await t_dispatcher_nonblocking_sequential())
     check("Dispatcher: 同 call_id は dedup", await t_dispatcher_dedup())
+    check("Dispatcher: report_result=False は成功時 再投入しない", await t_dispatcher_report_result_suppress())
     check("Dispatcher: 未対応は ok=False", await t_dispatcher_unknown())
     check("Orch: tool_calls 捕捉→完了後 submit・前置きは発話", await t_orch_captures_and_submits())
     check("Orch: 結果は「# 機能実行結果」へ・1ホップ抑制", await t_orch_result_render_and_suppress())

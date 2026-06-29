@@ -94,9 +94,14 @@ class FunctionDispatcher:
 
     async def _handle_one(self, tc: Any) -> None:
         name, args, call_id = parse_tool_call(tc)
-        ok = self._registry.has(name)
         # read-only 能力は sub-ms。将来の blocking 能力は handler 側で executor へ逃がす。
         content = self._registry.execute(name, args)
+        is_failure = content.startswith("（")  # registry の失敗/未対応マーカ
+        ok = self._registry.has(name) and not is_failure
+        # report_result=False の能力（create_task 等）は**成功時は再投入しない**（応答ターンの本文が
+        # 既に「予約したよ」等と確認済＝ack 重複＋状態先出しハルシネの防止）。失敗は必ず報告する。
+        if not self._registry.report_result(name) and not is_failure:
+            return
         await self._queue.put(
             Stimulus(
                 kind=StimulusKind.CALLFUNCTION_RESULT,

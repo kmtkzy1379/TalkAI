@@ -84,10 +84,15 @@ class TaskExecutor:
         content = self._registry.execute(task.what, task.args or {})
         # 決定論 verdict: 失敗/未対応マーカは「（…」で始まる（registry 規約）。
         ok = bool(self._registry.has(task.what)) and not content.startswith("（")
-        self._store.set_status(
+        advanced = self._store.set_status(
             task.task_id, DONE if ok else FAILED,
             result=content, failure_reason=None if ok else content,
         )
+        if not advanced:
+            # 実行中に取り消された（既に terminal=Cancelled）→ **結果を破棄して報告しない**
+            # （ユーザ設計: 完了させて結果は応答LLM に届けない）。status は Cancelled のまま。
+            logger.info("🗒 タスク %s は実行中に取消されたため結果を破棄", task.what)
+            return
         logger.info("🗒 タスク %s [%s] %s", task.what, "Done" if ok else "Failed", content[:60])
         report = f"（予約していたタスク）{content}"
         await self._queue.put(
