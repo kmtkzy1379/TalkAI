@@ -193,6 +193,7 @@ async def t_capabilities():
     reg = CapabilityRegistry()
     register_task_capabilities(reg, s)
     r_create = reg.execute("create_task", {"action": "self_status", "when_seconds": 300})
+    r_bad = reg.execute("create_task", {"action": "fly_to_moon"})  # 未対応 action → 予約不可
     tid = s.list_all()[0].task_id
     r_remind = reg.execute("remind", {"message": "休憩しよう"})
     r_cancel = reg.execute("cancel_task", {"task_id": tid})
@@ -203,7 +204,8 @@ async def t_capabilities():
     remind_cap = reg._caps["remind"]
     await s.shutdown()
     return (
-        "作成" in r_create and len(s) == 1
+        "作成" in r_create and len(s) == 1  # 有効 action のみ登録（fly_to_moon は弾かれた）
+        and "予約できない" in r_bad
         and r_remind == "休憩しよう"
         and cancelled and "取り消せない" in r_cancel2
         and create_cap.mutates_state is True and remind_cap.offered is False

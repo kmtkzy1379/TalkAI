@@ -13,15 +13,25 @@ from datetime import datetime, timedelta, timezone
 from ..capability.registry import Capability, CapabilityRegistry
 from .schema import CANCELLED, PENDING, Task, new_task_id
 
-# create_task が予約できる action（read-only 能力 + remind）。inc2 で delegate_task(goal) が増える。
-_ALLOWED_ACTIONS = ["self_status", "pc_status", "remind"]
+# 予約 action から除外するタスク管理能力（自己再帰/無意味を防ぐ）。
+_MGMT = {"create_task", "list_tasks", "cancel_task"}
 
 
 def register_task_capabilities(registry: CapabilityRegistry, store) -> None:
+    def _allowed_actions() -> set:
+        # 予約できる action = 提示中(offered)で状態を変えない能力 + remind（内部）。
+        # 動的＝将来 search/screen-op を能力層に足すと自動で予約可能になる（テストの flaky も同様）。
+        names = {
+            c.name for c in registry._caps.values()
+            if c.offered and not c.mutates_state and c.name not in _MGMT
+        }
+        names.add("remind")
+        return names
+
     def _create_task(args: dict) -> str:
         action = (args.get("action") or "").strip()
-        if action not in _ALLOWED_ACTIONS:
-            return f"（予約できない動作「{action}」です。{ '/'.join(_ALLOWED_ACTIONS) } から選んでください）"
+        if action not in _allowed_actions():
+            return f"（予約できない動作「{action}」です。今できるのは {'/'.join(sorted(_allowed_actions()))} だよ）"
         when = None
         ws = args.get("when_seconds")
         if isinstance(ws, (int, float)) and ws > 0:
@@ -54,9 +64,10 @@ def register_task_capabilities(registry: CapabilityRegistry, store) -> None:
 
     registry.register(Capability(
         name="create_task",
-        description="後で自動実行する予約タスクを作る。例『5分後に状態を教えて』→ action=self_status, when_seconds=300。",
+        description="後で自動実行する予約タスクを作る。action は実行する能力名（例: self_status / pc_status / remind）。"
+                    "例『5分後に状態を教えて』→ action=self_status, when_seconds=300。",
         params_schema={
-            "action": {"type": "string", "enum": _ALLOWED_ACTIONS, "description": "予約する動作"},
+            "action": {"type": "string", "description": "予約する能力名（提示中の能力か remind）"},
             "when_seconds": {"type": "integer", "description": "何秒後に実行するか（省略=すぐ）"},
             "message": {"type": "string", "description": "action が remind の時に伝える内容"},
         },
