@@ -23,7 +23,7 @@ from .pipeline.stimulus import StimulusKind
 from .pipeline.stimulus_queue import StimulusQueue
 from .capability import CapabilityRegistry
 from .response.function_dispatcher import FunctionDispatcher
-from .task import ReconcileTimer, TaskExecutor, TaskStore, register_task_capabilities
+from .task import ReconcileTimer, TaskAgent, TaskExecutor, TaskStore, register_task_capabilities
 from .response.input_source import MicSttInputSource
 from .response.orchestrator import ResponseOrchestrator
 from .response.player import RealAudioPlayer
@@ -105,7 +105,14 @@ class VoiceLoop:
                 orphan_timeout_sec=Config.TASK_ORPHAN_TIMEOUT_SEC,
             )
             register_task_capabilities(self.capabilities, self.task_store)
-            self.task_executor = TaskExecutor(store=self.task_store, registry=self.capabilities, queue=self.queue)
+            # TaskAgent（inc2）: delegate_task の自然文ゴールを賢い task LLM が境界つきループで完遂。
+            task_agent = TaskAgent(
+                registry=self.capabilities, model_registry=self.registry, store=self.task_store,
+                max_steps=Config.TASK_AGENT_MAX_STEPS, timeout_sec=Config.TASK_AGENT_TIMEOUT_SEC,
+            )
+            self.task_executor = TaskExecutor(
+                store=self.task_store, registry=self.capabilities, queue=self.queue, agent=task_agent,
+            )
             self.reconcile_timer = ReconcileTimer(
                 store=self.task_store, executor=self.task_executor, tick_sec=Config.TASK_RECONCILE_TICK_SEC,
             )

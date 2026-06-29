@@ -17,6 +17,7 @@ ROLE_ENV: dict[str, tuple[str, str]] = {
     "response": ("RESPONSE_MODEL", "openai/gpt-4o"),
     "speech_decide": ("DECIDE_MODEL", "openai/gpt-4o-mini"),
     "feedback": ("FEEDBACK_MODEL", "openai/gpt-4o-mini"),
+    "task": ("TASK_MODEL", "openai/gpt-5.5"),  # TaskAgent（非同期・遅延許容＝賢いモデル）
     "vlm_leaf": ("VLM_LEAF_MODEL", "gemini/gemini-2.5-flash"),
     "vlm_merge": ("VLM_MERGE_MODEL", "gemini/gemini-2.5-pro"),
     "youtube": ("YOUTUBE_MODEL", "openai/gpt-4o"),

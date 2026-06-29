@@ -14,7 +14,7 @@ from ..capability.registry import Capability, CapabilityRegistry
 from .schema import CANCELLED, PENDING, RUNNING, TERMINAL, Task, new_task_id
 
 # 予約 action から除外するタスク管理能力（自己再帰/無意味を防ぐ）。
-_MGMT = {"create_task", "list_tasks", "cancel_task"}
+_MGMT = {"create_task", "delegate_task", "list_tasks", "cancel_task"}
 
 
 def register_task_capabilities(registry: CapabilityRegistry, store) -> None:
@@ -37,10 +37,24 @@ def register_task_capabilities(registry: CapabilityRegistry, store) -> None:
         if isinstance(ws, (int, float)) and ws > 0:
             when = (datetime.now(timezone.utc) + timedelta(seconds=float(ws))).isoformat()
         task_args = {"message": args["message"]} if action == "remind" and args.get("message") else {}
-        task = Task(task_id=new_task_id(), what=action, args=task_args, when=when, goal=args.get("goal"))
+        task = Task(task_id=new_task_id(), what=action, args=task_args, when=when)
         store.add(task)
         eta = f"{int(ws)}秒後" if when else "すぐ"
         return f"タスクを作成したよ（{action} / {eta} / ID:{task.task_id}）。"
+
+    def _delegate_task(args: dict) -> str:
+        # 自然文ゴールを TaskAgent（賢いタスク担当）に委譲。what は空＝executor が goal 分岐に回す。
+        goal = (args.get("goal") or "").strip()
+        if not goal:
+            return "（ゴールが空でした）"
+        when = None
+        ws = args.get("when_seconds")
+        if isinstance(ws, (int, float)) and ws > 0:
+            when = (datetime.now(timezone.utc) + timedelta(seconds=float(ws))).isoformat()
+        task = Task(task_id=new_task_id(), what="", goal=goal, when=when)
+        store.add(task)
+        eta = f"{int(ws)}秒後" if when else "すぐ"
+        return f"タスクを引き受けたよ（{goal[:24]} / {eta} / ID:{task.task_id}）。"
 
     def _remind(args: dict) -> str:
         return args.get("message") or "（リマインド内容が空でした）"
@@ -80,6 +94,18 @@ def register_task_capabilities(registry: CapabilityRegistry, store) -> None:
             "message": {"type": "string", "description": "action が remind の時に伝える内容"},
         },
         handler=_create_task, mutates_state=True, report_result=False,  # 成功 ack は応答本文が担う（重複/先出し防止）
+    ))
+    registry.register(Capability(
+        name="delegate_task",
+        description="複数段階の作業や調べ物を、賢いタスク担当(TaskAgent)に任せる。goal に自然文で"
+                    "『何を達成したいか』を書く（例: PCとイブの状態を調べてまとめて）。応答中に呼んで"
+                    "『やっとくね』とだけ言えば、達成後に結果が後で届く。イブが自律的に『これは任せよう』"
+                    "と判断して呼んでよい。",
+        params_schema={
+            "goal": {"type": "string", "description": "達成したいこと（自然文のゴール）"},
+            "when_seconds": {"type": "integer", "description": "何秒後に始めるか（省略=すぐ）"},
+        },
+        handler=_delegate_task, mutates_state=True, report_result=False,  # ack は応答本文が担う
     ))
     registry.register(Capability(
         name="remind", description="（内部）予約された内容を伝える。", params_schema={},

@@ -15,8 +15,10 @@ from .store import TaskStore
 from .executor import TaskExecutor
 from .scheduler import ReconcileTimer
 from .capabilities import register_task_capabilities
+from .agent import TaskAgent
 
 __all__ = [
     "Task", "TaskStore", "TaskExecutor", "ReconcileTimer", "register_task_capabilities",
+    "TaskAgent",
     "new_task_id", "PENDING", "RUNNING", "DONE", "FAILED", "CANCELLED", "TERMINAL",
 ]
