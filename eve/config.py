@@ -142,8 +142,8 @@ class Config:
     TASK_RECONCILE_TICK_SEC = float(os.getenv("TASK_RECONCILE_TICK_SEC", "1.0"))  # スケジューラ周期
     TASK_ORPHAN_TIMEOUT_SEC = float(os.getenv("TASK_ORPHAN_TIMEOUT_SEC", "3600"))  # 起動時 Running 孤児の age-out
     # TaskAgent（J-1 inc2 = 賢いタスクLLMの境界つきループ）。コードが境界を所有。
-    TASK_AGENT_MAX_STEPS = int(os.getenv("TASK_AGENT_MAX_STEPS", "6"))  # ループ最大手数（OpenAI SDK 既定5 相当）
-    TASK_AGENT_TIMEOUT_SEC = float(os.getenv("TASK_AGENT_TIMEOUT_SEC", "30.0"))  # 1ゴールの壁(monotonic)時間上限
+    TASK_AGENT_MAX_STEPS = int(os.getenv("TASK_AGENT_MAX_STEPS", "5"))  # ループ最大手数
+    TASK_AGENT_TIMEOUT_SEC = float(os.getenv("TASK_AGENT_TIMEOUT_SEC", "180.0"))  # 1ゴールの壁(monotonic)時間上限=3分で強制終了
 
     @classmethod
     def validate(cls) -> list[str]:
