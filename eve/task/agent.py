@@ -41,6 +41,15 @@ def _g(o, k):
     return o.get(k) if isinstance(o, dict) else getattr(o, k, None)
 
 
+def _content(resp) -> str:
+    """resp から choices[0].message.content を頑健に取り出す（要約呼び出し用）。"""
+    choices = _g(resp, "choices") or []
+    if not choices:
+        return ""
+    msg = _g(choices[0], "message")
+    return (_g(msg, "content") or "") if msg is not None else ""
+
+
 def _extract(message) -> tuple[str, list[tuple[str, str, str]]]:
     """message から (content, [(call_id, name, raw_args_json)]) を頑健に取り出す。raise しない。"""
     content = _g(message, "content") or ""
@@ -88,20 +97,22 @@ class TaskAgent:
             {"role": "user", "content": f"ゴール: {goal}"},
         ]
         last_content = ""
+        notes: list[str] = []  # 各 step の手順（限界離脱時に「なぜ終わらなかったか」を要約する材料）
         for step in range(self._max_steps):
             if self._cancelled(task_id):
                 logger.info("🗒 TaskAgent: 実行中に取消（破棄） task=%s", task_id)
                 return None
             if self._now() > deadline:
                 logger.info("🗒 TaskAgent: timeout task=%s step=%d", task_id, step)
-                return last_content or "（時間切れで完了できなかった）"
+                return await self._summarize_failure(goal, notes, "時間切れ(3分)")
             try:
                 resp = await self._model.complete(
                     "task", messages, tools=self._registry.agent_tool_schemas(),
                 )
             except Exception:
                 logger.exception("TaskAgent LLM 呼び出し失敗 task=%s", task_id)
-                return last_content or "（タスク処理中にエラーが起きて完了できなかった）"
+                notes.append(f"step{step}: LLM 呼び出しエラー")
+                return await self._summarize_failure(goal, notes, "エラー")
 
             choices = _g(resp, "choices") or []
             message = _g(choices[0], "message") if choices else None
@@ -126,7 +137,28 @@ class TaskAgent:
             for (cid, name, raw) in calls:
                 result = self._registry.execute(name, _parse_args(raw))
                 logger.info("🗒 TaskAgent step=%d %s -> %s", step, name, result[:50])
+                notes.append(f"step{step}: {name} -> {result[:60]}")
                 messages.append({"role": "tool", "tool_call_id": cid, "content": result})
 
         logger.info("🗒 TaskAgent: max_steps 到達 task=%s", task_id)
-        return last_content or "（手順の上限まで試したけど完了できなかった）"
+        return await self._summarize_failure(goal, notes, f"手数上限({self._max_steps}手)")
+
+    async def _summarize_failure(self, goal: str, notes: list[str], reason: str) -> str:
+        """限界(タイムアウト/手数上限/エラー)で離脱した時、**なぜ終わらなかったか**を一言にまとめて返す。
+        返り値は「（…」始まり＝executor が Failed と判定（コードが verdict 所有）。要約 LLM 失敗時は
+        notes を決定論連結（no-op 規律）。稀な離脱時のみ 1回だけ呼ぶ。"""
+        detail = " / ".join(notes) if notes else "（手がかりなし）"
+        messages = [
+            {"role": "system", "content": "タスクが完了できませんでした。試した手順から、なぜ時間がかかった/"
+                                          "何が原因で終わらなかったかを日本語で**1文**に簡潔にまとめて（言い訳せず事実だけ）。"},
+            {"role": "user", "content": f"ゴール: {goal}\n打ち切り理由: {reason}\n試した手順:\n{detail}"},
+        ]
+        summary = ""
+        try:
+            resp = await self._model.complete("summarize", messages)
+            summary = (_content(resp) or "").strip()
+        except Exception:
+            logger.exception("限界要約 LLM 失敗（notes で代替）")
+        if not summary:
+            summary = detail[:120]
+        return f"（{reason}: {summary}）"

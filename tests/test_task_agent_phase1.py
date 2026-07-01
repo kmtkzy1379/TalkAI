@@ -161,7 +161,8 @@ async def t_agent_max_steps():
     reg = FakeReg({"self_status": "手が空いている"})
     agent = TaskAgent(registry=reg, model_registry=model, store=CancelStore(), max_steps=3)
     out = await agent.run("終わらないやつ", "t")
-    return out.startswith("（手順の上限") and model.calls == 3 and len(reg.calls) == 3
+    # 手数上限で離脱→「（手数上限…）」で Failed・要約が1回追加（task 3 + summarize 1）。
+    return out.startswith("（手数上限") and model.calls == 4 and len(reg.calls) == 3
 
 
 async def t_agent_timeout():
@@ -178,7 +179,7 @@ async def t_agent_timeout():
     reg = FakeReg({"self_status": "ok"})
     agent = TaskAgent(registry=reg, model_registry=model, store=CancelStore(), timeout_sec=10.0, now_fn=now)
     out = await agent.run("遅いやつ", "t")
-    return out.startswith("（時間切れ") and model.calls == 1  # step0 で1回実行、step1 で timeout
+    return out.startswith("（時間切れ") and model.calls == 2  # task 1 + 要約 1
 
 
 async def t_agent_cancel_midloop():
@@ -200,6 +201,26 @@ async def t_agent_missing_task_aborts():
     agent = TaskAgent(registry=FakeReg({}), model_registry=model, store=EmptyStore())
     out = await agent.run("g", "t")
     return out is None and model.calls == 0
+
+
+async def t_agent_limit_summary():
+    # 手数上限で離脱時、summarize ロールで「なぜ終わらなかったか」を1文にして「（手数上限: …）」で返す。
+    class RoleModel:
+        def __init__(self):
+            self.calls = []
+
+        async def complete(self, role, messages, **kw):
+            self.calls.append(role)
+            if role == "summarize":
+                return _resp(content="必要な手段が無くて終えられなかった")
+            return _resp(tool_calls=[_tc("c", "self_status")])  # ずっと tool_call＝終わらない
+
+    m = RoleModel()
+    reg = FakeReg({"self_status": "ok"})
+    agent = TaskAgent(registry=reg, model_registry=m, store=CancelStore(), max_steps=2)
+    out = await agent.run("無理なゴール", "t")
+    return (out.startswith("（手数上限") and "必要な手段が無くて" in out
+            and m.calls.count("task") == 2 and m.calls.count("summarize") == 1)
 
 
 # ========== Executor 分岐（実 store/executor + fake agent）==========
@@ -296,6 +317,7 @@ async def main():
     check("Agent: timeout 打ち切り", await t_agent_timeout())
     check("Agent: 実行中キャンセル→None(破棄)", await t_agent_cancel_midloop())
     check("Agent: task 消失→None", await t_agent_missing_task_aborts())
+    check("Agent: 限界で理由を要約(（手数上限: …）)", await t_agent_limit_summary())
     check("Executor: goal→agent→Done+再投入", await t_executor_goal_done_reinject())
     check("Executor: goal が None→取消破棄", await t_executor_goal_cancel_discard())
     check("Executor: agent 無し goal→Failed", await t_executor_goal_no_agent_fails())
