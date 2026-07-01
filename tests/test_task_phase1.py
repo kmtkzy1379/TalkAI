@@ -200,10 +200,10 @@ async def t_cancel_running_and_latest():
     register_task_capabilities(reg, s)
     s.add(Task(task_id="run1", what="self_status", when=None))
     s.claim_due()  # Running
-    r1 = reg.execute("cancel_task", {"task_id": "run1"})  # 実行中も取り消せる
+    r1 = reg.execute("cancel_task", {})  # 直近未終了(run1・実行中)を取り消す（フォールバック経路）
     running_cancelled = s.get("run1").status == CANCELLED
     s.add(Task(task_id="p2", what="self_status", when=_iso(BASE + timedelta(seconds=100))))
-    r2 = reg.execute("cancel_task", {})  # ID 省略 → 直近の未終了(p2)
+    r2 = reg.execute("cancel_task", {})  # 直近の未終了(p2)
     await s.shutdown()
     return running_cancelled and s.get("p2").status == CANCELLED and "取り消した" in r1 and "取り消した" in r2
 

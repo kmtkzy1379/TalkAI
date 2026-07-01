@@ -45,7 +45,7 @@ def _near(a: Optional[datetime], b: Optional[datetime], tol: float = _DEDUP_TOL_
     return abs((a - b).total_seconds()) <= tol
 
 
-def register_task_capabilities(registry: CapabilityRegistry, store) -> None:
+def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resolver=None) -> None:
     def _find_duplicate(goal: str, when: Optional[str]):
         # 同じ goal かつ when が近接の PENDING があれば重複（混乱ターンの再作成を弾く＝RC2）。
         target = _parse_iso(when)
@@ -75,20 +75,17 @@ def register_task_capabilities(registry: CapabilityRegistry, store) -> None:
         return "登録中のタスク:\n" + "\n".join(lines)
 
     def _cancel_task(args: dict) -> str:
-        # ※Part A 暫定（Part B で CancelResolver によるファジー解決へ置換）。id 省略→直近未終了。
-        tid = (args.get("task_id") or "").strip()
-        if not tid:
-            actives = [t for t in store.list_all() if t.status in (PENDING, RUNNING)]
-            if not actives:
-                return "（今は取り消せる予約タスクは無いよ）"
-            t = actives[-1]; tid = t.task_id
-        else:
-            t = store.get(tid)
-            if t is None:
-                return f"（ID「{tid}」のタスクは見つからなかったよ）"
-        if t.status in TERMINAL:
-            return f"（「{_display_name(t)}」は既に {t.status} なので取り消せないよ）"
-        store.set_status(tid, CANCELLED)
+        reference = (args.get("reference") or args.get("task_id") or "").strip()
+        if cancel_resolver is not None:
+            # 本番: タスク側(CancelResolver)がファジー解決＋報告する（非同期）。ここは受付けるだけ。
+            cancel_resolver.submit(reference)
+            return "取消を確認するね。"  # report_result=False で抑制・実結果は resolver が報告
+        # フォールバック(resolver 未接続・主にテスト): 直近未終了を即キャンセル。
+        actives = [t for t in store.list_all() if t.status in (PENDING, RUNNING)]
+        if not actives:
+            return "（今は取り消せる予約タスクは無いよ）"
+        t = actives[-1]
+        store.set_status(t.task_id, CANCELLED)
         return f"予約していた「{_display_name(t)}」を取り消したよ。"
 
     registry.register(Capability(
@@ -112,5 +109,5 @@ def register_task_capabilities(registry: CapabilityRegistry, store) -> None:
         description="タスクの取り消し。『キャンセルして』『やっぱりいい』等と言われたら、ユーザの言い回しを"
                     "reference にそのまま入れて1回呼ぶ（どのタスクかはタスク側が判断する）。",
         params_schema={"reference": {"type": "string", "description": "取り消したいタスクのユーザの言い回し（省略可）"}},
-        handler=_cancel_task, mutates_state=True,
+        handler=_cancel_task, mutates_state=True, report_result=False,  # 実結果は CancelResolver が報告
     ))

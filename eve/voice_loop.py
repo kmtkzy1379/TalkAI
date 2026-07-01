@@ -23,7 +23,7 @@ from .pipeline.stimulus import StimulusKind
 from .pipeline.stimulus_queue import StimulusQueue
 from .capability import CapabilityRegistry
 from .response.function_dispatcher import FunctionDispatcher
-from .task import ReconcileTimer, TaskAgent, TaskExecutor, TaskStore, register_task_capabilities
+from .task import CancelResolver, ReconcileTimer, TaskAgent, TaskExecutor, TaskStore, register_task_capabilities
 from .response.input_source import MicSttInputSource
 from .response.orchestrator import ResponseOrchestrator
 from .response.player import RealAudioPlayer
@@ -99,12 +99,17 @@ class VoiceLoop:
         self.task_store = None
         self.task_executor = None
         self.reconcile_timer = None
+        self.cancel_resolver = None
         if Config.TASK_ENABLED:
             self.task_store = TaskStore(
                 task_file=Config.TASK_FILE, max_tasks=Config.TASK_MAX,
                 orphan_timeout_sec=Config.TASK_ORPHAN_TIMEOUT_SEC,
             )
-            register_task_capabilities(self.capabilities, self.task_store)
+            # 取消はタスク側で解決（別コルーチン・executor と並行）: 応答LLM は reference を渡すだけ。
+            self.cancel_resolver = CancelResolver(
+                store=self.task_store, model_registry=self.registry, queue=self.queue,
+            )
+            register_task_capabilities(self.capabilities, self.task_store, cancel_resolver=self.cancel_resolver)
             # TaskAgent（inc2）: delegate_task の自然文ゴールを賢い task LLM が境界つきループで完遂。
             task_agent = TaskAgent(
                 registry=self.capabilities, model_registry=self.registry, store=self.task_store,
@@ -218,6 +223,8 @@ class VoiceLoop:
             await self.task_store.initialize()
             self.task_executor.start()
             self.reconcile_timer.start()
+            if self.cancel_resolver is not None:
+                self.cancel_resolver.start()  # executor と並列（取消が実行中タスクの後ろで待たない）
             logger.info("タスク管理 稼働（予約タスク）")
         # F6: 画面認識を起動（既定 off）。capture スレッドは loop 確定後に生成し on_frame を橋渡し。
         if Config.VLM_ENABLED:
@@ -259,7 +266,12 @@ class VoiceLoop:
             await self.dispatcher.stop()
         except Exception:
             pass
-        # J-1: タスク管理を停止（timer 停止→executor drain→store flush の順）。
+        # J-1: タスク管理を停止（取消解決 drain→timer 停止→executor drain→store flush の順）。
+        if self.cancel_resolver is not None:
+            try:
+                await self.cancel_resolver.stop()
+            except Exception:
+                pass
         if self.reconcile_timer is not None:
             try:
                 await self.reconcile_timer.stop()
