@@ -274,20 +274,17 @@ async def t_delegate_task_capability():
     t = s.list_all()[-1]
     r_empty = reg.execute("delegate_task", {"goal": "  "})
     cap = reg._caps["delegate_task"]
-    resp = {x["function"]["name"] for x in reg.tool_schemas()}        # 応答LLM 向け（委譲/管理）
+    r_dup = reg.execute("delegate_task", {"goal": "PCとイブの状態を調べてまとめて", "when_seconds": 5})  # dedup
+    resp = {x["function"]["name"] for x in reg.tool_schemas()}        # 応答LLM 向け（委譲/取消だけ）
     agent = {x["function"]["name"] for x in reg.agent_tool_schemas()}  # TaskAgent 向け（実行系）
     await s.shutdown()
     return (
         "引き受けた" in r and t.goal == "PCとイブの状態を調べてまとめて" and t.what == "" and t.when is not None
-        and "ゴールが空" in r_empty
+        and "ゴールが空" in r_empty and "もう予約してる" in r_dup
         and cap.mutates_state is True and cap.report_result is False
-        # 責務分離: 応答LLM は委譲/管理だけ・実行系は見えない。agent は実行系だけ・委譲系は見えない。
-        and resp == {"delegate_task", "create_task", "cancel_task", "list_tasks"}
-        and "self_status" in agent and "pc_status" in agent and "delegate_task" not in agent
-        # delegate_task は予約 action に出ない（_MGMT 除外）= create_task で予約できない
-        and "予約できない" in reg.execute("create_task", {"action": "delegate_task"})
-        # 実行系は create_task で予約できる（agent_tool）
-        and "作成した" in reg.execute("create_task", {"action": "pc_status"})
+        # 責務分離: 応答LLM は delegate/cancel だけ。実行系(list_tasks 含む)は agent 専用。
+        and resp == {"delegate_task", "cancel_task"}
+        and "self_status" in agent and "pc_status" in agent and "list_tasks" in agent and "delegate_task" not in agent
     )
 
 

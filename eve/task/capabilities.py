@@ -1,73 +1,83 @@
-"""タスク管理の能力を CapabilityRegistry へ登録（**応答LLM はこの委譲/管理系だけ**振る）。
+"""タスク管理の能力を CapabilityRegistry へ登録（**応答LLM は委譲/取消の意図を渡すだけ**）。
 
-- `delegate_task(goal, when_seconds?)`: 自然文ゴールを TaskAgent に委譲（inc2）。複数段階/調べ物。
-- `create_task(action, when_seconds?, message?)`: 実行系能力1つの単純予約（「5分後に〜」）。
-- `remind(message)`: 予約時に message をそのまま返す純動作（executor 実行・tool 非提供）。
-- `list_tasks` / `cancel_task(task_id?)`: 一覧 / 取消（Pending も Running も・ID 省略で直近）。
-実行系能力(self_status/pc_status/将来の検索・画面操作)は agent_tool=True で **TaskAgent 専用**。
+- `delegate_task(goal, when_seconds?)`: 自然文ゴールを TaskAgent に委譲。即時も後回しも状態確認も全部これ。
+- `cancel_task(reference?)`: 取消の意図をそのまま渡す（どのタスクかはタスク側が解決。Part B で CancelResolver 化）。
+- `list_tasks`: **agent 専用**(agent_tool)＝「予約教えて」も委譲で答える。
+実行系能力(self_status/pc_status/将来の検索・画面操作)は agent_tool=True で TaskAgent 専用。
 handler は同期・非ブロッキング（store へ即追加 / 状態は store がコード一本化で持つ）。
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 
 from ..capability.registry import Capability, CapabilityRegistry
 from .schema import CANCELLED, PENDING, RUNNING, TERMINAL, Task, new_task_id
 
-# 予約 action から除外するタスク管理能力（自己再帰/無意味を防ぐ）。
-_MGMT = {"create_task", "delegate_task", "list_tasks", "cancel_task"}
+_DEDUP_TOL_SEC = 20.0  # 同一 goal で when がこの秒数以内なら重複予約とみなす
+
+
+def _display_name(t) -> str:
+    """一覧/取消の表示名。goal タスクは what="" なので goal を優先（RC4 空名対策）。"""
+    return t.goal or t.what or "(無題)"
+
+
+def _iso_in(seconds) -> Optional[str]:
+    if isinstance(seconds, (int, float)) and seconds > 0:
+        return (datetime.now(timezone.utc) + timedelta(seconds=float(seconds))).isoformat()
+    return None
+
+
+def _parse_iso(s: Optional[str]) -> Optional[datetime]:
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def _near(a: Optional[datetime], b: Optional[datetime], tol: float = _DEDUP_TOL_SEC) -> bool:
+    if a is None and b is None:
+        return True  # 両方 即時（when None）は同一窓
+    if a is None or b is None:
+        return False
+    return abs((a - b).total_seconds()) <= tol
 
 
 def register_task_capabilities(registry: CapabilityRegistry, store) -> None:
-    def _allowed_actions() -> set:
-        # 予約できる action = 実行系能力(agent_tool=True) + remind（内部）。
-        # 動的＝将来 search/screen-op を実行系として足すと自動で予約可能になる（テストの flaky も同様）。
-        names = {c.name for c in registry._caps.values() if c.agent_tool}
-        names.add("remind")
-        return names
-
-    def _create_task(args: dict) -> str:
-        action = (args.get("action") or "").strip()
-        if action not in _allowed_actions():
-            return f"（予約できない動作「{action}」です。今できるのは {'/'.join(sorted(_allowed_actions()))} だよ）"
-        when = None
-        ws = args.get("when_seconds")
-        if isinstance(ws, (int, float)) and ws > 0:
-            when = (datetime.now(timezone.utc) + timedelta(seconds=float(ws))).isoformat()
-        task_args = {"message": args["message"]} if action == "remind" and args.get("message") else {}
-        task = Task(task_id=new_task_id(), what=action, args=task_args, when=when)
-        store.add(task)
-        eta = f"{int(ws)}秒後" if when else "すぐ"
-        return f"タスクを作成したよ（{action} / {eta} / ID:{task.task_id}）。"
+    def _find_duplicate(goal: str, when: Optional[str]):
+        # 同じ goal かつ when が近接の PENDING があれば重複（混乱ターンの再作成を弾く＝RC2）。
+        target = _parse_iso(when)
+        for t in store.list_all():
+            if t.status == PENDING and (t.goal or "").strip() == goal and _near(_parse_iso(t.when), target):
+                return t
+        return None
 
     def _delegate_task(args: dict) -> str:
-        # 自然文ゴールを TaskAgent（賢いタスク担当）に委譲。what は空＝executor が goal 分岐に回す。
         goal = (args.get("goal") or "").strip()
         if not goal:
             return "（ゴールが空でした）"
-        when = None
-        ws = args.get("when_seconds")
-        if isinstance(ws, (int, float)) and ws > 0:
-            when = (datetime.now(timezone.utc) + timedelta(seconds=float(ws))).isoformat()
+        when = _iso_in(args.get("when_seconds"))
+        dup = _find_duplicate(goal, when)
+        if dup is not None:
+            return f"それはもう予約してるよ（ID:{dup.task_id}）。"
         task = Task(task_id=new_task_id(), what="", goal=goal, when=when)
         store.add(task)
-        eta = f"{int(ws)}秒後" if when else "すぐ"
+        eta = f"{int(args['when_seconds'])}秒後" if when else "すぐ"
         return f"タスクを引き受けたよ（{goal[:24]} / {eta} / ID:{task.task_id}）。"
-
-    def _remind(args: dict) -> str:
-        return args.get("message") or "（リマインド内容が空でした）"
 
     def _list_tasks(args: dict) -> str:
         tasks = store.list_all()
         if not tasks:
             return "今は登録されているタスクは無いよ。"
-        lines = [f"・{t.what}（{t.status}{'・' + t.when if t.when else ''}）ID:{t.task_id}" for t in tasks[-10:]]
+        lines = [f"・{_display_name(t)}（{t.status}{'・' + t.when if t.when else ''}）ID:{t.task_id}" for t in tasks[-10:]]
         return "登録中のタスク:\n" + "\n".join(lines)
 
     def _cancel_task(args: dict) -> str:
+        # ※Part A 暫定（Part B で CancelResolver によるファジー解決へ置換）。id 省略→直近未終了。
         tid = (args.get("task_id") or "").strip()
         if not tid:
-            # ID 省略 → 直近の未終了タスク（待機 or 実行中）を取り消す（「さっきの予約キャンセルして」）。
             actives = [t for t in store.list_all() if t.status in (PENDING, RUNNING)]
             if not actives:
                 return "（今は取り消せる予約タスクは無いよ）"
@@ -77,46 +87,30 @@ def register_task_capabilities(registry: CapabilityRegistry, store) -> None:
             if t is None:
                 return f"（ID「{tid}」のタスクは見つからなかったよ）"
         if t.status in TERMINAL:
-            return f"（「{t.what}」は既に {t.status} なので取り消せないよ）"
-        # Pending/Running とも Cancelled へ（実行中に取り消した場合は executor が結果を破棄する）。
+            return f"（「{_display_name(t)}」は既に {t.status} なので取り消せないよ）"
         store.set_status(tid, CANCELLED)
-        return f"予約していた「{t.what}」を取り消したよ。"
+        return f"予約していた「{_display_name(t)}」を取り消したよ。"
 
     registry.register(Capability(
-        name="create_task",
-        description="後で自動実行する予約タスクを作る。action は実行する能力名（例: self_status / pc_status / remind）。"
-                    "例『5分後に状態を教えて』→ action=self_status, when_seconds=300。",
-        params_schema={
-            "action": {"type": "string", "description": "予約する能力名（提示中の能力か remind）"},
-            "when_seconds": {"type": "integer", "description": "何秒後に実行するか（省略=すぐ）"},
-            "message": {"type": "string", "description": "action が remind の時に伝える内容"},
-        },
-        handler=_create_task, mutates_state=True, report_result=False,  # 成功 ack は応答本文が担う（重複/先出し防止）
-    ))
-    registry.register(Capability(
         name="delegate_task",
-        description="複数段階の作業や調べ物を、賢いタスク担当(TaskAgent)に任せる。goal に自然文で"
-                    "『何を達成したいか』を書く（例: PCとイブの状態を調べてまとめて）。応答中に呼んで"
-                    "『やっとくね』とだけ言えば、達成後に結果が後で届く。イブが自律的に『これは任せよう』"
-                    "と判断して呼んでよい。",
+        description="やりたいこと・調べ物・状態確認・後回しの予約を、賢いタスク担当(TaskAgent)に任せる。"
+                    "goal に自然文で『何を達成/報告したいか』を、**ユーザの言い回しをそのまま**書く"
+                    "（例: 30秒後に今の時刻を教えて / PCとイブの状態を調べてまとめて）。どんな簡単な事も"
+                    "自分でやらずここへ。when_seconds 省略=すぐ、指定=その秒後。呼んだら『やっとくね』とだけ言う。",
         params_schema={
-            "goal": {"type": "string", "description": "達成したいこと（自然文のゴール）"},
+            "goal": {"type": "string", "description": "達成/報告したいこと（自然文・ユーザの言い回しを保つ）"},
             "when_seconds": {"type": "integer", "description": "何秒後に始めるか（省略=すぐ）"},
         },
         handler=_delegate_task, mutates_state=True, report_result=False,  # ack は応答本文が担う
     ))
     registry.register(Capability(
-        name="remind", description="（内部）予約された内容を伝える。", params_schema={},
-        handler=_remind, mutates_state=False, offered=False,
-    ))
-    registry.register(Capability(
-        name="list_tasks", description="登録中の予約タスク一覧を見る。", params_schema={},
-        handler=_list_tasks,
+        name="list_tasks", description="登録中の予約タスク一覧を見る。引数なし。", params_schema={},
+        handler=_list_tasks, offered=False, agent_tool=True,  # agent 専用（「予約教えて」も委譲で答える）
     ))
     registry.register(Capability(
         name="cancel_task",
-        description="予約・実行中のタスクを取り消す。**task_id は省略可**＝直近の予約を取り消す。"
-                    "『キャンセルして』『やっぱりいい』等と言われたら、list_tasks で確認せず**直接これを1回呼ぶ**。",
-        params_schema={"task_id": {"type": "string", "description": "取り消すタスクID（省略すると直近の予約）"}},
+        description="タスクの取り消し。『キャンセルして』『やっぱりいい』等と言われたら、ユーザの言い回しを"
+                    "reference にそのまま入れて1回呼ぶ（どのタスクかはタスク側が判断する）。",
+        params_schema={"reference": {"type": "string", "description": "取り消したいタスクのユーザの言い回し（省略可）"}},
         handler=_cancel_task, mutates_state=True,
     ))

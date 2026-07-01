@@ -231,24 +231,26 @@ async def t_capabilities():
     await s.initialize()
     reg = CapabilityRegistry()
     register_task_capabilities(reg, s)
-    r_create = reg.execute("create_task", {"action": "self_status", "when_seconds": 300})
-    r_bad = reg.execute("create_task", {"action": "fly_to_moon"})  # 未対応 action → 予約不可
+    r_del = reg.execute("delegate_task", {"goal": "30秒後に時刻を教えて", "when_seconds": 30})
+    r_dup = reg.execute("delegate_task", {"goal": "30秒後に時刻を教えて", "when_seconds": 30})  # 同一→dedup で弾く
+    r_empty = reg.execute("delegate_task", {"goal": "  "})
     tid = s.list_all()[0].task_id
-    r_remind = reg.execute("remind", {"message": "休憩しよう"})
+    t = s.get(tid)
     r_cancel = reg.execute("cancel_task", {"task_id": tid})
     cancelled = s.get(tid).status == CANCELLED
-    r_cancel2 = reg.execute("cancel_task", {"task_id": tid})  # 既に terminal → 取消不可
-    schemas = {x["function"]["name"] for x in reg.tool_schemas()}
-    create_cap = reg._caps["create_task"]
-    remind_cap = reg._caps["remind"]
+    offered = {x["function"]["name"] for x in reg.tool_schemas()}
+    agent = {x["function"]["name"] for x in reg.agent_tool_schemas()}
+    del_cap = reg._caps["delegate_task"]
     await s.shutdown()
     return (
-        "作成" in r_create and len(s) == 1  # 有効 action のみ登録（fly_to_moon は弾かれた）
-        and "予約できない" in r_bad
-        and r_remind == "休憩しよう"
-        and cancelled and "取り消せない" in r_cancel2
-        and create_cap.mutates_state is True and create_cap.report_result is False and remind_cap.offered is False
-        and "create_task" in schemas and "remind" not in schemas  # 内部能力は tool 非提供
+        "引き受けた" in r_del and len(s) == 1  # dup は作られない
+        and "もう予約してる" in r_dup and "ゴールが空" in r_empty
+        and t.what == "" and t.goal == "30秒後に時刻を教えて"  # goal タスク
+        and cancelled and "取り消した" in r_cancel and t.goal in r_cancel  # 空名でなく goal 名で報告(RC4)
+        and del_cap.mutates_state is True and del_cap.report_result is False
+        and offered == {"delegate_task", "cancel_task"}  # 応答LLM は委譲/取消だけ
+        and "list_tasks" in agent and "self_status" in agent  # 実行系は agent 専用
+        and "create_task" not in offered and "remind" not in offered and "list_tasks" not in offered
     )
 
 
