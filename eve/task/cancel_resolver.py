@@ -110,6 +110,8 @@ class CancelResolver:
 
     async def _handle_one(self, req: CancelRequest) -> None:
         actives = self._actives()
+        # 観測性: 取消要求の入口を必ず1行残す（2026-07-13 実機事故はここの判断が無ログで追跡困難だった）。
+        logger.info("🚫 取消要求 ref=%.60r actives=%d", req.reference, len(actives))
         if not actives:
             ref = req.reference.strip()
             msg = f"「{ref}」ってタスクは入ってないよ。今は止められる予約も無いよ。" if ref else "今は止められるタスクは無いよ。"
@@ -134,6 +136,7 @@ class CancelResolver:
             await self._report(req, "ごめん、どのタスクか確認できなかったよ。", ok=False)
             return
         decision, task_id, message = self._parse(resp)
+        logger.info("🚫 取消解決(LLM): decision=%s task_id=%s", decision or "(空)", task_id or "(空)")
         if decision == "match" and task_id:
             await self._cancel_and_report(req, task_id, llm_message=message)
         else:
@@ -151,6 +154,7 @@ class CancelResolver:
         if not advanced:
             await self._report(req, f"「{name}」はもう終わってたよ。", ok=False)
             return
+        logger.info("🚫 タスク取消: %s 「%.40s」(ref=%.40r)", task_id, name, req.reference)
         await self._report(req, llm_message or f"「{name}」を止めたよ。", ok=True)
 
     async def _report(self, req: CancelRequest, message: str, *, ok: bool) -> None:

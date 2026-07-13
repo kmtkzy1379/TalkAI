@@ -98,6 +98,13 @@ class FunctionDispatcher:
         content = self._registry.execute(name, args)
         is_failure = content.startswith("（")  # registry の失敗/未対応マーカ
         ok = self._registry.has(name) and not is_failure
+        # 観測性: どの tool が何の引数で呼ばれ何を返したかを1行で残す（2026-07-13 実機事故の
+        # 追跡が tasks.jsonl の復元頼みだった反省。全文は出さない＝%.60s 切り詰め慣行）。
+        try:
+            args_str = json.dumps(args, ensure_ascii=False)
+        except (TypeError, ValueError):
+            args_str = str(args)
+        logger.info("⚙ %s(%.80s) -> %.60s", name or "(unknown)", args_str, content)
         # report_result=False の能力（create_task 等）は**成功時は再投入しない**（応答ターンの本文が
         # 既に「予約したよ」等と確認済＝ack 重複＋状態先出しハルシネの防止）。失敗は必ず報告する。
         if not self._registry.report_result(name) and not is_failure:
