@@ -64,6 +64,18 @@ try:
     check("VLM 既定 off では capture スレッド未生成(構築は可)", vl.capture_thread is None)
     # play_fn が should_stop を取れる＝文途中 barge-in(B3) の配線が生きている
     check("audio が mid-sentence stop 対応 play_fn を保持", vl.audio._play_takes_stop is True)
+    # J-1/Fix#2: 予約タスク状態注入の配線（TASK_ENABLED に連動）
+    from eve.config import Config as _Cfg  # noqa: E402
+    check("tasks_provider の配線が TASK_ENABLED に連動",
+          (vl.orchestrator._tasks_provider is not None) == bool(_Cfg.TASK_ENABLED))
+    _prev_task_enabled = _Cfg.TASK_ENABLED
+    _Cfg.TASK_ENABLED = True
+    try:
+        vl2 = VoiceLoop()
+        check("TASK_ENABLED=True で tasks_provider 配線(空 store→[])",
+              vl2.orchestrator._tasks_provider is not None and vl2.orchestrator._tasks_provider() == [])
+    finally:
+        _Cfg.TASK_ENABLED = _prev_task_enabled
 except Exception as e:  # 構築自体が落ちたら配線ドリフト＝即失敗
     check(f"VoiceLoop 構築で例外: {e!r}", False)
 

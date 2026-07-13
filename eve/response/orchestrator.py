@@ -48,6 +48,7 @@ class ResponseOrchestrator:
         on_response_complete: Optional[Callable[[], None]] = None,
         vision_state=None,  # F6 任意: 直近の画面ナレーション源（latest_vision を文脈へ注入）
         dispatcher=None,  # J 任意: FunctionDispatcher（tool_calls を応答完了後に submit）
+        tasks_provider: Optional[Callable[[], list[str]]] = None,  # J-1 任意: 予約タスク一覧（整形済み行）
     ) -> None:
         self._audio = audio
         self._stream_fn = stream_fn
@@ -66,6 +67,10 @@ class ResponseOrchestrator:
         self._vision_state = vision_state
         # 任意注入(J): Call-Function の実行サイドカー。tool_calls を応答完了後に submit（非ブロッキング）。
         self._dispatcher = dispatcher
+        # 任意注入(J-1/Fix#2): 予約タスクの現在状態（整形済み行）。**全刺激種別**で system に注入する
+        # （USER=完了済み変更の再実行防止 / CALLFUNCTION_RESULT=結果と矛盾する約束の防止 /
+        # AUTONOMOUS=存在しないタスクの再約束防止。2026-07-13 実機事故の根本原因対応）。
+        self._tasks_provider = tasks_provider
         self.last_response = ""  # 生成済み全文（自然さの目視・テスト用。記憶には使わない＝C5）
 
     def _tools_enabled_for(self, stimulus: Stimulus) -> bool:
@@ -104,6 +109,13 @@ class ResponseOrchestrator:
             callfunction_result = payload.content
         else:
             user_text = str(payload)
+        # Fix#2: 予約タスクの現在状態（ターン開始時の同期スナップショット・loop 単一所有なので安全）。
+        active_tasks = None
+        if self._tasks_provider is not None:
+            try:
+                active_tasks = self._tasks_provider()
+            except Exception:
+                logger.exception("予約タスク一覧の取得に失敗（注入なしで継続）")
         # native ロール messages（system + user/assistant ターン列 + 最終 user発話/自発指示）。
         return self._ctx.assemble(
             user_text=user_text,
@@ -115,6 +127,7 @@ class ResponseOrchestrator:
             speech_decision_reason=speech_reason,
             callfunction_result=callfunction_result,
             tools_active=self._tools_enabled_for(stimulus),
+            active_tasks=active_tasks,
         )
 
     def _notify_complete(self) -> None:

@@ -14,12 +14,12 @@ from .schema import (
 from .store import TaskStore
 from .executor import TaskExecutor
 from .scheduler import ReconcileTimer
-from .capabilities import register_task_capabilities
+from .capabilities import active_tasks_for_context, register_task_capabilities
 from .agent import TaskAgent
 from .cancel_resolver import CancelResolver, CancelRequest
 
 __all__ = [
     "Task", "TaskStore", "TaskExecutor", "ReconcileTimer", "register_task_capabilities",
-    "TaskAgent", "CancelResolver", "CancelRequest",
+    "active_tasks_for_context", "TaskAgent", "CancelResolver", "CancelRequest",
     "new_task_id", "PENDING", "RUNNING", "DONE", "FAILED", "CANCELLED", "TERMINAL",
 ]

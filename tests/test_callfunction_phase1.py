@@ -394,6 +394,71 @@ async def main() -> None:
     check("Orch: tool のみ(無発話)でも無クラッシュ・submit", await t_orch_toolonly_no_content())
     check("Orch: 結果は content で RAG 検索(repr 不使用)", await t_orch_result_rag_uses_content())
     check("Orch: dispatcher=None で従来挙動(旧シグネチャ)", await t_orch_no_dispatcher_unchanged())
+    check("Fix#2: 予約タスク一覧を全刺激種別の system に注入", await t_orch_tasks_injected_all_kinds())
+    check("Fix#2: ゼロ件明示 / provider 未配線はブロック無し", await t_orch_tasks_zero_and_default())
+    check("Fix#2: provider 例外でも注入なしで応答継続", await t_orch_tasks_provider_error_resilient())
+
+
+async def t_orch_tasks_injected_all_kinds() -> bool:
+    # Fix#2: 予約タスク一覧は**全刺激種別**の system に入る（USER=再実行防止 /
+    # CALLFUNCTION_RESULT=矛盾約束防止 / AUTONOMOUS=空約束防止）。
+    from eve.speech.decider import AutonomousSpeech
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    seen_sys: list = []
+
+    async def stream_fn(messages, *, tools=None, tool_sink=None):
+        seen_sys.append(messages[0]["content"])
+        yield "はい。"
+
+    orch = ResponseOrchestrator(audio, stream_fn, _tts,
+                                tasks_provider=lambda: ["・「50秒後に気持ち」（あと約30秒で実行）"])
+    w = asyncio.create_task(audio.play_worker())
+    await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "やあ"))
+    await orch.handle(Stimulus(StimulusKind.CALLFUNCTION_RESULT, CallFunctionResult("goal", "済んだよ", True)))
+    await orch.handle(Stimulus(StimulusKind.AUTONOMOUS_SPEECH, AutonomousSpeech(content="一言", reason="沈黙")))
+    w.cancel()
+    return (len(seen_sys) == 3
+            and all("# 予約タスク" in s and "50秒後に気持ち" in s for s in seen_sys))
+
+
+async def t_orch_tasks_zero_and_default() -> bool:
+    # Fix#2: ゼロ件は「（予約タスクは無い）」を明示（矛盾発話はゼロ件を知らないのが原因）。
+    # provider 未配線（None）ならブロック自体を出さない（既定挙動不変）。
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    seen: dict = {}
+
+    async def stream_fn(messages, *, tools=None, tool_sink=None):
+        seen["sys"] = messages[0]["content"]
+        yield "はい。"
+
+    w = asyncio.create_task(audio.play_worker())
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, tasks_provider=lambda: [])
+    await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "やあ"))
+    zero_ok = "# 予約タスク" in seen["sys"] and "（予約タスクは無い）" in seen["sys"]
+    orch2 = ResponseOrchestrator(audio, stream_fn, _tts)  # provider なし
+    await orch2.handle(Stimulus(StimulusKind.USER_UTTERANCE, "やあ"))
+    none_ok = "# 予約タスク" not in seen["sys"]
+    w.cancel()
+    return zero_ok and none_ok
+
+
+async def t_orch_tasks_provider_error_resilient() -> bool:
+    # Fix#2: provider 例外は注入なしで応答継続（A3 流儀・落とさない）。
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    seen: dict = {}
+
+    def boom() -> list:
+        raise RuntimeError("store down")
+
+    async def stream_fn(messages, *, tools=None, tool_sink=None):
+        seen["sys"] = messages[0]["content"]
+        yield "はい。"
+
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, tasks_provider=boom)
+    w = asyncio.create_task(audio.play_worker())
+    await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "やあ"))
+    w.cancel()
+    return orch.last_response == "はい。" and "# 予約タスク" not in seen["sys"]
 
 
 asyncio.run(main())

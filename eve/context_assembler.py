@@ -55,7 +55,7 @@ class ContextAssembler:
         self.system_prompt = system_prompt
 
     def _build_system(self, *, rag_chunks, last_feedback, vision, speech_decision_reason, now,
-                      callfunction_result=None, tools_active=False) -> str:
+                      callfunction_result=None, tools_active=False, active_tasks=None) -> str:
         parts: list[str] = []
         if self.system_prompt:
             parts.append(self.system_prompt)
@@ -80,6 +80,17 @@ class ContextAssembler:
             # 再投入された機能実行結果（ユーザ発話ではない＝user 枠に入れない）。会話が無くても
             # この結果を必ず一言で報告させる（予約タスクが沈黙中に完了した時の挨拶化を防ぐ）。
             parts.append(f"# 機能実行結果（この結果をユーザに一言で報告して）\n{callfunction_result}")
+        if active_tasks is not None:
+            # Fix#2（2026-07-13 実機事故対応）: 予約タスクの現在状態を毎ターン注入。
+            # None=タスク機能未配線（ブロック自体を出さない）/ []=ゼロ件を明示（「止めたよ」の
+            # 直後に「伝えるね」と約束する矛盾発話は、ゼロ件だと知らないことが原因だった）。
+            body = "\n".join(active_tasks) if active_tasks else "（予約タスクは無い）"
+            parts.append(
+                "# 予約タスク（現在の状態・この一覧だけが正）\n" + body + "\n"
+                "この一覧に無い予約は存在しない（完了・取消済みを含む）。直近の会話と食い違うときは"
+                "一覧を信じ、既に済んだ登録・変更・取消をもう一度実行しない。一覧に無いタスクの実行を"
+                "約束しない。一覧は状況把握用で、そのまま読み上げない。"
+            )
         if tools_active:
             parts.append(
                 "# 機能（Call-Function）の使い方\n"
@@ -126,6 +137,7 @@ class ContextAssembler:
         speech_decision_reason: str | None = None,
         callfunction_result: str | None = None,
         tools_active: bool = False,
+        active_tasks: list[str] | None = None,
         now: Stamp | None = None,
     ) -> list[dict]:
         now = now or Stamp.now()
@@ -136,6 +148,7 @@ class ContextAssembler:
                     rag_chunks=rag_chunks, last_feedback=last_feedback, vision=vision,
                     speech_decision_reason=speech_decision_reason, now=now,
                     callfunction_result=callfunction_result, tools_active=tools_active,
+                    active_tasks=active_tasks,
                 ),
             }
         ]

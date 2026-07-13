@@ -22,11 +22,13 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logging.disable(logging.CRITICAL)
 
 from eve.capability import CapabilityRegistry  # noqa: E402
+from eve.clock import humanize_eta  # noqa: E402
 from eve.pipeline.stimulus import StimulusKind  # noqa: E402
 from eve.pipeline.stimulus_queue import StimulusQueue  # noqa: E402
 from eve.task import (  # noqa: E402
     CANCELLED, DONE, FAILED, PENDING, RUNNING,
-    ReconcileTimer, Task, TaskExecutor, TaskStore, register_task_capabilities,
+    ReconcileTimer, Task, TaskExecutor, TaskStore,
+    active_tasks_for_context, register_task_capabilities,
 )
 
 _passed = 0
@@ -254,6 +256,42 @@ async def t_capabilities():
     )
 
 
+async def t_active_tasks_context():
+    # Fix#2: 応答LLM 注入用の一覧。Pending/Running のみ・丸め残り時間・task_id を出さない（leak ガード）。
+    s = TaskStore(task_file=_tmp(), now_fn=lambda: BASE)
+    await s.initialize()
+    s.add(Task(task_id="p1", what="", goal="50秒後に気持ちを教えて", when=_iso(BASE + timedelta(seconds=35))))
+    s.add(Task(task_id="p0", what="", goal="すぐのやつ", when=None))
+    s.add(Task(task_id="r1", what="", goal="PCの状態を調べて", when=None))
+    s.set_status("r1", RUNNING)
+    s.add(Task(task_id="d1", what="", goal="終わったやつ", when=None))
+    s.set_status("d1", DONE, result="x")
+    lines = active_tasks_for_context(s, now=BASE)
+    joined = "\n".join(lines)
+    ok = (len(lines) == 3
+          and "「50秒後に気持ちを教えて」（あと約30秒で実行）" in joined
+          and "「すぐのやつ」（まもなく実行）" in joined
+          and "「PCの状態を調べて」（実行中）" in joined
+          and "終わったやつ" not in joined  # terminal は出さない
+          and "p1" not in joined and "r1" not in joined and "d1" not in joined)  # ID leak ガード
+    await s.shutdown()
+    return ok
+
+
+async def t_active_tasks_limit_and_eta():
+    s = TaskStore(task_file=_tmp(), now_fn=lambda: BASE)
+    await s.initialize()
+    for i in range(7):
+        s.add(Task(task_id=f"t{i}", what="", goal=f"ゴール{i}", when=_iso(BASE + timedelta(seconds=100 + i))))
+    lines = active_tasks_for_context(s, now=BASE)
+    ok_limit = len(lines) == 6 and lines[-1] == "・ほか2件"
+    ok_eta = (humanize_eta(5) == "まもなく" and humanize_eta(35) == "あと約30秒"
+              and humanize_eta(59) == "あと約50秒" and humanize_eta(60) == "あと約1分"
+              and humanize_eta(3599) == "あと約59分" and humanize_eta(3600) == "あと約1時間")
+    await s.shutdown()
+    return ok_limit and ok_eta
+
+
 async def main():
     check("Store: 往復+terminal-stays-terminal", await t_store_roundtrip_terminal())
     check("Store: due_now(when≤now のみ)", await t_store_due_now())
@@ -265,6 +303,8 @@ async def main():
     check("cancel: Running も / ID省略で直近", await t_cancel_running_and_latest())
     check("Scheduler: when 到来で trigger・busy ガード", await t_scheduler_triggers_when_due())
     check("capabilities: create/cancel/remind/markers", await t_capabilities())
+    check("Fix#2: active_tasks_for_context(状態/ETA/ID leak なし)", await t_active_tasks_context())
+    check("Fix#2: 一覧上限+humanize_eta 丸め境界", await t_active_tasks_limit_and_eta())
 
 
 asyncio.run(main())

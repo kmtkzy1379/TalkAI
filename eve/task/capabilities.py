@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from ..capability.registry import Capability, CapabilityRegistry
+from ..clock import humanize_eta
 from .schema import CANCELLED, PENDING, RUNNING, TERMINAL, Task, new_task_id
 
 _DEDUP_TOL_SEC = 20.0  # 同一 goal で when がこの秒数以内なら重複予約とみなす
@@ -43,6 +44,29 @@ def _near(a: Optional[datetime], b: Optional[datetime], tol: float = _DEDUP_TOL_
     if a is None or b is None:
         return False
     return abs((a - b).total_seconds()) <= tol
+
+
+def active_tasks_for_context(store, *, now: Optional[datetime] = None, limit: int = 5) -> list[str]:
+    """応答LLM の system 注入用の予約タスク行（Fix#2・2026-07-13 実機事故対応）。
+
+    Pending/Running のみ・**task_id は出さない**（読み上げ leak の唯一の確実な防御は
+    そもそも渡さないこと。cancel は reference 自然文で解決するので ID 不要）。
+    残り時間は丸め表現（復唱されても自然）。ゼロ件は呼び出し側が「（予約タスクは無い）」を出す。
+    """
+    now = now or datetime.now(timezone.utc)
+    act = [t for t in store.list_all() if t.status in (PENDING, RUNNING)]
+    act.sort(key=lambda t: t.when or "")  # when は UTC ISO 固定形式（_iso_in 産）＝辞書順で時刻順
+    lines: list[str] = []
+    for t in act[:limit]:
+        if t.status == RUNNING:
+            eta = "実行中"
+        else:
+            w = _parse_iso(t.when)
+            eta = "まもなく実行" if w is None else humanize_eta((w - now).total_seconds()) + "で実行"
+        lines.append(f"・「{_display_name(t)}」（{eta}）")
+    if len(act) > limit:
+        lines.append(f"・ほか{len(act) - limit}件")
+    return lines
 
 
 def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resolver=None) -> None:

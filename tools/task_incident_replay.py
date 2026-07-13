@@ -51,7 +51,8 @@ from eve.response.tts import VoicevoxTTS  # noqa: E402
 from eve.stt import make_stt  # noqa: E402
 from eve.task import (  # noqa: E402
     CANCELLED, DONE, FAILED, PENDING, RUNNING,
-    CancelResolver, ReconcileTimer, TaskAgent, TaskExecutor, TaskStore, register_task_capabilities,
+    CancelResolver, ReconcileTimer, TaskAgent, TaskExecutor, TaskStore,
+    active_tasks_for_context, register_task_capabilities,
 )
 
 T0 = time.monotonic()
@@ -154,7 +155,8 @@ class World:
 
         orch = ResponseOrchestrator(self.audio, stream_fn, self.tts.generate,
                                     ContextAssembler(system_prompt=SPEECH_STYLE),
-                                    conversation_cache=self.cache, dispatcher=self.dispatcher)
+                                    conversation_cache=self.cache, dispatcher=self.dispatcher,
+                                    tasks_provider=lambda: active_tasks_for_context(self.store))
         _handle = orch.handle
         world = self
 

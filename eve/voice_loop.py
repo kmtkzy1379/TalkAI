@@ -23,7 +23,10 @@ from .pipeline.stimulus import StimulusKind
 from .pipeline.stimulus_queue import StimulusQueue
 from .capability import CapabilityRegistry
 from .response.function_dispatcher import FunctionDispatcher
-from .task import CancelResolver, ReconcileTimer, TaskAgent, TaskExecutor, TaskStore, register_task_capabilities
+from .task import (
+    CancelResolver, ReconcileTimer, TaskAgent, TaskExecutor, TaskStore,
+    active_tasks_for_context, register_task_capabilities,
+)
 from .response.input_source import MicSttInputSource
 from .response.orchestrator import ResponseOrchestrator
 from .response.player import RealAudioPlayer
@@ -100,6 +103,7 @@ class VoiceLoop:
         self.task_executor = None
         self.reconcile_timer = None
         self.cancel_resolver = None
+        tasks_provider = None  # Fix#2: TASK_ENABLED 時のみ配線（None ならブロック自体を注入しない）
         if Config.TASK_ENABLED:
             self.task_store = TaskStore(
                 task_file=Config.TASK_FILE, max_tasks=Config.TASK_MAX,
@@ -121,6 +125,10 @@ class VoiceLoop:
             self.reconcile_timer = ReconcileTimer(
                 store=self.task_store, executor=self.task_executor, tick_sec=Config.TASK_RECONCILE_TICK_SEC,
             )
+            # Fix#2: 予約タスクの現在状態を応答LLM の system に毎ターン注入（完了済み変更の
+            # 再実行・状態と矛盾する約束の防止＝2026-07-13 実機事故の根本原因対応）。
+            store = self.task_store
+            tasks_provider = lambda: active_tasks_for_context(store)  # noqa: E731
 
         async def stream_fn(messages, *, tools=None, tool_sink=None):
             if tools:
@@ -143,6 +151,7 @@ class VoiceLoop:
             on_response_complete=self._on_response_complete,  # 正常完了で feedback + 沈黙時計リセット
             vision_state=self.vision_state,  # F6: 応答文脈に直近画面を注入
             dispatcher=self.dispatcher,  # J: tool_calls を応答完了後に submit（gate は CALLFUNCTION_ENABLED）
+            tasks_provider=tasks_provider,  # J-1/Fix#2: 予約タスク状態の毎ターン注入（TASK_ENABLED 時のみ）
         )
         self.runner = PipelineRunner(self.queue, self.orchestrator, self.audio)
         # 沈黙監視は応答中(runner busy)/ユーザ発話中は発火しない（is_busy をガードに使う）。

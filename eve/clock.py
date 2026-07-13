@@ -75,3 +75,18 @@ def humanize(delta_seconds: float) -> str:
     if d < 86400:
         return f"{int(d // 3600)}時間前"
     return f"{int(d // 86400)}日前"
+
+
+def humanize_eta(seconds: float) -> str:
+    """残り秒を「あと約30秒」等の丸め表現に（`humanize` の未来方向・予約タスクの文脈接地用）。
+
+    秒精度を出さない（10秒単位に丸める）＝応答LLMが復唱しても機械的にならない。
+    """
+    s = max(0.0, seconds)
+    if s <= 10:
+        return "まもなく"
+    if s < 60:
+        return f"あと約{int(s // 10) * 10}秒"
+    if s < 3600:
+        return f"あと約{int(s // 60)}分"
+    return f"あと約{int(s // 3600)}時間"
