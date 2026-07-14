@@ -33,6 +33,13 @@ logger = logging.getLogger(__name__)
 StreamFn = Callable[[list[dict]], AsyncIterator[str]]  # messages -> 文字列デルタの async iter
 TtsFn = Callable[[str], Awaitable[Optional[bytes]]]  # 文 -> 音声バイト(or None)
 
+# 再配達（2026-07-13 21:20 実機事故対応）: barge-in で潰れたタスク報告の救済条件。
+# 実発話（C5: 再生開始した文は途中停止でも「聞かれた扱い」）がこの文字数以下なら
+# 「実質何も伝わっていない」とみなし再配達する。超えていれば配達済み扱い（二重発話防止）。
+REDELIVER_MAX_SPOKEN_CHARS = 5
+# 再配達の上限回数（マイクノイズ等で barge-in が連発しても無限に再試行しない）。
+REDELIVER_MAX_ATTEMPTS = 2
+
 
 class ResponseOrchestrator:
     def __init__(
@@ -49,6 +56,7 @@ class ResponseOrchestrator:
         vision_state=None,  # F6 任意: 直近の画面ナレーション源（latest_vision を文脈へ注入）
         dispatcher=None,  # J 任意: FunctionDispatcher（tool_calls を応答完了後に submit）
         tasks_provider: Optional[Callable[[], list[str]]] = None,  # J-1 任意: 予約タスク一覧（整形済み行）
+        redeliver_fn: Optional[Callable[[Stimulus], None]] = None,  # 任意: 潰れた報告の再投入（同期・非ブロッキング）
     ) -> None:
         self._audio = audio
         self._stream_fn = stream_fn
@@ -71,6 +79,9 @@ class ResponseOrchestrator:
         # （USER=完了済み変更の再実行防止 / CALLFUNCTION_RESULT=結果と矛盾する約束の防止 /
         # AUTONOMOUS=存在しないタスクの再約束防止。2026-07-13 実機事故の根本原因対応）。
         self._tasks_provider = tasks_provider
+        # 任意注入: barge-in で発話前に潰れた CALLFUNCTION_RESULT を再投入するコールバック。
+        # 「いつ再投入するか」（ユーザ発話が先に並ぶ保証）は提供側（VoiceLoop）が所有する。
+        self._redeliver_fn = redeliver_fn
         self.last_response = ""  # 生成済み全文（自然さの目視・テスト用。記憶には使わない＝C5）
 
     def _tools_enabled_for(self, stimulus: Stimulus) -> bool:
@@ -107,6 +118,14 @@ class ResponseOrchestrator:
         elif stimulus.kind == StimulusKind.CALLFUNCTION_RESULT and isinstance(payload, CallFunctionResult):
             # 機能実行結果はユーザ発話ではない＝user 枠でなく「# 機能実行結果」ブロックへ（誤話者防止）。
             callfunction_result = payload.content
+            if payload.attempts > 0:
+                # 再配達: 「遮られた再報告」であることを認識させる（さっき言いかけた、等の自然な言い直し。
+                # 既に伝えた前提の話し方や、同じ内容の二重報告を防ぐ）。
+                callfunction_result = (
+                    "（この報告は直前に読み上げが遮られて、まだユーザに伝わっていない。"
+                    "今の会話の流れに合わせて、改めて一度だけ自然に伝える。既に伝えた前提では話さない）\n"
+                    + payload.content
+                )
         else:
             user_text = str(payload)
         # Fix#2: 予約タスクの現在状態（ターン開始時の同期スナップショット・loop 単一所有なので安全）。
@@ -139,6 +158,57 @@ class ResponseOrchestrator:
         except Exception:
             logger.exception("feedback トリガで例外（無視して継続）")
 
+    def _maybe_redeliver(self, stimulus: Stimulus, gen: int, spoken: list[str], parts: list[str]) -> None:
+        """barge-in で発話前に潰れた機能実行報告の再配達判定（2026-07-13 21:20 実機事故対応）。
+
+        事故: 報告ターンが最初の一文を出す前に barge-in で中断され、queue から取り出し済みの
+        刺激は戻されず報告が無音消失した（タスクは Done・結果生成済みだった）。
+        対象は CALLFUNCTION_RESULT 全般（予約タスク/即時能力/取消報告）。
+
+        「配達済みか」の**最終判定は put 直前に再投入側が行う**（delivered クロージャ）:
+        cancel の伝播は即時だが on_played（C5: 再生開始した文は途中停止でも「聞かれた扱い」）は
+        数十ms 遅れて発火するため、この時点の spoken は未確定。再投入は最短でも2秒後なので
+        その時点では確定している。delivered は False→True にしか変化しない（spoken は増える一方・
+        parts は cancel 時点で確定）ため、ここでの早期 return は安全側のみ。
+        """
+        if self._redeliver_fn is None or stimulus.kind != StimulusKind.CALLFUNCTION_RESULT:
+            return
+        payload = stimulus.payload
+        if not isinstance(payload, CallFunctionResult):
+            return
+        if self._audio.current_generation() == gen:
+            return  # 中断されていない＝通常配達済み
+        if payload.attempts >= REDELIVER_MAX_ATTEMPTS:
+            logger.warning("⚠ 機能報告の再配達を断念（%d回中断）: %.40s", payload.attempts + 1, payload.content)
+            return
+
+        def delivered() -> bool:
+            """実質伝わったか（True なら再配達しない＝同じ報告を2回言わない）。
+
+            parts は「stream 完走時のみ全文」が渡される契約（途中 break/cancel では空）。
+            よって parts 一致は「≤5文字の短い報告を最後まで再生し切った」場合だけ成立する。
+            """
+            s = "".join(spoken)
+            if len(s) > REDELIVER_MAX_SPOKEN_CHARS:
+                return True  # 聞かれた扱いの文がある（C5 準拠＝会話記憶とも整合）
+            if parts and s == "".join(parts):
+                return True  # 全文（完走保証つき）を再生済み＝完全配達
+            return False
+
+        if delivered():
+            return
+        retry = Stimulus(
+            kind=StimulusKind.CALLFUNCTION_RESULT,
+            payload=CallFunctionResult(payload.function_name, payload.content, payload.ok, payload.attempts + 1),
+            dedup_key=stimulus.dedup_key,  # queue 内 dedup が二重再投入も防ぐ
+        )
+        logger.info("🔁 機能報告を再配達予約（%d回目・判定時発話%d文字）: %.40s",
+                    payload.attempts + 1, len("".join(spoken)), payload.content)
+        try:
+            self._redeliver_fn(retry, delivered)
+        except Exception:
+            logger.exception("再配達の予約に失敗（この報告は断念）")
+
     async def handle(self, stimulus: Stimulus) -> None:
         gen = self._audio.current_generation()
         # 記憶: 現ターンを記録する**前**に直近会話をスナップショット（現発話が二重表示されない）。
@@ -157,6 +227,11 @@ class ResponseOrchestrator:
                     rag_chunks = await self._rag.search(stimulus.payload.content)
                 else:
                     rag_chunks = await self._rag.search(str(stimulus.payload))
+            except asyncio.CancelledError:
+                # 応答開始前（RAG 検索中）の barge-in: まだ一文字も発話していない＝報告は再配達対象。
+                # ここを覆わないと「開始直後の相槌」（実機事故 2026-07-13 21:20 の形）で報告が消える。
+                self._maybe_redeliver(stimulus, gen, [], [])
+                raise
             except Exception:
                 logger.exception("RAG 取得に失敗（記憶なしで継続）")
         messages = self._build_messages(stimulus, recent, rag_chunks)
@@ -171,6 +246,7 @@ class ResponseOrchestrator:
         tasks: list[asyncio.Task] = []
         parts: list[str] = []
         spoken: list[str] = []  # C5: 実際に再生し終えた文だけが入る（生成≠発話）
+        stream_complete = False  # stream が中断されず最後まで生成し切ったか（再配達の完全配達判定に使う）
         eve_recorded = False
 
         def _record_eve() -> None:
@@ -224,6 +300,7 @@ class ResponseOrchestrator:
                     # 正常終了時のみ末尾を flush（barge-in/エラー中断時は出さない）
                     for sentence in splitter.flush():
                         _emit(sentence)
+                    stream_complete = True  # parts が「報告の全文」であることの保証（途中 break では偽）
             except Exception:
                 # A3: LLM/stream の一時エラーは起こりうる → ログして途中までで打ち切り、継続。
                 logger.exception("応答生成中にエラー（途中までで打ち切り）")
@@ -241,10 +318,17 @@ class ResponseOrchestrator:
             # 実行は背景サイドカーで進む。barge-in(CancelledError)経路はここに到達しない＝submit しない。
             if tool_sink and self._dispatcher is not None:
                 self._dispatcher.submit(tool_sink)
+            # 正常経路でも世代変化（audio.interrupt のみ・stream break）で無発話終了があり得る
+            # → 潰れたタスク報告は再配達（CancelledError 経路と同じ判定）。
+            # parts は stream 完走時のみ「全文」として渡す（途中 break の parts と spoken が偶然
+            # 一致しても「短い前置きだけ再生済み＝配達済み」と誤判定しないため）。
+            self._maybe_redeliver(stimulus, gen, spoken, parts if stream_complete else [])
         except asyncio.CancelledError:
             # barge-in: ここまでに**実際に喋った分だけ**を記憶に記録（生成途中の文は残さない）。
             _record_eve()
             for t in tasks:  # 進行中の TTS タスクも片付ける（孤児化防止）
                 if not t.done():
                     t.cancel()
+            # barge-in で発話前に潰れたタスク報告は再配達（同期呼び出しのみ・await しない）。
+            self._maybe_redeliver(stimulus, gen, spoken, parts if stream_complete else [])
             raise

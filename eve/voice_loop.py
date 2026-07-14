@@ -11,6 +11,7 @@ import asyncio
 import logging
 from typing import Optional
 
+from .clock import now_mono
 from .config import Config
 from .context_assembler import ContextAssembler
 from .feedback import FeedbackLLM, FeedbackWorker, PredictionState
@@ -152,6 +153,7 @@ class VoiceLoop:
             vision_state=self.vision_state,  # F6: 応答文脈に直近画面を注入
             dispatcher=self.dispatcher,  # J: tool_calls を応答完了後に submit（gate は CALLFUNCTION_ENABLED）
             tasks_provider=tasks_provider,  # J-1/Fix#2: 予約タスク状態の毎ターン注入（TASK_ENABLED 時のみ）
+            redeliver_fn=self._redeliver_stimulus,  # barge-in で潰れたタスク報告の再配達（WHEN はこちらが所有）
         )
         self.runner = PipelineRunner(self.queue, self.orchestrator, self.audio)
         # 沈黙監視は応答中(runner busy)/ユーザ発話中は発火しない（is_busy をガードに使う）。
@@ -164,6 +166,10 @@ class VoiceLoop:
             on_utterance=self.speech_state.mark_user_utterance,  # 発話終了→沈黙時計リセット
         )
         self._tasks: list[asyncio.Task] = []
+        # 再配達（barge-in で潰れた機能報告）の待機タスク。done で自己除去・stop() で cancel。
+        self._redeliver_waiters: "set[asyncio.Task]" = set()
+        self._redeliver_grace_sec = 2.0  # user_speaking 解除→put までの STT 完了猶予
+        self._redeliver_max_wait_sec = 60.0  # 話し終わり待ちの上限（餓死防止）
 
     def _barge_in(self) -> None:
         """発話開始の瞬間: 音声停止＋進行中応答キャンセル（Eve が即譲る）。"""
@@ -178,6 +184,35 @@ class VoiceLoop:
         """応答 正常完了: F4 feedback を起こす + F5 沈黙時計をリセット（Eve が喋った）。"""
         self.feedback_worker.trigger()
         self.speech_state.mark_eve_activity()
+
+    def _redeliver_stimulus(self, stim, should_abort) -> None:
+        """barge-in で発話前に潰れた機能報告の再投入（WHEN 制御＝2026-07-13 21:20 事故対応）。
+
+        ユーザが話し終わる（user_speaking=False）まで待ち、さらに STT 完了猶予をおいてから
+        queue へ戻す。これでユーザの割り込み発話が先にキューに並び、priority（USER=0 <
+        CALLFUNCTION_RESULT=1）で「ユーザへの応答が先・再報告が後」の順序が構造的に成立する。
+        should_abort = put 直前の最終判定（「結局再生されていた」レースを拾い二重発話を防ぐ。
+        on_played は cancel 伝播より数十ms 遅れて発火し得るため、判定はここまで遅延させる）。
+        同期・非ブロッキング（orchestrator の CancelledError 経路から呼ばれる）。
+        既知の限界: STT が猶予を超えて遅いとユーザ発話刺激より先に並び順序が入れ替わる
+        （両方配達はされる・再報告マーキングで発話は自然に繋がる＝許容）。
+        """
+        async def _wait_and_put() -> None:
+            t0 = now_mono()
+            while self.speech_state.user_speaking and now_mono() - t0 < self._redeliver_max_wait_sec:
+                await asyncio.sleep(0.1)  # 話し終わり待ち（上限＝報告を餓死させない）
+            if self.speech_state.user_speaking:
+                logger.warning("⚠ ユーザ発話が待機上限を超過 — 報告を再投入する（barge で再中断され得る）")
+            await asyncio.sleep(self._redeliver_grace_sec)  # STT 完了猶予＝ユーザ発話刺激が先に並ぶ
+            if should_abort():
+                logger.info("🔁 再配達を中止（再生済みが確定＝二重発話防止）")
+                return
+            await self.queue.put(stim)
+
+        task = asyncio.create_task(_wait_and_put())
+        # done で自己除去（溜め込まない）+ stop() で明示 cancel（シャットダウン時の孤児化防止）。
+        self._redeliver_waiters.add(task)
+        task.add_done_callback(self._redeliver_waiters.discard)
 
     def _vision_can_speak(self) -> bool:
         """F6 画面起因の発話ガード（A5/Q4）: 応答中/ユーザ発話中/判定処理中なら起こさない。"""
@@ -303,6 +338,8 @@ class VoiceLoop:
         except Exception:
             pass
         for t in self._tasks:
+            t.cancel()
+        for t in list(self._redeliver_waiters):  # 再配達待機の孤児化防止（未配達分は消える＝許容）
             t.cancel()
         try:
             await self.cache.shutdown()  # 書き込みキューをドレイン（記録を取りこぼさない）

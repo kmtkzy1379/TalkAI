@@ -397,6 +397,20 @@ async def main() -> None:
     check("Fix#2: 予約タスク一覧を全刺激種別の system に注入", await t_orch_tasks_injected_all_kinds())
     check("Fix#2: ゼロ件明示 / provider 未配線はブロック無し", await t_orch_tasks_zero_and_default())
     check("Fix#2: provider 例外でも注入なしで応答継続", await t_orch_tasks_provider_error_resilient())
+    check("再配達: cancel経路で attempts+1/dedup/内容/ok 伝搬・幻記憶なし", await t_redeliver_on_cancelled_report())
+    check("再配達: stream前(RAG検索中)cancel も救済（事故窓の残り）", await t_redeliver_prestream_rag_cancel())
+    check("再配達: gen-break 正常経路でも救済", await t_redeliver_gen_break())
+    check("再配達: >5文字再生済みは再配達しない", await t_no_redeliver_after_spoken())
+    check("再配達: ≤5文字の前置きのみ再生は再配達する（境界下側）", await t_redeliver_short_preamble())
+    check("再配達: ≤5文字でも全文完走再生済みは再配達しない", await t_tiny_report_complete_no_redeliver())
+    check("再配達: 途中停止文は聞かれた扱い→put直前 abort が反転（レース）", await t_redeliver_abort_after_midstop())
+    check("再配達: USER kind は対象外", await t_no_redeliver_user_kind())
+    check("再配達: 非 CallFunctionResult payload は無反応", await t_no_redeliver_bad_payload())
+    check("再配達: cancel のみ(世代不変)は対象外", await t_no_redeliver_cancel_only())
+    check("再配達: attempts 上限の両側(1→通る/2→断念)", await t_redeliver_attempts_boundary())
+    check("再配達: 再報告プレフィクスは attempts>0 のみ", t_redeliver_prefix_in_messages())
+    check("再配達: redeliver_fn 例外でも本流に漏れない", await t_redeliver_fn_exception_safe())
+    check("再配達: queue で USER が再投入刺激より先に出る", await t_queue_user_priority_over_retry())
 
 
 async def t_orch_tasks_injected_all_kinds() -> bool:
@@ -459,6 +473,375 @@ async def t_orch_tasks_provider_error_resilient() -> bool:
     await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "やあ"))
     w.cancel()
     return orch.last_response == "はい。" and "# 予約タスク" not in seen["sys"]
+
+
+# ========== 再配達（barge-in で潰れた機能報告の救済・2026-07-13 21:20 実機事故対応） ==========
+
+def _rd_payload(attempts=0, ok=True):
+    return CallFunctionResult("goal", "10秒タスクの結果: 今は21時45分だよ", ok, attempts)
+
+
+class FakeCache:
+    """C5 検証用（実 ConversationCache と同じく空 text は無視）。"""
+
+    def __init__(self):
+        self.turns = []
+
+    def recent_for_injection(self):
+        return []
+
+    def add_turn(self, role, text):
+        if text:
+            self.turns.append((role, text))
+
+
+async def t_redeliver_on_cancelled_report() -> bool:
+    # 事故の直接回帰: 発話前に cancel された報告 → attempts=1・同 dedup/内容/ok で再配達予約。
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    captured = []
+
+    def rd(s, a):
+        captured.append((s, a))
+    cache = FakeCache()
+    started = asyncio.Event()
+
+    async def stream_fn(messages):
+        started.set()
+        await asyncio.Event().wait()
+        yield "x。"
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, conversation_cache=cache, redeliver_fn=rd)
+    stim = Stimulus(StimulusKind.CALLFUNCTION_RESULT, _rd_payload(ok=False), dedup_key="task:t1")
+    t = asyncio.create_task(orch.handle(stim))
+    await started.wait()
+    audio.interrupt(); t.cancel()
+    try:
+        await t
+    except asyncio.CancelledError:
+        pass
+    if len(captured) != 1:
+        return False
+    s, abort = captured[0]
+    p = s.payload
+    return (s.kind == StimulusKind.CALLFUNCTION_RESULT and s.dedup_key == "task:t1"
+            and p.attempts == 1 and p.content == stim.payload.content
+            and p.ok is False and p.function_name == "goal"
+            and abort() is False  # 何も再生していない＝配達済みでない
+            and not any(r == "eve" for r, _ in cache.turns))  # C5: 幻の記憶なし
+
+
+async def t_redeliver_prestream_rag_cancel() -> bool:
+    # 事故窓の残り（レッドチーム指摘#1）: stream 開始前（RAG 検索中）の cancel でも再配達される。
+    class HangRag:
+        async def search(self, q):
+            await asyncio.Event().wait()
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    captured = []
+
+    def rd(s, a):
+        captured.append((s, a))
+
+    async def stream_fn(messages):
+        yield "届かない。"
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, rag_store=HangRag(), redeliver_fn=rd)
+    stim = Stimulus(StimulusKind.CALLFUNCTION_RESULT, _rd_payload(), dedup_key="task:t1")
+    t = asyncio.create_task(orch.handle(stim))
+    await asyncio.sleep(0.05)  # RAG 検索で停止中
+    audio.interrupt(); t.cancel()
+    try:
+        await t
+    except asyncio.CancelledError:
+        pass
+    return len(captured) == 1 and captured[0][0].payload.attempts == 1
+
+
+async def t_redeliver_gen_break() -> bool:
+    # cancel でなく世代変化（audio.interrupt のみ・stream break）の正常経路でも再配達される。
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    captured = []
+
+    def rd(s, a):
+        captured.append((s, a))
+
+    async def stream_fn(messages):
+        audio.interrupt()
+        yield "できたよ。"
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, redeliver_fn=rd)
+    await orch.handle(Stimulus(StimulusKind.CALLFUNCTION_RESULT, _rd_payload(), dedup_key="task:t1"))
+    return len(captured) == 1 and captured[0][0].payload.attempts == 1 and captured[0][1]() is False
+
+
+async def t_no_redeliver_after_spoken() -> bool:
+    # >5文字の文を再生済み（聞かれた扱い）→ 再配達しない（同じ報告を2回言わない）。
+    played = asyncio.Event()
+
+    async def play_fn(audio_bytes):
+        played.set()  # on_played は play 直後に await なしで発火 → 再開時 spoken 充填済み
+    audio = AudioPlayQueue(play_fn=play_fn)
+    captured = []
+
+    def rd(s, a):
+        captured.append((s, a))
+
+    async def stream_fn(messages):
+        yield "タスク終わったよ、いまは二十一時。"
+        await played.wait()
+        audio.interrupt()
+        yield "続きの文。"
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, redeliver_fn=rd)
+    w = asyncio.create_task(audio.play_worker())
+    await orch.handle(Stimulus(StimulusKind.CALLFUNCTION_RESULT, _rd_payload(), dedup_key="task:t1"))
+    w.cancel()
+    return captured == []
+
+
+async def t_redeliver_short_preamble() -> bool:
+    # 境界の下側: 短い前置き（「了解。」=3文字 ≤5）しか再生できていない中断 → 残りは未配達＝再配達する
+    # （stream 完走していない parts は「全文」でない＝完全配達と誤判定しない回帰）。
+    played = asyncio.Event()
+
+    async def play_fn(audio_bytes):
+        played.set()
+    audio = AudioPlayQueue(play_fn=play_fn)
+    captured = []
+
+    def rd(s, a):
+        captured.append((s, a))
+
+    async def stream_fn(messages):
+        yield "了解。"
+        await played.wait()
+        audio.interrupt()
+        yield "本題はこれからだった。"
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, redeliver_fn=rd)
+    w = asyncio.create_task(audio.play_worker())
+    await orch.handle(Stimulus(StimulusKind.CALLFUNCTION_RESULT, _rd_payload(), dedup_key="task:t1"))
+    w.cancel()
+    return len(captured) == 1 and captured[0][1]() is False
+
+
+async def t_tiny_report_complete_no_redeliver() -> bool:
+    # ≤5文字の報告を**完走+全文再生済み**で世代変化 → 完全配達＝再配達しない（parts 一致ルール）。
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def play_fn(audio_bytes):
+        started.set()
+        await release.wait()
+    audio = AudioPlayQueue(play_fn=play_fn)
+    captured = []
+
+    def rd(s, a):
+        captured.append((s, a))
+
+    async def stream_fn(messages):
+        yield "できたよ。"  # 4文字・これが全文（stream 完走）
+    cache = FakeCache()
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, conversation_cache=cache, redeliver_fn=rd)
+    w = asyncio.create_task(audio.play_worker())
+    t = asyncio.create_task(orch.handle(
+        Stimulus(StimulusKind.CALLFUNCTION_RESULT, _rd_payload(), dedup_key="task:t1")))
+    await started.wait()
+    audio.interrupt()  # 再生中にユーザが被せた（世代変化）
+    release.set()      # 再生完了 → on_played（聞かれた扱い）
+    await t
+    w.cancel()
+    return captured == []
+
+
+async def t_redeliver_abort_after_midstop() -> bool:
+    # レッドチーム指摘#2の回帰: cancel 伝播は即時・on_played は遅れて発火。判定時は「未配達」でも
+    # put 直前の should_abort が途中停止文（聞かれた扱い）を拾って True に反転＝二重発話を防ぐ。
+    started = asyncio.Event()
+
+    async def play_fn(audio_bytes, should_stop=None):
+        started.set()
+        for _ in range(100):
+            if should_stop is not None and should_stop():
+                return  # 途中停止（それでも on_played は呼ばれる＝C5）
+            await asyncio.sleep(0.01)
+    audio = AudioPlayQueue(play_fn=play_fn)
+    captured = []
+
+    def rd(s, a):
+        captured.append((s, a))
+
+    async def stream_fn(messages):
+        yield "タスク終わったよ、いまは二十一時。"
+        await asyncio.Event().wait()
+        yield "x。"
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, redeliver_fn=rd)
+    w = asyncio.create_task(audio.play_worker())
+    t = asyncio.create_task(orch.handle(
+        Stimulus(StimulusKind.CALLFUNCTION_RESULT, _rd_payload(), dedup_key="task:t1")))
+    await started.wait()
+    audio.interrupt(); t.cancel()  # 再生途中に barge-in
+    try:
+        await t
+    except asyncio.CancelledError:
+        pass
+    pre = len(captured) == 1 and captured[0][1]() is False  # 判定時: spoken 未確定
+    await asyncio.sleep(0.1)  # should_stop で play が戻り on_played 発火
+    post = captured[0][1]() is True  # put 直前判定: 聞かれた扱い＝中止
+    w.cancel()
+    return pre and post
+
+
+async def t_no_redeliver_user_kind() -> bool:
+    # USER ターンの中断は再配達対象外（kind ガード）。
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    captured = []
+
+    def rd(s, a):
+        captured.append((s, a))
+    started = asyncio.Event()
+
+    async def stream_fn(messages):
+        started.set()
+        await asyncio.Event().wait()
+        yield "x。"
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, redeliver_fn=rd)
+    t = asyncio.create_task(orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "調子どう？")))
+    await started.wait()
+    audio.interrupt(); t.cancel()
+    try:
+        await t
+    except asyncio.CancelledError:
+        pass
+    return captured == []
+
+
+async def t_no_redeliver_bad_payload() -> bool:
+    # CALLFUNCTION_RESULT だが payload が CallFunctionResult でない → 無クラッシュ・再配達なし。
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    captured = []
+
+    def rd(s, a):
+        captured.append((s, a))
+    started = asyncio.Event()
+
+    async def stream_fn(messages):
+        started.set()
+        await asyncio.Event().wait()
+        yield "x。"
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, redeliver_fn=rd)
+    t = asyncio.create_task(orch.handle(Stimulus(StimulusKind.CALLFUNCTION_RESULT, "生文字列")))
+    await started.wait()
+    audio.interrupt(); t.cancel()
+    try:
+        await t
+    except asyncio.CancelledError:
+        pass
+    return captured == []
+
+
+async def t_no_redeliver_cancel_only() -> bool:
+    # cancel のみ（世代不変＝シャットダウン相当）→ 再配達しない（stop() で余計な waiter を生まない）。
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    captured = []
+
+    def rd(s, a):
+        captured.append((s, a))
+    started = asyncio.Event()
+
+    async def stream_fn(messages):
+        started.set()
+        await asyncio.Event().wait()
+        yield "x。"
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, redeliver_fn=rd)
+    t = asyncio.create_task(orch.handle(
+        Stimulus(StimulusKind.CALLFUNCTION_RESULT, _rd_payload(), dedup_key="task:t1")))
+    await started.wait()
+    t.cancel()  # audio.interrupt() は呼ばない
+    try:
+        await t
+    except asyncio.CancelledError:
+        pass
+    return captured == []
+
+
+async def t_redeliver_attempts_boundary() -> bool:
+    # 上限の両側: attempts=1 は通る（→2）・attempts=2 は断念。
+    async def run_with(att):
+        audio = AudioPlayQueue(play_fn=_noop_play)
+        captured = []
+
+        def rd(s, a):
+            captured.append(s)
+        started = asyncio.Event()
+
+        async def stream_fn(messages):
+            started.set()
+            await asyncio.Event().wait()
+            yield "x。"
+        orch = ResponseOrchestrator(audio, stream_fn, _tts, redeliver_fn=rd)
+        t = asyncio.create_task(orch.handle(
+            Stimulus(StimulusKind.CALLFUNCTION_RESULT, _rd_payload(attempts=att), dedup_key="task:t")))
+        await started.wait()
+        audio.interrupt(); t.cancel()
+        try:
+            await t
+        except asyncio.CancelledError:
+            pass
+        return captured
+    c1 = await run_with(1)
+    c2 = await run_with(2)
+    return len(c1) == 1 and c1[0].payload.attempts == 2 and c2 == []
+
+
+def t_redeliver_prefix_in_messages() -> bool:
+    # 再配達（attempts>0）は「# 機能実行結果」に「遮られた再報告」前置が入る。初回は入らない。
+    orch = ResponseOrchestrator(AudioPlayQueue(play_fn=_noop_play), None, _tts)
+    m1 = orch._build_messages(Stimulus(StimulusKind.CALLFUNCTION_RESULT, _rd_payload(attempts=1)))
+    m0 = orch._build_messages(Stimulus(StimulusKind.CALLFUNCTION_RESULT, _rd_payload(attempts=0)))
+    s1, s0 = m1[0]["content"], m0[0]["content"]
+    return ("# 機能実行結果" in s1 and "読み上げが遮られて" in s1
+            and s1.index("# 機能実行結果") < s1.index("読み上げが遮られて")
+            and "21時45分" in s1
+            and "遮られて" not in s0 and "# 機能実行結果" in s0)
+
+
+async def t_redeliver_fn_exception_safe() -> bool:
+    # redeliver_fn が例外を投げても、cancel 経路は CancelledError を正しく raise・gen-break 経路は正常 return。
+    audio = AudioPlayQueue(play_fn=_noop_play)
+
+    def rd(s, a):
+        raise RuntimeError("boom")
+    started = asyncio.Event()
+
+    async def stream_fn(messages):
+        started.set()
+        await asyncio.Event().wait()
+        yield "x。"
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, redeliver_fn=rd)
+    t = asyncio.create_task(orch.handle(
+        Stimulus(StimulusKind.CALLFUNCTION_RESULT, _rd_payload(), dedup_key="task:t1")))
+    await started.wait()
+    audio.interrupt(); t.cancel()
+    cancelled_ok = False
+    try:
+        await t
+    except asyncio.CancelledError:
+        cancelled_ok = True
+    except Exception:
+        return False
+
+    async def stream2(messages):
+        audio.interrupt()
+        yield "y。"
+    orch2 = ResponseOrchestrator(audio, stream2, _tts, redeliver_fn=rd)
+    await orch2.handle(Stimulus(StimulusKind.CALLFUNCTION_RESULT, _rd_payload(), dedup_key="task:t2"))
+    return cancelled_ok
+
+
+async def t_queue_user_priority_over_retry() -> bool:
+    # 「ユーザ応答が先」のキュー側保証: 再投入刺激と USER が同時在中なら USER が先に出る。
+    q = StimulusQueue()
+    retry = Stimulus(StimulusKind.CALLFUNCTION_RESULT, _rd_payload(attempts=1), dedup_key="task:t1")
+    await q.put(retry)
+    await q.put(Stimulus(StimulusKind.USER_UTTERANCE, "OK"))
+    first = await q.get()
+    second = await q.get()
+    return first.kind == StimulusKind.USER_UTTERANCE and second is retry
 
 
 asyncio.run(main())

@@ -76,6 +76,30 @@ try:
               vl2.orchestrator._tasks_provider is not None and vl2.orchestrator._tasks_provider() == [])
     finally:
         _Cfg.TASK_ENABLED = _prev_task_enabled
+    # 再配達（barge-in で潰れた機能報告の救済）の配線と WHEN ポリシー実挙動
+    check("orchestrator に再配達 fn を配線", vl.orchestrator._redeliver_fn == vl._redeliver_stimulus)
+
+    import asyncio as _aio  # noqa: E402
+    from eve.pipeline.stimulus import CallFunctionResult as _CFR, Stimulus as _St, StimulusKind as _SK  # noqa: E402
+
+    async def _w2() -> bool:
+        vl._redeliver_grace_sec = 0.3  # テスト短縮（インスタンス属性）
+        stim = _St(_SK.CALLFUNCTION_RESULT, _CFR("goal", "x", True, 1), dedup_key="task:w2")
+        vl.speech_state.mark_user_speech_start()
+        vl._redeliver_stimulus(stim, lambda: False)
+        await _aio.sleep(0.5)
+        during_speech = vl.queue.qsize()  # 発話中は投入されない
+        vl.speech_state.mark_user_utterance()
+        await _aio.sleep(0.6)  # 猶予 0.3s 経過後に投入
+        after = vl.queue.qsize()
+        # abort=True の再配達は投入されない（put 直前の最終判定）
+        vl._redeliver_stimulus(_St(_SK.CALLFUNCTION_RESULT, _CFR("goal", "y", True, 1), dedup_key="task:w3"),
+                               lambda: True)
+        await _aio.sleep(0.5)
+        aborted = vl.queue.qsize()
+        return during_speech == 0 and after == 1 and aborted == 1 and len(vl._redeliver_waiters) == 0
+
+    check("再配達WHEN: 発話中は待機→解除+猶予後に投入 / abort で中止 / waiter 自己除去", _aio.run(_w2()))
 except Exception as e:  # 構築自体が落ちたら配線ドリフト＝即失敗
     check(f"VoiceLoop 構築で例外: {e!r}", False)
 

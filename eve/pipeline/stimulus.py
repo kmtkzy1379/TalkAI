@@ -43,8 +43,11 @@ class CallFunctionResult:
 
     content = 応答LLM へ渡す**人間可読**の結果文（再投入時に「# 機能実行結果」へそのまま入る）。
     function_name = 実行した能力名（ログ/文脈用）。ok = 成否（失敗も正直に伝えるため保持）。
+    attempts = 配達試行回数（0=初回）。barge-in で報告が発話前に潰れた時の再配達で +1 され、
+    文脈に「遮られた再報告」と明示される（2026-07-13 21:20 実機事故: 報告の無音消失 対応）。
     """
 
     function_name: str
     content: str
     ok: bool = True
+    attempts: int = 0
