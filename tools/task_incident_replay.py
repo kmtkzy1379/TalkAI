@@ -123,6 +123,11 @@ class World:
         self.turn_played_chars = 0  # 現報告ターンで実再生完了した文字数（barge 有効性ゲート）
         self.speech_state = SpeechState()  # 本番同等の user_speaking（再配達 WHEN 制御）
         self._redeliver_tasks = []
+        # 異常検出: ターン cancel 後も stream が回り続けたら記録（barge が効いていない疑いの実証用）
+        self._turn_id = 0
+        self._active_turn = 0
+        self.turn_cancelled_at = {}  # turn_id -> mono
+        self.anomalies = []  # (turn_id, 遅れ秒, 直近delta断片)
 
     async def start(self):
         self.cache = ConversationCache(history_file=os.path.join(self.art, "h.jsonl"))
@@ -152,13 +157,23 @@ class World:
         async def stream_fn(messages, *, tools=None, tool_sink=None):
             # 本番 voice_loop.py と同一（max_tokens は付けない: gpt-5.x 系は reasoning が
             # 予算を食い尽くし content が空になる＝発話ゼロで再現にならない）。
+            # 計装: この turn が cancel された後に delta が流れ続けたら異常記録（barge 有効性の実証）。
+            tid = world._active_turn
+
+            def _check(x):
+                cat = world.turn_cancelled_at.get(tid)
+                if cat is not None:
+                    late = time.monotonic() - cat
+                    if late > 0.3:
+                        world.anomalies.append((tid, round(late, 2), str(x)[:30]))
+                return x
             if tools:
                 async for x in self.reg.stream_with_tools("response", messages, tools=tools,
                                                           tool_sink=tool_sink):
-                    yield x
+                    yield _check(x)
             else:
                 async for x in self.reg.stream("response", messages):
-                    yield x
+                    yield _check(x)
 
         # 実再生完了（on_played=聞かれた扱い）の文字数を観測（barge 有効性ゲート用）。
         _enq = self.audio.enqueue
@@ -182,6 +197,9 @@ class World:
         async def handle_wrap(stim):
             att = getattr(stim.payload, "attempts", None)
             dk = getattr(stim, "dedup_key", None)
+            world._turn_id += 1
+            world._active_turn = world._turn_id
+            tid = world._turn_id
             world.handle_starts.append((time.monotonic(), stim.kind, dk, att))
             if stim.kind == StimulusKind.CALLFUNCTION_RESULT:
                 world.turn_played_chars = 0
@@ -190,6 +208,7 @@ class World:
             try:
                 await _handle(stim)
             except asyncio.CancelledError:
+                world.turn_cancelled_at[tid] = time.monotonic()
                 world.cancelled.append((stim.kind, dk))
                 ev("✂中断", f"{stim.kind.name} dedup={dk}")
                 raise
@@ -522,6 +541,174 @@ async def phase_c3(reg, stt, art, run_id):
         await w.stop()
 
 
+# ============================ Phase D: タスク待機中の混線ストレス ============================
+
+def _full_delivery_count(w, marker):
+    """完了ターンのうち marker（結果の中核語）を含む発話の数（完全配達の重複検出）。"""
+    return sum(1 for _k, _d, _a, sp in w.handles if marker in sp)
+
+
+async def phase_d1(reg, stt, art, run_id):
+    """雑談混線+発話前barge: タスク待機中に雑談2連発→報告を潰す→追い質問→全部整合するか。"""
+    CUR[0] = f"D1-run{run_id}"
+    w = World(reg, stt, art, f"d1_{run_id}")
+    await w.start()
+    try:
+        heard_q3 = await w.hear("ごめん、続けて。")
+        await w.say("30秒後に今の時刻を教えてくれる？", must=("30", "秒"))
+        pend = [t for t in w.goal_tasks() if t.status == PENDING]
+        if len(pend) != 1:
+            return ("INCONCLUSIVE", f"予約が {len(pend)} 件")
+        dedup = f"task:{pend[0].task_id}"
+        # 待機中の雑談（タスクと無関係な質問を挟む）
+        await w.say("ところで富士山ってどれくらいの高さだっけ？")
+        await w.say("へえ。じゃあ海で一番深いところは何メートル？")
+        evt = w.report_started.setdefault(dedup, asyncio.Event())
+        try:
+            await asyncio.wait_for(evt.wait(), timeout=90)
+        except asyncio.TimeoutError:
+            return ("INCONCLUSIVE", "報告ターンが開始しなかった")
+        await asyncio.sleep(0.4)
+        if w.turn_played_chars > 5:
+            return ("INCONCLUSIVE", "barge 前に本文再生済み")
+        w.barge()
+        await _mimic_user_speech(w, heard_q3)
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 120:
+            if any(a == 1 for a, _ in _report_stats(w, dedup)[1]):
+                break
+            await asyncio.sleep(0.5)
+        await w.wait_idle(30)
+        starts, dones, cut = _report_stats(w, dedup)
+        result_core = (w.store.get(pend[0].task_id).result or "")[:10]
+        n_user_done = sum(1 for k, _d, _a, sp in w.handles if k == StimulusKind.USER_UTTERANCE and sp)
+        ev("📋", f"starts={[a for _, a in starts]} dones={len(dones)} user応答={n_user_done} "
+                 f"anomalies={w.anomalies}")
+        if w.anomalies:
+            return ("FAIL", f"cancel 後も stream 継続の異常: {w.anomalies}")
+        if len(dones) != 1 or dones[0][0] != 1:
+            return ("FAIL", f"報告発話が {len(dones)} 件（期待: 再配達の1件）")
+        if n_user_done < 2:  # 雑談2件ぶん（予約 ack と「続けて」は tool のみ無発話になり得る既知挙動）
+            return ("FAIL", f"ユーザ発話への応答が {n_user_done} 件（雑談が無視された）")
+        if w.store.get(pend[0].task_id).status != DONE:
+            return ("FAIL", "store 状態異常")
+        return ("PASS", f"雑談2件応答+報告再配達1回（結果: {result_core}…）・stream異常ゼロ")
+    finally:
+        await w.stop()
+
+
+async def phase_d2(reg, stt, art, run_id):
+    """本文再生中barge+追い質問: >5文字再生済みで潰す→即質問→重複配達なし・stream異常なし。"""
+    CUR[0] = f"D2-run{run_id}"
+    w = World(reg, stt, art, f"d2_{run_id}")
+    await w.start()
+    try:
+        heard_q = await w.hear("ありがとう。ところで水って何度で凍るんだっけ？")
+        await w.say("30秒後にあなたの好きな食べ物を教えてくれる？", must=("30", "秒"))
+        pend = [t for t in w.goal_tasks() if t.status == PENDING]
+        if len(pend) != 1:
+            return ("INCONCLUSIVE", f"予約が {len(pend)} 件")
+        dedup = f"task:{pend[0].task_id}"
+        evt = w.report_started.setdefault(dedup, asyncio.Event())
+        try:
+            await asyncio.wait_for(evt.wait(), timeout=90)
+        except asyncio.TimeoutError:
+            return ("INCONCLUSIVE", "報告ターンが開始しなかった")
+        t0 = time.monotonic()
+        while w.turn_played_chars <= 5 and time.monotonic() - t0 < 60:
+            if _report_stats(w, dedup)[1]:
+                return ("INCONCLUSIVE", "barge 前に報告が完了した")
+            await asyncio.sleep(0.05)
+        if w.turn_played_chars <= 5:
+            return ("INCONCLUSIVE", "本文再生を検知できず")
+        t_barge = time.monotonic()
+        w.barge()
+        await _mimic_user_speech(w, heard_q)
+        await asyncio.sleep(10.0)
+        await w.wait_idle(30)
+        starts, dones, _ = _report_stats(w, dedup)
+        retry_starts = [a for _, a in starts if a and a >= 1]
+        result_core = (w.store.get(pend[0].task_id).result or "")[:8]
+        dup = _full_delivery_count(w, result_core) if result_core else 0
+        # 追い質問の処理判定: barge 後に USER ターンが開始し、かつ非空のユーザ応答が存在すること
+        # （予約 ack が tool のみ無発話になる既知挙動があるため総数閾値では判定しない）。
+        followup_started = any(m > t_barge and k == StimulusKind.USER_UTTERANCE
+                               for m, k, _d, _a in w.handle_starts)
+        answered = any(k == StimulusKind.USER_UTTERANCE and sp for k, _d, _a, sp in w.handles)
+        ev("📋", f"再配達開始={retry_starts} 完全配達数={dup} 追い質問開始={followup_started} "
+                 f"応答有={answered} anomalies={w.anomalies}")
+        if w.anomalies:
+            return ("FAIL", f"cancel 後も stream 継続の異常: {w.anomalies}")
+        if retry_starts:
+            return ("FAIL", "再生済みなのに再配達された（二重発話）")
+        if dup > 1:
+            return ("FAIL", f"結果の完全配達が {dup} 回（重複発話）")
+        if not (followup_started and answered):
+            return ("FAIL", "追い質問が処理されなかった")
+        return ("PASS", "再生中barge→再配達なし・重複なし・追い質問に応答・stream異常ゼロ")
+    finally:
+        await w.stop()
+
+
+async def phase_d3(reg, stt, art, run_id):
+    """再配達の連続potsし: 初回と再配達1回目を両方潰す→2回目の再配達で届く（上限内の粘り）。"""
+    CUR[0] = f"D3-run{run_id}"
+    w = World(reg, stt, art, f"d3_{run_id}")
+    await w.start()
+    try:
+        heard1 = await w.hear("ちょっと待って。")
+        heard2 = await w.hear("ごめん、もう大丈夫。")
+        await w.say("30秒後に今の時刻を教えてくれる？", must=("30", "秒"))
+        pend = [t for t in w.goal_tasks() if t.status == PENDING]
+        if len(pend) != 1:
+            return ("INCONCLUSIVE", f"予約が {len(pend)} 件")
+        dedup = f"task:{pend[0].task_id}"
+        evt = w.report_started.setdefault(dedup, asyncio.Event())
+        try:
+            await asyncio.wait_for(evt.wait(), timeout=90)
+        except asyncio.TimeoutError:
+            return ("INCONCLUSIVE", "報告ターン未開始")
+        await asyncio.sleep(0.4)
+        if w.turn_played_chars > 5:
+            return ("INCONCLUSIVE", "barge1 前に本文再生済み")
+        w.barge()
+        await _mimic_user_speech(w, heard1)
+        # 再配達1回目（attempts=1）の開始を待って、それも発話前に潰す
+        t0 = time.monotonic()
+        retry1_started = False
+        while time.monotonic() - t0 < 90:
+            if any(a == 1 for _m, a in _report_stats(w, dedup)[0]):
+                retry1_started = True
+                break
+            await asyncio.sleep(0.1)
+        if not retry1_started:
+            return ("INCONCLUSIVE", "再配達1回目が開始しなかった")
+        await asyncio.sleep(0.4)
+        if w.turn_played_chars > 5:
+            return ("INCONCLUSIVE", "barge2 前に本文再生済み")
+        w.barge()
+        await _mimic_user_speech(w, heard2)
+        # 再配達2回目（attempts=2・上限）で届くはず
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < 120:
+            if any(a == 2 for a, _ in _report_stats(w, dedup)[1]):
+                break
+            await asyncio.sleep(0.5)
+        await w.wait_idle(30)
+        starts, dones, cut = _report_stats(w, dedup)
+        ev("📋", f"starts={[a for _, a in starts]} dones={[(a, s[:25]) for a, s in dones]} "
+                 f"中断={len(cut)} anomalies={w.anomalies}")
+        if w.anomalies:
+            return ("FAIL", f"cancel 後も stream 継続の異常: {w.anomalies}")
+        if [a for _, a in starts] != [0, 1, 2]:
+            return ("FAIL", f"開始列 {[a for _, a in starts]}（期待 [0,1,2]）")
+        if len(dones) != 1 or dones[0][0] != 2:
+            return ("FAIL", f"発話された報告 {len(dones)} 件（期待: attempts=2 の1件）")
+        return ("PASS", "2連続で潰しても3回目（上限）で届いた・発話1回のみ")
+    finally:
+        await w.stop()
+
+
 # ============================ Phase B: 決定論注入 ============================
 
 # (reference, 温存すべきか) — アクティブは常に「50秒後に今の気持ち教えて」1件。
@@ -634,6 +821,21 @@ async def main():
                 results_c.append((name, verdict, why))
                 print(f"\n  ── {name} run{r}: {verdict} — {why}\n")
 
+    results_d = []
+    if os.getenv("SKIP_D") != "1":
+        print("\n═══ Phase D: タスク待機中の混線ストレス ═══")
+        if stt is None:
+            stt = make_stt()
+            await stt.warmup()
+        n_d = int(os.getenv("N_RUNS_D", "1"))
+        for r in range(1, n_d + 1):
+            for name, fn in (("D1雑談混線+発話前barge", phase_d1),
+                             ("D2再生中barge+追い質問", phase_d2),
+                             ("D3再配達2連続潰し", phase_d3)):
+                verdict, why = await fn(reg, stt, art, r)
+                results_d.append((name, verdict, why))
+                print(f"\n  ── {name} run{r}: {verdict} — {why}\n")
+
     print("\n════════════ 判定サマリ ════════════")
     if results_b:
         print(f"Phase B: {sum(results_b)}/{len(results_b)} PASS")
@@ -641,9 +843,12 @@ async def main():
         print(f"Phase A run{i}: {v} — {why}")
     for name, v, why in results_c:
         print(f"Phase {name}: {v} — {why}")
+    for name, v, why in results_d:
+        print(f"Phase {name}: {v} — {why}")
     print(f"artifacts: {art}")
     fail = ((results_b and not all(results_b)) or any(v == "FAIL" for v, _ in results_a)
-            or any(v == "FAIL" for _, v, _ in results_c))
+            or any(v == "FAIL" for _, v, _ in results_c)
+            or any(v == "FAIL" for _, v, _ in results_d))
     sys.exit(1 if fail else 0)
 
 
