@@ -69,13 +69,22 @@ try:
     check("tasks_provider の配線が TASK_ENABLED に連動",
           (vl.orchestrator._tasks_provider is not None) == bool(_Cfg.TASK_ENABLED))
     _prev_task_enabled = _Cfg.TASK_ENABLED
+    _prev_search_enabled = _Cfg.SEARCH_ENABLED
     _Cfg.TASK_ENABLED = True
+    _Cfg.SEARCH_ENABLED = True
     try:
         vl2 = VoiceLoop()
         check("TASK_ENABLED=True で tasks_provider 配線(空 store→[])",
               vl2.orchestrator._tasks_provider is not None and vl2.orchestrator._tasks_provider() == [])
+        # J-2: search_web は TaskAgent 専用（agent_tool に出て offered に出ない）
+        _agent_names = {s["function"]["name"] for s in vl2.capabilities.agent_tool_schemas()}
+        _offered_names = {s["function"]["name"] for s in vl2.capabilities.tool_schemas()}
+        check("SEARCH_ENABLED で search_web 配線(agent専用・応答LLM不可視)",
+              vl2.search_client is not None and "search_web" in _agent_names
+              and "search_web" not in _offered_names)
     finally:
         _Cfg.TASK_ENABLED = _prev_task_enabled
+        _Cfg.SEARCH_ENABLED = _prev_search_enabled
     # 再配達（barge-in で潰れた機能報告の救済）の配線と WHEN ポリシー実挙動
     check("orchestrator に再配達 fn を配線", vl.orchestrator._redeliver_fn == vl._redeliver_stimulus)
 

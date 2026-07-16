@@ -104,6 +104,7 @@ class VoiceLoop:
         self.task_executor = None
         self.reconcile_timer = None
         self.cancel_resolver = None
+        self.search_client = None  # J-2（SEARCH_ENABLED かつ TASK_ENABLED 時のみ生成）
         tasks_provider = None  # Fix#2: TASK_ENABLED 時のみ配線（None ならブロック自体を注入しない）
         if Config.TASK_ENABLED:
             self.task_store = TaskStore(
@@ -130,6 +131,19 @@ class VoiceLoop:
             # 再実行・状態と矛盾する約束の防止＝2026-07-13 実機事故の根本原因対応）。
             store = self.task_store
             tasks_provider = lambda: active_tasks_for_context(store)  # noqa: E731
+            # J-2 search（既定 off・TASK_ENABLED ブロック内に置く＝TaskAgent 専用能力なので
+            # タスク管理なしでは誰も呼べない状態を構造的に不能にする）。
+            if Config.SEARCH_ENABLED:
+                import importlib.util
+                if importlib.util.find_spec("ddgs") is None:
+                    # 起動時 fail-soft（VOICEVOX 未起動と同流儀）: 検索だけ無効化して続行。
+                    logger.warning("SEARCH_ENABLED=1 だが ddgs 未導入のため検索を無効化（pip install ddgs）")
+                else:
+                    from .search import SearchClient, register_search_capability
+                    self.search_client = SearchClient()
+                    register_search_capability(self.capabilities, self.search_client)
+        elif Config.SEARCH_ENABLED:
+            logger.warning("SEARCH_ENABLED=1 だが TASK_ENABLED=0 のため検索は無効（TaskAgent 専用能力）")
 
         async def stream_fn(messages, *, tools=None, tool_sink=None):
             if tools:
@@ -270,6 +284,8 @@ class VoiceLoop:
             if self.cancel_resolver is not None:
                 self.cancel_resolver.start()  # executor と並列（取消が実行中タスクの後ろで待たない）
             logger.info("タスク管理 稼働（予約タスク）")
+            if self.search_client is not None:
+                logger.info("Web検索 稼働（search_web・TaskAgent 専用）")
         # F6: 画面認識を起動（既定 off）。capture スレッドは loop 確定後に生成し on_frame を橋渡し。
         if Config.VLM_ENABLED:
             self.vlm_worker.start()

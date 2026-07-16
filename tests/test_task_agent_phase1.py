@@ -108,6 +108,10 @@ class FakeReg:
         # 実 CapabilityRegistry と同契約（同期能力は execute と同値）。
         return self.execute(name, args)
 
+    def is_blocking(self, name):
+        # 実 CapabilityRegistry と同契約（fake は同期のみ＝False。テストで上書き可）。
+        return False
+
     def has(self, name):
         return name in self.results
 

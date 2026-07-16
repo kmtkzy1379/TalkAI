@@ -136,6 +136,7 @@ class TaskAgent:
                     for (cid, name, raw) in calls
                 ],
             })
+            blocking_done = 0  # 1 step 内で実行した重い能力（検索等）の数
             for (cid, name, raw) in calls:
                 # per-call 取消チェック: async 能力（検索等）は call 実行中/実行間に取消が入り得る。
                 # step 冒頭のみのチェックだと「止めたよ」の発話後に残り call が実行され続け、
@@ -143,8 +144,16 @@ class TaskAgent:
                 if self._cancelled(task_id):
                     logger.info("🗒 TaskAgent: 実行中に取消（破棄） task=%s", task_id)
                     return None
-                # J-2 前提工事: 統一経路 execute_async（同期能力は同値・ブロッキング能力は loop を塞がない）。
-                result = await self._registry.execute_async(name, _parse_args(raw))
+                # 重い能力は 1 step 1 件まで（J-2 レッドチーム S1: 1 step の一括 tool_calls で
+                # executor を長時間占有し他タスクを遅延させる穴を、能力の種類によらず塞ぐ）。
+                # 実行せず結果を見てから次を決めさせる＝Reflexion ループの本来の形にも合う。
+                if blocking_done >= 1 and self._registry.is_blocking(name):
+                    result = "（時間のかかる操作は一度に1つまで。この前の結果を見てから、必要なら次の手で呼んで）"
+                else:
+                    # J-2 前提工事: 統一経路 execute_async（同期能力は同値・ブロッキングは loop を塞がない）。
+                    result = await self._registry.execute_async(name, _parse_args(raw))
+                    if self._registry.is_blocking(name):
+                        blocking_done += 1
                 logger.info("🗒 TaskAgent step=%d %s -> %s", step, name, result[:50])
                 notes.append(f"step{step}: {name} -> {result[:60]}")
                 messages.append({"role": "tool", "tool_call_id": cid, "content": result})

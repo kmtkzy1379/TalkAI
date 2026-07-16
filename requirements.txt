@@ -12,3 +12,4 @@ torch
 # F3.5 長期記憶。sentence-transformers=Ruri v3 埋め込み（ローカル・遅延 import）。
 # Tier-1 決定論テストには不要（fake embed_fn 注入）。
 sentence-transformers
+ddgs  # J-2 Web検索（キー不要メタ検索・遅延 import）

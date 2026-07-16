@@ -145,6 +145,15 @@ class Config:
     TASK_AGENT_MAX_STEPS = int(os.getenv("TASK_AGENT_MAX_STEPS", "5"))  # ループ最大手数
     TASK_AGENT_TIMEOUT_SEC = float(os.getenv("TASK_AGENT_TIMEOUT_SEC", "180.0"))  # 1ゴールの壁(monotonic)時間上限=3分で強制終了
 
+    # Web検索（J-2 inc1 = ddgs スニペットのみ）。TASK_ENABLED 前提（TaskAgent 専用能力）。
+    SEARCH_ENABLED = os.getenv("SEARCH_ENABLED", "0") == "1"  # 既定 off（実機で明示 on）
+    SEARCH_MAX_RESULTS = int(os.getenv("SEARCH_MAX_RESULTS", "5"))  # 上位件数
+    SEARCH_TIMEOUT_SEC = float(os.getenv("SEARCH_TIMEOUT_SEC", "10.0"))  # 検索1回の総予算（wait_for 側）
+    SEARCH_SOCKET_TIMEOUT_SEC = float(os.getenv("SEARCH_SOCKET_TIMEOUT_SEC", "5.0"))  # ddgs ソケット側（thread 自然死の保証）
+    SEARCH_CACHE_TTL_SEC = float(os.getenv("SEARCH_CACHE_TTL_SEC", "600.0"))  # 同一クエリの再検索抑制（再取得は fresh=true）
+    SEARCH_COOLDOWN_SEC = float(os.getenv("SEARCH_COOLDOWN_SEC", "30.0"))  # 連続空振り時の冷却（レートリミット実測30sで回復）
+    SEARCH_BACKEND = os.getenv("SEARCH_BACKEND", "duckduckgo")  # ddgs バックエンド（auto は死んだ経路で例外化する回線がある・実機スモーク）
+
     @classmethod
     def validate(cls) -> list[str]:
         """不足している必須設定を列挙。空リストなら起動可（Start ゲートで使う）。"""

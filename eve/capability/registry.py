@@ -97,6 +97,14 @@ class CapabilityRegistry:
         cap = self._caps.get(name)
         return cap.report_result if cap is not None else True
 
+    def is_blocking(self, name: str) -> bool:
+        """時間のかかる能力か（async_handler 持ち＝検索/将来の fetch・画面操作）。
+
+        TaskAgent が 1 step 内の重い呼び出しを律速するのに使う（未知/同期は False）。
+        """
+        cap = self._caps.get(name)
+        return cap is not None and cap.async_handler is not None
+
     def names(self) -> list[str]:
         return list(self._caps)
 
