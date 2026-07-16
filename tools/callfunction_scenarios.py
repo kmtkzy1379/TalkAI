@@ -77,7 +77,7 @@ async def run_model(model: str) -> None:
         c, sink = await _turn(reg, registry, system, "ねえイブ、今の調子とキューの状況どう？")
         print(f"  S1 前置き={c!r}  tool_calls={[parse_tool_call(t)[0] for t in sink]}")
         if sink:
-            res = registry.execute(*parse_tool_call(sink[0])[:2])
+            res = await registry.execute_async(*parse_tool_call(sink[0])[:2])
             print(f"     報告: {await _report(reg, res)!r}")
 
         # S2 マルチツール
@@ -89,7 +89,7 @@ async def run_model(model: str) -> None:
         names3 = [parse_tool_call(t)[0] for t in sink3]
         print(f"  S3 前置き={c3!r}  tool_calls={names3}")
         if sink3:
-            res3 = registry.execute(*parse_tool_call(sink3[0])[:2])
+            res3 = await registry.execute_async(*parse_tool_call(sink3[0])[:2])
             print(f"     実行結果(失敗): {res3}")
             print(f"     正直報告: {await _report(reg, res3)!r}")
     except Exception as e:

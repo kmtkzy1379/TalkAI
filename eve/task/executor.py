@@ -89,7 +89,8 @@ class TaskExecutor:
             await self._run_capability(task)
 
     async def _run_capability(self, task) -> None:
-        content = self._registry.execute(task.what, task.args or {})
+        # J-2 前提工事: 統一経路 execute_async（同期能力は同値・ブロッキング能力は loop を塞がない）。
+        content = await self._registry.execute_async(task.what, task.args or {})
         # 決定論 verdict: 失敗/未対応マーカは「（…」で始まる（registry 規約）。
         ok = bool(self._registry.has(task.what)) and not content.startswith("（")
         report = f"（予約していたタスク）{content}"

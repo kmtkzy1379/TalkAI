@@ -66,6 +66,10 @@ class RecordingRegistry:
         self.calls.append(name)
         return self._results.get(name, f"result:{name}")
 
+    async def execute_async(self, name: str, args: dict = None) -> str:
+        # 実 CapabilityRegistry と同契約（同期能力は execute と同値）。
+        return self.execute(name, args)
+
     def tool_schemas(self) -> list[dict]:
         return []
 
@@ -397,6 +401,12 @@ async def main() -> None:
     check("Fix#2: 予約タスク一覧を全刺激種別の system に注入", await t_orch_tasks_injected_all_kinds())
     check("Fix#2: ゼロ件明示 / provider 未配線はブロック無し", await t_orch_tasks_zero_and_default())
     check("Fix#2: provider 例外でも注入なしで応答継続", await t_orch_tasks_provider_error_resilient())
+    check("execute_async: 同期handler同値(成功/失敗マーカ/未対応)", await t_execute_async_sync_equiv())
+    check("execute_async: async handler実行中もloopが回る", await t_execute_async_handler_runs_and_loop_alive())
+    check("execute_async: async例外マーカ/同期経路の防御線", await t_execute_async_exception_and_sync_guard())
+    check("execute_async: CancelledError は伝播", await t_execute_async_cancel_propagates())
+    check("execute_async: 同期経路は無suspend(原子性のpin)", t_execute_async_sync_no_suspend())
+    check("execute_async: 遅いasync能力でもdispatcher逐次", await t_dispatcher_serial_async())
     check("再配達: cancel経路で attempts+1/dedup/内容/ok 伝搬・幻記憶なし", await t_redeliver_on_cancelled_report())
     check("再配達: stream前(RAG検索中)cancel も救済（事故窓の残り）", await t_redeliver_prestream_rag_cancel())
     check("再配達: gen-break 正常経路でも救済", await t_redeliver_gen_break())
@@ -473,6 +483,116 @@ async def t_orch_tasks_provider_error_resilient() -> bool:
     await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "やあ"))
     w.cancel()
     return orch.last_response == "はい。" and "# 予約タスク" not in seen["sys"]
+
+
+# ========== execute_async（J-2 前提工事: ブロッキング能力の統一実行経路） ==========
+
+async def t_execute_async_sync_equiv() -> bool:
+    # 同期 handler は execute_async 経由でも execute と同値（挙動・失敗マーカとも）。
+    reg = CapabilityRegistry()
+    reg.register(Capability(name="ok", description="", params_schema={}, handler=lambda a: "結果A"))
+    reg.register(Capability(name="err", description="", params_schema={},
+                            handler=lambda a: (_ for _ in ()).throw(RuntimeError("boom"))))
+    r1 = await reg.execute_async("ok")
+    r2 = await reg.execute_async("err")
+    r3 = await reg.execute_async("zzz")
+    # 完全同値（マーカ文言・理由切り詰めまで execute() と一致すること）
+    return (r1 == reg.execute("ok") == "結果A"
+            and r2 == reg.execute("err") and r2.startswith("（機能「err」の実行に失敗しました") and "boom" in r2
+            and r3 == reg.execute("zzz") and r3.startswith("（未対応の機能"))
+
+
+async def t_execute_async_handler_runs_and_loop_alive() -> bool:
+    # async_handler が await され、実行中も loop が回り続ける（ブロッキング能力の核要件）。
+    reg = CapabilityRegistry()
+    seen_args = []
+
+    async def slow(args: dict) -> str:
+        seen_args.append(args)
+        await asyncio.sleep(0.3)
+        return "遅い結果"
+    reg.register(Capability(name="slow", description="", params_schema={}, async_handler=slow))
+    ticks = [0]
+
+    async def ticker():
+        while True:
+            ticks[0] += 1
+            await asyncio.sleep(0.02)
+    t = asyncio.create_task(ticker())
+    result = await reg.execute_async("slow")  # args 省略 → {} に正規化されて渡る
+    t.cancel()
+    return (result == "遅い結果" and ticks[0] >= 3  # 実行中に loop が回っている（CI 高負荷でも安全な下限）
+            and seen_args == [{}])
+
+
+async def t_execute_async_exception_and_sync_guard() -> bool:
+    # async_handler の例外→失敗マーカ / async 専用能力を同期 execute で呼ぶ→専用マーカ。
+    reg = CapabilityRegistry()
+
+    async def bad(args: dict) -> str:
+        raise ValueError("dead")
+    reg.register(Capability(name="bad", description="", params_schema={}, async_handler=bad))
+    r1 = await reg.execute_async("bad")
+    r2 = reg.execute("bad")  # 同期経路の防御線
+    return (r1.startswith("（機能「bad」の実行に失敗しました") and "dead" in r1
+            and r2.startswith("（機能「bad」は非同期専用"))
+
+
+def t_execute_async_sync_no_suspend() -> bool:
+    # 同期能力の execute_async は**一度も suspend しない**ことを pin（暗黙の原子性契約の防衛線）。
+    # ここに await が混入すると、delegate_task の dedup 等の check-then-act 原子性が静かに崩れ、
+    # fake は suspend しないため既存テストでは検知できない（レッドチーム §2-3）。
+    reg = CapabilityRegistry()
+    reg.register(Capability(name="s", description="", params_schema={}, handler=lambda a: "x"))
+    coro = reg.execute_async("s")
+    try:
+        coro.send(None)
+    except StopIteration as e:
+        return e.value == "x"
+    coro.close()
+    return False
+
+
+async def t_dispatcher_serial_async() -> bool:
+    # 遅い async 能力でも dispatcher の逐次性（single-flight）が守られる。
+    reg = CapabilityRegistry()
+    events: list = []
+
+    async def slow(args: dict) -> str:
+        i = args.get("i")
+        events.append(("start", i))
+        await asyncio.sleep(0.05)
+        events.append(("end", i))
+        return f"r{i}"
+    reg.register(Capability(name="slow", description="", params_schema={}, async_handler=slow,
+                            offered=False, agent_tool=True))
+    q = StimulusQueue()
+    d = FunctionDispatcher(registry=reg, queue=q)
+    d.start()
+    d.submit([_tc("c1", "slow", '{"i": 1}'), _tc("c2", "slow", '{"i": 2}')])
+    await asyncio.sleep(0.3)
+    await d.stop()
+    return events == [("start", 1), ("end", 1), ("start", 2), ("end", 2)]
+
+
+async def t_execute_async_cancel_propagates() -> bool:
+    # CancelledError は握らない（shutdown/barge の伝播を妨げない）。
+    reg = CapabilityRegistry()
+    started = asyncio.Event()
+
+    async def hang(args: dict) -> str:
+        started.set()
+        await asyncio.Event().wait()
+        return "届かない"
+    reg.register(Capability(name="hang", description="", params_schema={}, async_handler=hang))
+    task = asyncio.create_task(reg.execute_async("hang"))
+    await started.wait()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        return True
+    return False
 
 
 # ========== 再配達（barge-in で潰れた機能報告の救済・2026-07-13 21:20 実機事故対応） ==========

@@ -104,6 +104,10 @@ class FakeReg:
             self._on_exec(name, args)
         return self.results.get(name, f"（未対応{name}）")
 
+    async def execute_async(self, name, args=None):
+        # 実 CapabilityRegistry と同契約（同期能力は execute と同値）。
+        return self.execute(name, args)
+
     def has(self, name):
         return name in self.results
 
@@ -190,6 +194,24 @@ async def t_agent_cancel_midloop():
     agent = TaskAgent(registry=reg, model_registry=model, store=cs, max_steps=5)
     out = await agent.run("途中で取消されるやつ", "t")
     return out is None and len(reg.calls) == 1  # step0 実行→cancel→step1 で None
+
+
+async def t_agent_percall_cancel_window():
+    # async 能力の実行中に取消 → **同一 step の残り call は実行されない**（per-call チェック・
+    # レッドチーム S-1: 「止めたよ」の後に残りの検索が走り続ける窓を塞ぐ）。
+    cs = CancelStore()
+
+    class AsyncReg(FakeReg):
+        async def execute_async(self, name, args=None):
+            r = self.execute(name, args)  # 記録
+            cs.cancel()  # 1本目の実行中に取消が入った状況
+            await asyncio.sleep(0)  # suspend する async 能力を模す
+            return r
+    model = FakeModel([_resp(tool_calls=[_tc("c1", "pc_status"), _tc("c2", "self_status")])])
+    reg = AsyncReg({"pc_status": "ok", "self_status": "ok"})
+    agent = TaskAgent(registry=reg, model_registry=model, store=cs, max_steps=5)
+    out = await agent.run("2連ツールの途中で取消", "t")
+    return out is None and len(reg.calls) == 1  # 2本目は per-call チェックで止まる
 
 
 async def t_agent_missing_task_aborts():
@@ -316,6 +338,7 @@ async def main():
     check("Agent: max_steps 打ち切り", await t_agent_max_steps())
     check("Agent: timeout 打ち切り", await t_agent_timeout())
     check("Agent: 実行中キャンセル→None(破棄)", await t_agent_cancel_midloop())
+    check("Agent: async能力の取消窓→同一stepの残りcallを実行しない", await t_agent_percall_cancel_window())
     check("Agent: task 消失→None", await t_agent_missing_task_aborts())
     check("Agent: 限界で理由を要約(（手数上限: …）)", await t_agent_limit_summary())
     check("Executor: goal→agent→Done+再投入", await t_executor_goal_done_reinject())

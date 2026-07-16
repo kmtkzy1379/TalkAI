@@ -94,8 +94,9 @@ class FunctionDispatcher:
 
     async def _handle_one(self, tc: Any) -> None:
         name, args, call_id = parse_tool_call(tc)
-        # read-only 能力は sub-ms。将来の blocking 能力は handler 側で executor へ逃がす。
-        content = self._registry.execute(name, args)
+        # J-2 前提工事: 統一経路 execute_async（read-only 能力は sub-ms でそのまま・
+        # ブロッキング能力は async_handler が to_thread 等へ逃がす＝loop を塞がない）。
+        content = await self._registry.execute_async(name, args)
         is_failure = content.startswith("（")  # registry の失敗/未対応マーカ
         ok = self._registry.has(name) and not is_failure
         # 観測性: どの tool が何の引数で呼ばれ何を返したかを1行で残す（2026-07-13 実機事故の

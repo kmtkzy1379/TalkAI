@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logging.disable(logging.CRITICAL)
 
-from eve.capability import CapabilityRegistry  # noqa: E402
+from eve.capability import Capability, CapabilityRegistry  # noqa: E402
 from eve.clock import humanize_eta  # noqa: E402
 from eve.pipeline.stimulus import StimulusKind  # noqa: E402
 from eve.pipeline.stimulus_queue import StimulusQueue  # noqa: E402
@@ -69,6 +69,10 @@ class FakeRegistry:
     def execute(self, name, args):
         self.calls.append((name, args))
         return self.results.get(name, f"（未対応「{name}」）")
+
+    async def execute_async(self, name, args=None):
+        # 実 CapabilityRegistry と同契約（同期能力は execute と同値）。
+        return self.execute(name, args)
 
 
 class FakeExec:
@@ -186,6 +190,9 @@ async def t_executor_discard_on_cancel():
             s.set_status("c1", CANCELLED)  # 実行の最中に取消が入ったと仮定
             return "状態は良好"
 
+        async def execute_async(self, name, args=None):
+            return self.execute(name, args)
+
     ex = TaskExecutor(store=s, registry=CancelDuringExec(), queue=q)
     ex.start(); ex.trigger()
     await asyncio.sleep(0.05)
@@ -256,6 +263,31 @@ async def t_capabilities():
     )
 
 
+async def t_executor_drain_slow_async():
+    # 遅い async 能力の実行中に stop(短drain) → 偽の報告刺激を残さず、store は Running のまま
+    # （次回起動の孤児 age-out が回収＝既存設計と整合。レッドチーム §2-2）。
+    s = TaskStore(task_file=_tmp(), now_fn=lambda: BASE)
+    await s.initialize()
+    reg2 = CapabilityRegistry()
+    started = asyncio.Event()
+
+    async def hang(args):
+        started.set()
+        await asyncio.sleep(10)
+        return "遅い"
+    reg2.register(Capability(name="hang", description="", params_schema={}, async_handler=hang,
+                             offered=False, agent_tool=True))
+    q = StimulusQueue()
+    ex = TaskExecutor(store=s, registry=reg2, queue=q)
+    s.add(Task(task_id="h1", what="hang", when=None))
+    ex.start(); ex.trigger()
+    await asyncio.wait_for(started.wait(), timeout=2)
+    await ex.stop(drain_timeout=0.1)
+    ok = q.qsize() == 0 and s.get("h1").status == RUNNING
+    await s.shutdown()
+    return ok
+
+
 async def t_active_tasks_context():
     # Fix#2: 応答LLM 注入用の一覧。Pending/Running のみ・丸め残り時間・task_id を出さない（leak ガード）。
     s = TaskStore(task_file=_tmp(), now_fn=lambda: BASE)
@@ -303,6 +335,7 @@ async def main():
     check("cancel: Running も / ID省略で直近", await t_cancel_running_and_latest())
     check("Scheduler: when 到来で trigger・busy ガード", await t_scheduler_triggers_when_due())
     check("capabilities: create/cancel/remind/markers", await t_capabilities())
+    check("Executor: 遅いasync能力中のstop→偽報告なし/Running温存", await t_executor_drain_slow_async())
     check("Fix#2: active_tasks_for_context(状態/ETA/ID leak なし)", await t_active_tasks_context())
     check("Fix#2: 一覧上限+humanize_eta 丸め境界", await t_active_tasks_limit_and_eta())
 

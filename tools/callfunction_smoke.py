@@ -58,7 +58,7 @@ async def run_model(model: str) -> None:
     # 実行 → 結果を再投入して報告文を生成
     for tc in sink:
         name, args, cid = parse_tool_call(tc)
-        result = caps.execute(name, args)
+        result = await caps.execute_async(name, args)  # 統一経路（async 専用能力にも対応）
         print(f"   → {name}({args}) = {result}")
         followup = [
             {"role": "system", "content": SPEECH_STYLE + f"\n\n# 機能実行結果\n{result}"},

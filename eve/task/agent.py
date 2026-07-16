@@ -80,7 +80,7 @@ class TaskAgent:
         self, *, registry, model_registry, store,
         max_steps: int = 6, timeout_sec: float = 30.0, now_fn=now_mono,
     ) -> None:
-        self._registry = registry          # CapabilityRegistry（tool_schemas + execute）
+        self._registry = registry          # CapabilityRegistry（agent_tool_schemas + execute_async）
         self._model = model_registry        # ModelRegistry（complete("task", ...)）
         self._store = store                  # TaskStore（cancel 検知に get()）
         self._max_steps = max(1, int(max_steps))
@@ -137,7 +137,14 @@ class TaskAgent:
                 ],
             })
             for (cid, name, raw) in calls:
-                result = self._registry.execute(name, _parse_args(raw))
+                # per-call 取消チェック: async 能力（検索等）は call 実行中/実行間に取消が入り得る。
+                # step 冒頭のみのチェックだと「止めたよ」の発話後に残り call が実行され続け、
+                # single-flight の executor を占有し他タスクも遅延する（レッドチーム S-1）。
+                if self._cancelled(task_id):
+                    logger.info("🗒 TaskAgent: 実行中に取消（破棄） task=%s", task_id)
+                    return None
+                # J-2 前提工事: 統一経路 execute_async（同期能力は同値・ブロッキング能力は loop を塞がない）。
+                result = await self._registry.execute_async(name, _parse_args(raw))
                 logger.info("🗒 TaskAgent step=%d %s -> %s", step, name, result[:50])
                 notes.append(f"step{step}: {name} -> {result[:60]}")
                 messages.append({"role": "tool", "tool_call_id": cid, "content": result})
