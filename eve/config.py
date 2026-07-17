@@ -151,7 +151,9 @@ class Config:
     SEARCH_TIMEOUT_SEC = float(os.getenv("SEARCH_TIMEOUT_SEC", "10.0"))  # 検索1回の総予算（wait_for 側）
     SEARCH_SOCKET_TIMEOUT_SEC = float(os.getenv("SEARCH_SOCKET_TIMEOUT_SEC", "5.0"))  # ddgs ソケット側（thread 自然死の保証）
     SEARCH_CACHE_TTL_SEC = float(os.getenv("SEARCH_CACHE_TTL_SEC", "600.0"))  # 同一クエリの再検索抑制（再取得は fresh=true）
-    SEARCH_COOLDOWN_SEC = float(os.getenv("SEARCH_COOLDOWN_SEC", "30.0"))  # 連続空振り時の冷却（レートリミット実測30sで回復）
+    SEARCH_COOLDOWN_SEC = float(os.getenv("SEARCH_COOLDOWN_SEC", "90.0"))  # 連続失敗時の冷却（検知後の回復窓は30sより長い実測 2026-07-17）
+    SEARCH_MIN_INTERVAL_SEC = float(os.getenv("SEARCH_MIN_INTERVAL_SEC", "10.0"))  # 実検索の最小間隔（3-4s連打は bot 検知に即かかる実測）
+    SEARCH_RETRY_EMPTY_DELAY_SEC = float(os.getenv("SEARCH_RETRY_EMPTY_DELAY_SEC", "8.0"))  # 0件時の1回だけ再検索の待ち（0=無効）
     SEARCH_BACKEND = os.getenv("SEARCH_BACKEND", "duckduckgo")  # ddgs バックエンド（auto は死んだ経路で例外化する回線がある・実機スモーク）
 
     @classmethod

@@ -47,7 +47,10 @@ class SearchClient:
         cooldown_sec: Optional[float] = None,
         backend: Optional[str] = None,
         fail_streak_max: int = 3,  # 連続失敗この回数でクールダウン（正直な0件×2の別キーワード再試行は許す）
+        min_interval_sec: Optional[float] = None,  # 実検索の最小間隔（bot検知対策・キャッシュ命中は消費しない）
+        retry_empty_delay_sec: Optional[float] = None,  # 0件時に1回だけ待って再検索（フレーキー空応答の吸収）
         now_fn: Callable[[], float] = now_mono,
+        sleep_fn: Callable[[float], "asyncio.Future"] = asyncio.sleep,  # テスト注入シーム
     ) -> None:
         self._search_fn = search_fn
         self._max_results = max_results if max_results is not None else Config.SEARCH_MAX_RESULTS
@@ -58,7 +61,13 @@ class SearchClient:
         self._cooldown_sec = cooldown_sec if cooldown_sec is not None else Config.SEARCH_COOLDOWN_SEC
         self._backend = backend if backend is not None else Config.SEARCH_BACKEND
         self._fail_streak_max = max(1, int(fail_streak_max))
+        self._min_interval = (min_interval_sec if min_interval_sec is not None
+                              else Config.SEARCH_MIN_INTERVAL_SEC)
+        self._retry_empty_delay = (retry_empty_delay_sec if retry_empty_delay_sec is not None
+                                   else Config.SEARCH_RETRY_EMPTY_DELAY_SEC)
         self._now = now_fn
+        self._sleep = sleep_fn
+        self._last_search_at = float("-inf")  # 最後に実検索を発射した mono 時刻
         self._cache: dict[str, tuple[float, str]] = {}  # 正規化クエリ -> (mono, ダイジェスト)
         self._fail_streak = 0  # 連続失敗（種別問わず・成功でリセット）
         self._cooldown_until = 0.0
@@ -79,25 +88,16 @@ class SearchClient:
         if now < self._cooldown_until:
             return ("（Web検索が連続で失敗しているため少し休んでいます"
                     "（レートリミットの可能性）。しばらくしてから試してください）")
-        try:
-            rows = await asyncio.wait_for(
-                asyncio.to_thread(self._run_search, q), timeout=self._timeout)
-        except asyncio.TimeoutError:
-            logger.warning("🔍 検索タイムアウト: %.40s", q)
-            return self._register_failure(
-                now, f"（Web検索がタイムアウトしました（{int(self._timeout)}秒以内に応答なし））")
-        except asyncio.CancelledError:
-            raise  # shutdown/取消の伝播を妨げない
-        except Exception as e:
-            msg = str(e)
-            if "No results" in msg:
-                # ddgs は 0件とレートリミットを区別せずこの例外を投げ得る（実機スモーク）
-                return self._register_failure(
-                    now, f"検索したが「{q}」に該当する結果は見つからなかった"
-                         "（別のキーワードなら見つかるかもしれない）。")
-            reason = f"{type(e).__name__}: {msg}".strip()
-            logger.warning("🔍 検索失敗: %.40s -> %.80s", q, reason)
-            return self._register_failure(now, f"（Web検索が失敗しました: {reason[:100]}）")
+        rows, failure = await self._search_once(q)
+        if failure is None and not rows and self._retry_empty_delay > 0:
+            # 0件は「本当に無い」と「bot検知の空応答」を区別できない（DDG実測）→
+            # 間隔をあけて1回だけ再検索し、フレーキーな空応答を吸収する。
+            logger.info("🔍 0件 → %.0fs 後に1回だけ再検索: %.40s", self._retry_empty_delay, q)
+            await self._sleep(self._retry_empty_delay)
+            rows, failure = await self._search_once(q)
+        now = self._now()  # 待機/実行の経過を反映
+        if failure is not None:
+            return self._register_failure(now, failure)
         if not rows:
             return self._register_failure(
                 now, f"検索したが「{q}」に該当する結果は見つからなかった"
@@ -113,6 +113,34 @@ class SearchClient:
         return digest
 
     # --- 内部 -----------------------------------------------------------------
+
+    async def _search_once(self, q: str) -> tuple[list, Optional[str]]:
+        """1回の実検索（最小間隔の充足→発射）。返り値 (rows, 失敗文字列 or None)。
+
+        最小間隔: 実検索の発射間隔をコードで強制（TaskAgent の機械的な3〜4秒連打が
+        DDG の bot 検知に即かかる実測 2026-07-17 への対策。キャッシュ命中は消費しない）。
+        CancelledError は素通し（間隔待ち中も取消可能）。
+        """
+        wait = self._last_search_at + self._min_interval - self._now()
+        if wait > 0:
+            await self._sleep(wait)
+        self._last_search_at = self._now()
+        try:
+            rows = await asyncio.wait_for(
+                asyncio.to_thread(self._run_search, q), timeout=self._timeout)
+            return rows or [], None
+        except asyncio.TimeoutError:
+            logger.warning("🔍 検索タイムアウト: %.40s", q)
+            return [], f"（Web検索がタイムアウトしました（{int(self._timeout)}秒以内に応答なし））"
+        except asyncio.CancelledError:
+            raise  # shutdown/取消の伝播を妨げない
+        except Exception as e:
+            msg = str(e)
+            if "No results" in msg:
+                return [], None  # ddgs は 0件をこの例外で表す（レートリミットも化ける・実測）
+            reason = f"{type(e).__name__}: {msg}".strip()
+            logger.warning("🔍 検索失敗: %.40s -> %.80s", q, reason)
+            return [], f"（Web検索が失敗しました: {reason[:100]}）"
 
     def _run_search(self, q: str) -> list:
         """検索の実行（**純粋関数**: to_thread 内で共有状態を触らない）。"""

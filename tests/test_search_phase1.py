@@ -61,7 +61,8 @@ def _client(search_fn, clock=None, **kw):
     clock = clock or Clock()
     defaults = dict(max_results=5, timeout_sec=1.0, socket_timeout_sec=0.5,
                     cache_ttl_sec=600.0, cooldown_sec=30.0, backend="duckduckgo",
-                    fail_streak_max=2)  # テストは最短で冷却を発火させる（既定は3）
+                    fail_streak_max=2,  # テストは最短で冷却を発火させる（既定は3）
+                    min_interval_sec=0.0, retry_empty_delay_sec=0.0)  # 間隔/リトライは専用テストで検証
     defaults.update(kw)
     return SearchClient(search_fn=search_fn, now_fn=clock.now, **defaults), clock
 
@@ -194,6 +195,61 @@ async def t_streak_default_allows_two_retries():
     o3 = await c.search("c")  # 3回目で成功（冷却されていない）
     return (not o1.startswith("（") and not o2.startswith("（")
             and not o3.startswith("（") and len(calls) == 3)
+
+
+async def t_min_interval_enforced():
+    # 実検索の最小間隔: 2連続の実検索で残り時間ぶん sleep する / キャッシュ命中は消費しない。
+    clock = Clock()
+    slept = []
+
+    def fn(q, n):
+        return ROWS
+
+    async def fake_sleep(s):
+        slept.append(round(s, 3))
+        clock.t += s
+    c, _ = _client(fn, clock=clock, min_interval_sec=10.0, sleep_fn=fake_sleep)
+    await c.search("a")          # 初回: 待ちなし
+    first = list(slept)
+    clock.t += 3.0
+    await c.search("a")          # キャッシュ命中: 実検索なし＝待ちなし
+    cache_hit = list(slept)
+    await c.search("b")          # 2発目の実検索: 残り 7.0s を待つ
+    return first == [] and cache_hit == [] and slept == [7.0]
+
+
+async def t_retry_empty_once():
+    # 0件は1回だけ間隔をあけて再検索（フレーキー空応答の吸収）。2回目成功なら通常結果。
+    calls = []
+    slept = []
+    clock = Clock()
+
+    def fn(q, n):
+        calls.append(q)
+        return [] if len(calls) == 1 else ROWS
+
+    async def fake_sleep(s):
+        slept.append(round(s, 3))
+        clock.t += s
+    c, _ = _client(fn, clock=clock, retry_empty_delay_sec=8.0, sleep_fn=fake_sleep)
+    out = await c.search("q")
+    return (not out.startswith("（") and "ja.wikipedia.org" in out
+            and len(calls) == 2 and 8.0 in slept)
+
+
+async def t_retry_empty_both_streak_once():
+    # リトライしても0件 → 正直空振り。ストリークは**1回分だけ**加算（リトライを2重に数えない）。
+    calls = []
+    clock = Clock()
+
+    async def fake_sleep(s):
+        clock.t += s
+    c, _ = _client(lambda q, n: calls.append(q) or [], clock=clock,
+                   retry_empty_delay_sec=5.0, fail_streak_max=2, sleep_fn=fake_sleep)
+    o1 = await c.search("a")  # 実検索2回（リトライ込み）だがストリーク1
+    o2 = await c.search("b")  # ストリーク2 → 冷却
+    return (not o1.startswith("（") and len(calls) == 4
+            and o2.startswith("（") and "連続で失敗" in o2)
 
 
 async def t_query_length_cap():
@@ -365,6 +421,9 @@ async def main():
     check("意味論: timeoutもストリークに乗る", await t_timeout_counts_toward_streak())
     check("意味論: 既定閾値3は0件×2の再試行を許す", await t_streak_default_allows_two_retries())
     check("型崩れrowsでも落ちない", await t_malformed_rows_no_crash())
+    check("最小間隔: 実検索のみ消費・残り時間を待つ", await t_min_interval_enforced())
+    check("0件リトライ: 1回だけ再検索して吸収", await t_retry_empty_once())
+    check("0件リトライ: 両方0件でもストリーク1回分", await t_retry_empty_both_streak_once())
     check("タイムアウト→マーカ", await t_timeout_marker())
     check("キャッシュ: 命中/fresh/TTL失効", await t_cache_fresh_ttl())
     check("空クエリ→マーカ", await t_empty_query_marker())
