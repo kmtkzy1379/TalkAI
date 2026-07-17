@@ -148,13 +148,13 @@ class Config:
     # Web検索（J-2 inc1 = ddgs スニペットのみ）。TASK_ENABLED 前提（TaskAgent 専用能力）。
     SEARCH_ENABLED = os.getenv("SEARCH_ENABLED", "0") == "1"  # 既定 off（実機で明示 on）
     SEARCH_MAX_RESULTS = int(os.getenv("SEARCH_MAX_RESULTS", "5"))  # 上位件数
-    SEARCH_TIMEOUT_SEC = float(os.getenv("SEARCH_TIMEOUT_SEC", "10.0"))  # 検索1回の総予算（wait_for 側）
+    SEARCH_TIMEOUT_SEC = float(os.getenv("SEARCH_TIMEOUT_SEC", "20.0"))  # 検索1回の総予算（auto のフォールバック実測 max 14.8s + 余裕）
     SEARCH_SOCKET_TIMEOUT_SEC = float(os.getenv("SEARCH_SOCKET_TIMEOUT_SEC", "5.0"))  # ddgs ソケット側（thread 自然死の保証）
     SEARCH_CACHE_TTL_SEC = float(os.getenv("SEARCH_CACHE_TTL_SEC", "600.0"))  # 同一クエリの再検索抑制（再取得は fresh=true）
     SEARCH_COOLDOWN_SEC = float(os.getenv("SEARCH_COOLDOWN_SEC", "90.0"))  # 連続失敗時の冷却（検知後の回復窓は30sより長い実測 2026-07-17）
-    SEARCH_MIN_INTERVAL_SEC = float(os.getenv("SEARCH_MIN_INTERVAL_SEC", "10.0"))  # 実検索の最小間隔（3-4s連打は bot 検知に即かかる実測）
+    SEARCH_MIN_INTERVAL_SEC = float(os.getenv("SEARCH_MIN_INTERVAL_SEC", "5.0"))  # 実検索の最小間隔（auto=多エンジン分散なら3s連打8/8成功の実測。単一エンジン時の保険として維持）
     SEARCH_RETRY_EMPTY_DELAY_SEC = float(os.getenv("SEARCH_RETRY_EMPTY_DELAY_SEC", "8.0"))  # 0件時の1回だけ再検索の待ち（0=無効）
-    SEARCH_BACKEND = os.getenv("SEARCH_BACKEND", "duckduckgo")  # ddgs バックエンド（auto は死んだ経路で例外化する回線がある・実機スモーク）
+    SEARCH_BACKEND = os.getenv("SEARCH_BACKEND", "auto")  # ddgs バックエンド（auto=マルチエンジン自動フォールバック。DNS 修正後 5 エンジン生存・3s連打8/8の実測 2026-07-18。DNS遮断回線では "duckduckgo" 固定に戻す）
 
     @classmethod
     def validate(cls) -> list[str]:
