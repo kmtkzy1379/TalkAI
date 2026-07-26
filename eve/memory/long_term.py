@@ -208,6 +208,7 @@ class RagStore:
             text=record.get("text", ""),
             iso=record.get("timestamp", now_iso()),
             as_topic_seed=as_topic_seed,
+            summary=record.get("summary", ""),  # 話題の種はこの1行だけを使う（decider）
         )
 
     async def _retrieve(self, query: str, k: int) -> tuple[list[dict], dict]:

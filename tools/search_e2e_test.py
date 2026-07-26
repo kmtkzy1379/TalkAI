@@ -15,6 +15,8 @@ r"""J-2 inc2 検索の音声E2E通しテスト（VOICEVOX ユーザ音声 × フ
 
 実行: $env:PYTHONIOENCODING="utf-8"; ..\portfolio8-VLM-AI\venv\Scripts\python.exe tools\search_e2e_test.py
 変数: E2E_ART=artifacts出力先 / REAL_AUDIO=1(実スピーカー再生) / SKIP="S1,S4"(スキップ)
+      REAL_STATE=1(**実起動と同じ状態**: .env のフラグ/モデルのまま + 本番の記憶をコピーして使う)
+      IDLE_NEGLECT_SEC=180(SIDLE の1ラウンド放置秒) / AUTO_ROUNDS / AUTO_NEGLECT_SEC(SAUTO)
 前提: VOICEVOX 起動 + .env のキー。データは artifacts 下に隔離（本物の記憶を汚さない）。
 """
 from __future__ import annotations
@@ -34,20 +36,47 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # 応答モデルの上書き（.env の RESPONSE_MODEL より優先・eve.config インポート前に必須）。
 # 既定 gpt-5.5: a(tool_calls JSON漏れ)が gpt-5.4-mini→gpt-5.5 で解消するか徹底検証するため。
-os.environ["RESPONSE_MODEL"] = os.environ.get("E2E_RESPONSE_MODEL", "openai/gpt-5.5")
+# REAL_STATE=1 の時は上書きしない（実起動と同じ .env の値で測る）。
+if os.getenv("REAL_STATE") != "1":
+    os.environ["RESPONSE_MODEL"] = os.environ.get("E2E_RESPONSE_MODEL", "openai/gpt-5.5")
 
 from eve.config import Config  # noqa: E402
 
-# --- フラグ/データ隔離は VoiceLoop 構築前に（Config は構築時に読まれる） ---
-Config.CALLFUNCTION_ENABLED = True
-Config.TASK_ENABLED = True
-Config.SEARCH_ENABLED = True
 ART = os.environ.get("E2E_ART") or os.path.join(
     tempfile.gettempdir(), f"search_e2e_{time.strftime('%H%M%S')}")
 os.makedirs(ART, exist_ok=True)
-Config.HISTORY_FILE = os.path.join(ART, "history.jsonl")
-Config.RAG_FILE = os.path.join(ART, "rag_memory.jsonl")
-Config.TASK_FILE = os.path.join(ART, "tasks.jsonl")
+
+# --- フラグ/データは VoiceLoop 構築前に（Config は構築時に読まれる） ---
+# REAL_STATE=1: **実起動(tools/voice_chat.py の VoiceLoop())と同じ状態**で測る。
+#   - 機能フラグ/モデルは .env のまま（強制 ON も RESPONSE_MODEL 上書きもしない）
+#   - 記憶は本番ファイルを artifacts に**コピーして**使う（起動時の状態は同一・書込は本番を汚さない）
+#   自律発話の頻度や RAG 起点の想起は、空の記憶では原理的に測れないため（実測 2026-07-26:
+#   隔離モードのRAGは同一セッション5件のみ＝過去の記憶が存在しない）。
+REAL_STATE = os.getenv("REAL_STATE") == "1"
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _seed_from_real(name: str, dest: str) -> str:
+    """本番ファイルを artifacts にコピー（無ければ空で開始）。返り値はコピー先パス。"""
+    src = os.path.join(_ROOT, name)
+    dst = os.path.join(ART, dest)
+    if os.path.exists(src):
+        import shutil
+        shutil.copyfile(src, dst)
+    return dst
+
+
+if REAL_STATE:
+    Config.HISTORY_FILE = _seed_from_real(Config.HISTORY_FILE, "history.jsonl")
+    Config.RAG_FILE = _seed_from_real(Config.RAG_FILE, "rag_memory.jsonl")
+    Config.TASK_FILE = _seed_from_real(Config.TASK_FILE, "tasks.jsonl")
+else:
+    Config.CALLFUNCTION_ENABLED = True
+    Config.TASK_ENABLED = True
+    Config.SEARCH_ENABLED = True
+    Config.HISTORY_FILE = os.path.join(ART, "history.jsonl")
+    Config.RAG_FILE = os.path.join(ART, "rag_memory.jsonl")
+    Config.TASK_FILE = os.path.join(ART, "tasks.jsonl")
 
 from eve.logsetup import configure  # noqa: E402
 from eve.pipeline.stimulus import Stimulus, StimulusKind  # noqa: E402
@@ -182,6 +211,7 @@ class Harness:
         self.decisions: list[dict] = []          # 全発話判定（speak True/False・理由・content）
         self._seen_decision_ts: set = set()      # ts（マイクロ秒精度）で重複排除
         self.suppressions: list[dict] = []        # 🔇 同内容抑制（terminal.log からは取れないので judge 記録）
+        self.seed_calls: list[dict] = []          # 発話判定に渡った話題の種（RAG起点かの事後判定用）
         self._instrument()
         self.run_task = None
         self.sampler = None
@@ -190,6 +220,20 @@ class Harness:
     def _instrument(self) -> None:
         orch = self.vl.orchestrator
         _handle = orch.handle
+
+        # 話題の種の記録: 自律発話が「記憶起点か」を事後に判定するため、判定へ渡った種を残す。
+        _autonomous_memories = self.vl.rag.autonomous_memories
+
+        async def seeds_wrap(query, k=3):
+            seeds = await _autonomous_memories(query, k)
+            self.seed_calls.append({
+                "t": round(time.monotonic() - T0, 2),
+                "query": (query or "")[:80],
+                "seeds": [(s.seed_text() if hasattr(s, "seed_text") else s.text)[:120] for s in seeds],
+            })
+            return seeds
+
+        self.vl.rag.autonomous_memories = seeds_wrap
 
         async def handle_wrap(stim):
             t0 = time.monotonic()
@@ -251,7 +295,10 @@ class Harness:
         caps.execute_async = ex_wrap  # type: ignore
 
         sc = self.vl.search_client
-        assert sc is not None, "SEARCH_ENABLED 配線に失敗（ddgs 未導入?）"
+        if sc is None:
+            # REAL_STATE では .env に SEARCH_ENABLED が無ければ検索は配線されない（実起動と同じ）。
+            assert REAL_STATE, "SEARCH_ENABLED 配線に失敗（ddgs 未導入?）"
+            return
         _search = sc.search
 
         async def search_wrap(query, fresh=False, deep=False):
@@ -380,19 +427,22 @@ class Harness:
         return None
 
     def _sidecars_idle(self) -> bool:
+        # REAL_STATE では .env にフラグが無ければ task/callfunction は配線されない（実起動と同じ）。
         d = self.vl.dispatcher
         r = self.vl.cancel_resolver
-        return (d._inbox.empty() and d._inbox._unfinished_tasks == 0
-                and (r is None or (r._inbox.empty() and r._inbox._unfinished_tasks == 0)))
+        ex = self.vl.task_executor
+        return ((d is None or (d._inbox.empty() and d._inbox._unfinished_tasks == 0))
+                and (r is None or (r._inbox.empty() and r._inbox._unfinished_tasks == 0))
+                and (ex is None or ex.is_idle()))
 
     async def wait_idle(self, timeout=120.0) -> bool:
         t = time.monotonic()
         while time.monotonic() - t < timeout:
             if (not self.vl.runner.is_busy() and self.vl.queue.qsize() == 0
-                    and self.vl.task_executor.is_idle() and self._sidecars_idle()):
+                    and self._sidecars_idle()):
                 await asyncio.sleep(0.4)
                 if (not self.vl.runner.is_busy() and self.vl.queue.qsize() == 0
-                        and self.vl.task_executor.is_idle() and self._sidecars_idle()):
+                        and self._sidecars_idle()):
                     return True
             await asyncio.sleep(0.15)
         ev("⚠", f"wait_idle timeout {timeout}s（自発発話/長考中の可能性・続行）")
@@ -634,7 +684,36 @@ async def s_auto_speech(h: Harness):
         await h.wait_idle(20)
 
 
+async def s_idle3(h: Harness):
+    """3分放置を複数ラウンド: 実運用で「どれくらいの頻度で話しかけてくるか」を測る。
+
+    画面は触らない（VLM 起因を混ぜない）。文脈は自然な区切り発話のみ、または起動直後の純沈黙。
+    「作業に集中する/見てて」系は decider が正しく黙るため、頻度計測には使わない。
+    """
+    neglect = float(os.getenv("IDLE_NEGLECT_SEC", "180"))
+    starters = [
+        None,  # 起動直後の純沈黙（会話文脈なし）
+        "ふー、ちょっと一息つこうかな。",
+        "特に予定はないんだよね。",
+    ]
+    for i, line in enumerate(starters):
+        ev("═══", f"IDLE-round{i}（{'区切り発話なし' if line is None else line}・放置{neglect:.0f}s）")
+        if line is not None:
+            await h.say(line)
+            await h.wait_idle(30)
+        t_round = time.monotonic()
+        await asyncio.sleep(neglect)
+        autos = [(round(m - t_round, 1), tx, c)
+                 for (m, k, d, tx, c) in h.handles if k == "AUTONOMOUS_SPEECH" and m >= t_round]
+        rate = len(autos) / (neglect / 60.0)
+        ev("📊", f"IDLE-round{i} 自律発話 {len(autos)}件 = {rate:.1f}件/分（放置{neglect:.0f}s）")
+        for sec, tx, cancelled in autos:
+            ev("🗣", f"  +{sec}s {'[中断]' if cancelled else ''} {tx[:90]}")
+        await h.wait_idle(20)
+
+
 SCENARIOS = [
+    ("SIDLE_3分放置頻度", s_idle3),
     ("SAUTO_自律発話計測", s_auto_speech),
     ("S1_通常検索+別話題", s1_search_plus_topic),
     ("S2_検索中に別タスク", s2_search_plus_task),
@@ -686,9 +765,10 @@ async def main() -> None:
             "speech_log": [str(x) for x in list(h.vl.speech_state.speech_log)],
             "decisions": h.decisions,       # 自律発話計測: 全判定（押し出し前に捕捉した全件）
             "suppressions": h.suppressions,  # 同内容抑制（②-1 の発火）
+            "seed_calls": h.seed_calls,      # 判定へ渡った話題の種（RAG起点かの事後判定用）
             "tasks_final": [{"id": t.task_id, "goal": t.goal, "status": t.status,
                              "result": (t.result or "")[:120]}
-                            for t in h.vl.task_store.list_all()],
+                            for t in (h.vl.task_store.list_all() if h.vl.task_store else [])],
         }
         with open(os.path.join(ART, "summary.json"), "w", encoding="utf-8") as f:
             json.dump(summary, f, ensure_ascii=False, indent=1)

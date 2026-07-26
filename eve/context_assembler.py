@@ -43,6 +43,19 @@ class RagChunk:
     text: str
     iso: str
     as_topic_seed: bool = False  # 無言時 random は True（思い出話と区別）
+    # 1行の要約（FeedbackLLM が付ける summary）。発話判定の「話題の種」は**これだけ**を渡す:
+    # text は「感情/次の予測/予測差/理由」を含む内部ログ形式で平均162字あり、話題として使える
+    # のは先頭1行(平均40字)だけ＝残りがノイズになる（実測 2026-07-26）。応答文脈は従来どおり
+    # text 全文（感情の色が応答の質に効く）。
+    summary: str = ""
+
+    def seed_text(self) -> str:
+        """話題の種としての1行表現（summary が無い古い記録は text の1行目で代替）。"""
+        s = (self.summary or "").strip()
+        if s:
+            return s
+        lines = (self.text or "").splitlines()
+        return lines[0].strip() if lines else ""
 
 
 def messages_to_text(messages: list[dict]) -> str:

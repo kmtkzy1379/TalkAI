@@ -515,6 +515,48 @@ async def _run_decider(state, contents, *, embedder=None, hook=None) -> tuple[li
     return delivered, list(state.speech_log)
 
 
+def t_turn_rendering_has_elapsed() -> bool:
+    # 直近会話には「いつの発話か」を必ず添える。無いと起動直後に前セッションの続きを
+    # 「今まさに返事待ち」と誤読して沈黙し続ける（実測 2026-07-26: 実起動状態で25判定中24が
+    # 「直前に伝えたばかり」を理由に沈黙。実際の会話は9日前）。
+    from eve.clock import Stamp
+    from eve.context_assembler import Turn
+    from eve.speech.decider import _render_turns
+    now = "2026-07-26T12:00:00+00:00"
+    turns = [Turn("user", "今タスクに入ってるんだよね", Stamp(mono=0.0, iso="2026-07-17T12:00:00+00:00")),
+             Turn("eve", "うん、調べてるところだよ", Stamp(mono=0.0, iso="2026-07-26T11:58:00+00:00"))]
+    s = _render_turns(turns, now)
+    no_stamp = _render_turns([type("T", (), {"speaker": "user", "text": "素の発話"})()], now)
+    return (
+        "[ユーザ/9日前]" in s and "[イブ/2分前]" in s
+        and "[user]" not in s
+        and "[ユーザ] 素の発話" in no_stamp  # stamp を持たない相手でも壊れない
+        and _render_turns([], now) == "（直近の会話なし）"
+    )
+
+
+def t_seed_rendering_summary_and_time() -> bool:
+    # 話題の種は「要約1行 + いつの記憶か」で描く。text 全文（感情/次の予測/予測差/理由の
+    # 内部ログ・平均162字）を渡すと話題として使える1行が埋もれ、時刻が無いと「そういえば前に」
+    # が言えない（実測 2026-07-26: 現行形式では発話率7%・記憶接地も弱い）。
+    from eve.context_assembler import RagChunk
+    from eve.speech.decider import _render_seeds
+    now = "2026-07-26T12:00:00+00:00"
+    c1 = RagChunk(
+        text="ユーザは空が青い理由を気にしていた\n感情: イブ=好奇心\n次の予測: 続けて質問しそう\n予測差: 92",
+        iso="2026-07-23T12:00:00+00:00", as_topic_seed=True,
+        summary="ユーザは空が青い理由を気にしていた")
+    c2 = RagChunk(text="要約なし記録の1行目\n感情: イブ=平静", iso="2026-07-26T11:55:00+00:00")
+    s = _render_seeds([c1, c2], now)
+    return (
+        "3日前" in s and "5分前" in s              # いつの記憶かを必ず添える
+        and "次の予測" not in s and "予測差" not in s  # 内部ログは渡さない
+        and "ユーザは空が青い理由を気にしていた" in s
+        and "要約なし記録の1行目" in s              # summary 欠落の古い記録は1行目で代替
+        and _render_seeds([], now) == "（なし）"
+    )
+
+
 async def t_seed_query_uses_last_user_turn() -> bool:
     # 話題の種のクエリは**直近のユーザ発話**で引く（イブ自身の自発発話で引くと自己強化ループ）
     state = SpeechState()
@@ -979,6 +1021,8 @@ async def main() -> None:
     # J-2 ②-1: 同内容の自発発話の抑制
     check("J-2 ②-1: 類似度指標の実データ校正（重複≥閾値/別話題<閾値）", t_content_similarity_calibration())
     check("J-2 ②-1: 同内容の自発発話をコードゲートで抑制", await t_decider_suppresses_duplicate_content())
+    check("直近会話に経過時間を添える(古い会話を返事待ちと誤読しない)", t_turn_rendering_has_elapsed())
+    check("話題の種は要約1行+相対時刻で描く", t_seed_rendering_summary_and_time())
     check("話題の種は直近ユーザ発話で引く(自己強化しない)", await t_seed_query_uses_last_user_turn())
     check("cosine 基本(同一/直交/空/ゼロ)", t_cosine_basic())
     check("言い換えは文字bigramをすり抜ける(二段目の根拠)", t_paraphrase_slips_bigram())

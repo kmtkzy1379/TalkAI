@@ -20,6 +20,8 @@ import re
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
+from ..clock import elapsed_wall, humanize, now_iso
+
 logger = logging.getLogger(__name__)
 
 # 話す判断だが LLM が content を出さなかった時の最小ヒント（応答LLMが文脈から膨らませる）。
@@ -122,11 +124,15 @@ SPEECH_DECIDE_SYSTEM = """\
 - 画面の内容を**過去の記憶と結びつける**（例:「前にチーズケーキ好きって言ってたね、これ良さそう」）。
 - 画面で相手が**探している/迷っているものに気づいて手伝う**（例:「スポッチャ、室内で雨でも遊べていいね」）。
 - 直近の会話を一歩進める／関連する**新しい話題を記憶から**振る／相手が一息ついた間に声をかける。
+- **沈黙が長い時は、過去の記憶や、そこから素朴に気になったことを自分から振ってよい**（人は黙っている
+  相手にも、ふと思い出した話や疑問を話しかける。画面や直前の会話に材料が無い時こそ、記憶が話のきっかけになる）。
 - 「# 画面」ブロックが**無い**ときは、直近に画面の変化が無い（＝今の画面については何も分かっていない）。
   画面の話はせず、**本当に良い一言が記憶や会話からある時だけ**にする（無ければ黙る方が自然）。
 
 【黙る(no)】
 - **直前にイブが自分から話して、相手がまだ返事していない**（畳みかけない・間を空けて相手の番を待つ）。
+  ※ただし会話行の「いつ」を見ること。何時間も/何日も前の会話は**返事待ちではない**（前のセッションの
+  続きなので、久しぶりに声をかけてよい。そこで止まっている話題があるなら、それを振るのはむしろ自然）。
 - 本当に言うことがない／さっきと同じことの繰り返しになる。
 - 相手が**今まさに手を動かして**作業に没頭している（入力中・操作中で画面が動いている）など、口を挟むと**邪魔になりそう**な時。※画面の情報が無い時は画面について何も推測しない（止まっている＝手が空いている、とも、集中中、とも決めつけない）。
 - **画面に新しい変化が無いのに、こちらから画面の話題を持ち出さない**（変化していない画面に急に話しかけるのは不自然。「# 画面」ブロックが無い時に画面の話をするのは捏造になる）。
@@ -137,7 +143,7 @@ SPEECH_DECIDE_SYSTEM = """\
 
 【禁止】
 - **毎回は話しかけない**。本当に良い一言・気の利いた一言がある時だけに絞る（質問の連投・実況の垂れ流しはしない）。
-- 過去の記憶は**時々の隠し味**。毎回「そういえば」と持ち出すと逆にしつこい（数回に1回で十分）。
+- 同じ記憶を続けて持ち出さない（一度触れた話題は間を空ける）。
 - **画面変化のいちいちを実況報告しない**（「○○が表示されました」の垂れ流しは黙る）。挨拶の繰り返しもしない。
 - surprise(予測差)は強い指標だが絶対ではない（高くても黙ってよいし、低くても話してよい）。
 
@@ -147,16 +153,38 @@ reason: なぜそう判断したか（1文）
 content: 話すなら、イブが実際に話す内容のたたき台（1文）。黙るなら空でよい。"""
 
 
-def _render_turns(turns) -> str:
+def _render_turns(turns, now: Optional[str] = None) -> str:
+    """直近会話の描画: **話者 + いつの発話か**。
+
+    時刻が無いと、起動直後に前回セッションの続き（例: 9日前に中断した調査の話）を「今まさに
+    相手の返事待ち」と読み、沈黙し続ける（実測 2026-07-26・実起動状態のE2E: 25判定中24が
+    「直前に伝えたばかりで返事待ち」を理由に沈黙）。沈黙秒数はプロセス起動からの値なので、
+    会話がいつのものかはここでしか分からない。
+    """
+    n = now or now_iso()
     lines = []
     for t in turns or []:
         label = _SPEAKER_LABEL.get(getattr(t, "speaker", ""), getattr(t, "speaker", ""))
-        lines.append(f"[{label}] {getattr(t, 'text', '')}")
+        iso = getattr(getattr(t, "stamp", None), "iso", "") or ""
+        when = f"/{humanize(elapsed_wall(iso, n))}" if iso else ""
+        lines.append(f"[{label}{when}] {getattr(t, 'text', '')}")
     return "\n".join(lines) or "（直近の会話なし）"
 
 
-def _render_seeds(seeds) -> str:
-    lines = [f"・{getattr(c, 'text', '')}" for c in (seeds or [])]
+def _render_seeds(seeds, now: Optional[str] = None) -> str:
+    """話題の種の描画: **要約1行 + いつの記憶か**（応答文脈の `[話題の種/3日前]` と同じ時間接地）。
+
+    時刻を付けないと「そういえば*前に*」が言えない（5分前か3週間前か判定LLMに分からない）。
+    text 全文でなく1行要約なのは、text が「感情/次の予測/予測差/理由」を含む内部ログ形式で
+    話題として使えるのは先頭1行だけだから（実測: 平均162字中40字・2026-07-26）。
+    """
+    n = now or now_iso()
+    lines = []
+    for c in seeds or []:
+        body = c.seed_text() if hasattr(c, "seed_text") else getattr(c, "text", "")
+        iso = getattr(c, "iso", "")
+        when = f"[{humanize(elapsed_wall(iso, n))}] " if iso else ""
+        lines.append(f"・{when}{body}")
     return "\n".join(lines) or "（なし）"
 
 
@@ -175,7 +203,7 @@ def _render_active_tasks(active_tasks: Optional[list]) -> str:
 def build_decide_messages(
     *, surprise: int, silence_seconds: float, recent_turns, topic_seeds,
     last_feedback: Optional[str] = None, vision: Optional[str] = None,
-    active_tasks: Optional[list] = None,
+    active_tasks: Optional[list] = None, now: Optional[str] = None,
 ) -> list[dict]:
     fb = (last_feedback or "").strip() or "（なし）"
     screen = (vision or "").strip()
@@ -183,8 +211,8 @@ def build_decide_messages(
     tasks_block = _render_active_tasks(active_tasks)
     user = (
         "…\n\n"
-        f"# 直近の会話\n{_render_turns(recent_turns)}\n\n"
-        f"# 過去の記憶・話題の種（今の流れに合えば「そういえば前〜って言ってたね」と自然に話を広げてよい）\n{_render_seeds(topic_seeds)}\n\n"
+        f"# 直近の会話（[話者/いつの発話か]）\n{_render_turns(recent_turns, now)}\n\n"
+        f"# 過去の記憶・話題の種（今の流れに合えば「そういえば前〜って言ってたね」と自然に話を広げてよい）\n{_render_seeds(topic_seeds, now)}\n\n"
         f"# イブの今の状態（直近フィードバック: 感情/要約）\n{fb}"
         f"{screen_block}{tasks_block}\n\n"
         f"# 状況\n沈黙{silence_seconds:.0f}秒 / 予測差(surprise)={surprise}"
