@@ -6,7 +6,8 @@
 - FunctionDispatcher: submit 非ブロッキング・背景 worker 逐次・dedup_key・未対応 ok=False・stop drain。
 - ResponseOrchestrator: tool_calls 捕捉→応答完了後に submit / CALLFUNCTION_RESULT を「# 機能実行結果」へ
   （user 枠に repr を入れない）/ 1ホップ抑制（結果ターンに tools 無し・submit なし）/ barge-in で submit なし /
-  無発話(tool のみ)でも無クラッシュ / dispatcher=None で従来挙動（旧 stream_fn シグネチャ不変）。
+  無発話(tool のみ)は J-2 P2-1 のコードフォールバック相槌で無言を防ぐ（tool名別の定型文・
+  auto ログタグ） / dispatcher=None で従来挙動（旧 stream_fn シグネチャ不変）。
 
 実行: $env:PYTHONIOENCODING="utf-8"; python tests\test_callfunction_phase1.py
 """
@@ -86,6 +87,16 @@ class FakeDispatcher:
 
     def submit(self, tool_calls) -> None:
         self.submitted.append(list(tool_calls))
+
+
+class FakeDeliveryChecker:
+    """orchestrator 用: submit を記録するだけ（J-2 P1-1 配線テスト）。"""
+
+    def __init__(self) -> None:
+        self.submitted: list[tuple] = []
+
+    def submit(self, stimulus, *, recent_text, spoken_text) -> None:
+        self.submitted.append((stimulus, recent_text, spoken_text))
 
 
 class FakeRag:
@@ -329,6 +340,9 @@ async def t_orch_bargein_no_submit() -> bool:
 
 
 async def t_orch_toolonly_no_content() -> bool:
+    # J-2 P2-1: tool のみで発話ゼロだったターンはコードのフォールバック相槌が入る
+    # （未知/agent専用ツール名は既定の「うん。」・実測: gpt-5.4-mini は前置き無しでtoolだけ
+    # 呼ぶことが8回中6回あった＝プロンプトの必須化だけでは治らないためコードで保証）。
     Config.CALLFUNCTION_ENABLED = True
     try:
         audio = AudioPlayQueue(play_fn=_noop_play)
@@ -344,7 +358,138 @@ async def t_orch_toolonly_no_content() -> bool:
         w = asyncio.create_task(audio.play_worker())
         await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "調子？"))
         w.cancel()
-        return orch.last_response == "" and len(disp.submitted) == 1  # 無発話でも submit・無クラッシュ
+        return (
+            orch.last_response == "うん。"  # 既定フォールバック（無言にしない）
+            and len(disp.submitted) == 1  # submit は従来どおり・無クラッシュ
+        )
+    finally:
+        Config.CALLFUNCTION_ENABLED = False
+
+
+async def t_orch_toolonly_fallback_names_tool_specific_ack() -> bool:
+    # delegate_task/cancel_task は tool 名別の定型相槌（既存の応答文言と整合させる）。
+    Config.CALLFUNCTION_ENABLED = True
+    try:
+        audio = AudioPlayQueue(play_fn=_noop_play)
+        disp = FakeDispatcher([{"type": "function", "function": {"name": "delegate_task"}}])
+
+        async def stream_fn(messages, *, tools=None, tool_sink=None):
+            if tool_sink is not None:
+                tool_sink.append(_tc("c1", "delegate_task"))
+            return
+            yield
+
+        orch = ResponseOrchestrator(audio, stream_fn, _tts, dispatcher=disp)
+        w = asyncio.create_task(audio.play_worker())
+        await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "30秒後に教えて"))
+        w.cancel()
+        return orch.last_response == "やっとくね。"
+    finally:
+        Config.CALLFUNCTION_ENABLED = False
+
+
+async def t_delivery_checker_submitted_on_normal_completion() -> bool:
+    # J-2 P1-1: barge-in なしで完了した CALLFUNCTION_RESULT ターンは配達確認へ submit される。
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    dc = FakeDeliveryChecker()
+
+    async def stream_fn(messages):
+        yield "報告するね。"
+
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, delivery_checker=dc)
+    w = asyncio.create_task(audio.play_worker())
+    payload = CallFunctionResult("delegate_task", "30秒後の時刻は12:00だよ", True)
+    stim = Stimulus(StimulusKind.CALLFUNCTION_RESULT, payload, dedup_key="task:t1")
+    await orch.handle(stim)
+    w.cancel()
+    if len(dc.submitted) != 1:
+        return False
+    got_stim, recent_text, spoken_text = dc.submitted[0]
+    return got_stim is stim and spoken_text == "報告するね。"
+
+
+async def t_delivery_checker_not_submitted_for_user_utterance() -> bool:
+    # USER_UTTERANCE は配達確認の対象外（報告ターンではない）。
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    dc = FakeDeliveryChecker()
+
+    async def stream_fn(messages):
+        yield "うん、元気だよ。"
+
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, delivery_checker=dc)
+    w = asyncio.create_task(audio.play_worker())
+    await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "調子どう？"))
+    w.cancel()
+    return dc.submitted == []
+
+
+async def t_delivery_checker_not_submitted_on_cancelled_bargein() -> bool:
+    # task.cancel() での barge-in（CancelledError 経路）は配達確認を投げない
+    # （_maybe_redeliver 側が既にこのケースを担当・二重処理しない）。
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    dc = FakeDeliveryChecker()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_stream(messages):
+        started.set()
+        await release.wait()
+        yield "届かない"
+
+    orch = ResponseOrchestrator(audio, slow_stream, _tts, delivery_checker=dc)
+    payload = CallFunctionResult("delegate_task", "30秒後の時刻は12:00だよ", True)
+    task = asyncio.create_task(
+        orch.handle(Stimulus(StimulusKind.CALLFUNCTION_RESULT, payload, dedup_key="task:t1")))
+    await started.wait()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    return dc.submitted == []
+
+
+async def t_delivery_checker_not_submitted_on_generation_bargein() -> bool:
+    # 世代変化(audio.interrupt)のみで stream が break した正常経路（CancelledError でない）
+    # でも、gen 不一致なら配達確認へは投げない（_maybe_redeliver 側の担当・二重投入しない）。
+    audio = AudioPlayQueue(play_fn=_noop_play)
+    dc = FakeDeliveryChecker()
+
+    async def stream_fn(messages):
+        yield "まだ"  # 文末記号なし→ parts には未反映
+        audio.interrupt()
+        await asyncio.sleep(0)
+        yield "続き。"  # 次の delta で generation mismatch → break
+
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, delivery_checker=dc)
+    w = asyncio.create_task(audio.play_worker())
+    payload = CallFunctionResult("delegate_task", "30秒後の時刻は12:00だよ", True)
+    await orch.handle(Stimulus(StimulusKind.CALLFUNCTION_RESULT, payload, dedup_key="task:t1"))
+    w.cancel()
+    return dc.submitted == []
+
+
+async def t_orch_toolonly_fallback_skipped_on_bargein() -> bool:
+    # barge-in(世代変化) で stream_complete=False のまま終わった時は、フォールバックを足さない
+    # （not parts だけで判定すると誤ってフォールバックしてしまう穴を stream_complete ゲートで塞ぐ）。
+    Config.CALLFUNCTION_ENABLED = True
+    try:
+        audio = AudioPlayQueue(play_fn=_noop_play)
+        disp = FakeDispatcher([{"type": "function", "function": {"name": "delegate_task"}}])
+
+        async def stream_fn(messages, *, tools=None, tool_sink=None):
+            if tool_sink is not None:
+                tool_sink.append(_tc("c1", "delegate_task"))
+            yield "まだ"  # 文末記号なし→ splitter 未確定（parts には入らない）
+            audio.interrupt()  # ここで世代を進める＝barge-in 相当
+            await asyncio.sleep(0)
+            yield "続き。"  # 次の delta で generation mismatch → break（stream_complete=False のまま）
+
+        orch = ResponseOrchestrator(audio, stream_fn, _tts, dispatcher=disp)
+        w = asyncio.create_task(audio.play_worker())
+        await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "30秒後に教えて"))
+        w.cancel()
+        return orch.last_response == ""  # フォールバックも足されない
     finally:
         Config.CALLFUNCTION_ENABLED = False
 
@@ -395,7 +540,13 @@ async def main() -> None:
     check("Orch: tool_calls 捕捉→完了後 submit・前置きは発話", await t_orch_captures_and_submits())
     check("Orch: 結果は「# 機能実行結果」へ・1ホップ抑制", await t_orch_result_render_and_suppress())
     check("Orch: barge-in では submit しない", await t_orch_bargein_no_submit())
-    check("Orch: tool のみ(無発話)でも無クラッシュ・submit", await t_orch_toolonly_no_content())
+    check("J-2 P2-1: tool のみ(無発話)は既定フォールバック相槌", await t_orch_toolonly_no_content())
+    check("J-2 P2-1: delegate_task はtool名別の定型相槌", await t_orch_toolonly_fallback_names_tool_specific_ack())
+    check("J-2 P2-1: barge-in(stream未完走)はフォールバックしない", await t_orch_toolonly_fallback_skipped_on_bargein())
+    check("J-2 P1-1: barge-inなし完了は配達確認へsubmit", await t_delivery_checker_submitted_on_normal_completion())
+    check("J-2 P1-1: USER_UTTERANCEは配達確認の対象外", await t_delivery_checker_not_submitted_for_user_utterance())
+    check("J-2 P1-1: CancelledError barge-inはsubmitしない", await t_delivery_checker_not_submitted_on_cancelled_bargein())
+    check("J-2 P1-1: 世代変化barge-inはsubmitしない", await t_delivery_checker_not_submitted_on_generation_bargein())
     check("Orch: 結果は content で RAG 検索(repr 不使用)", await t_orch_result_rag_uses_content())
     check("Orch: dispatcher=None で従来挙動(旧シグネチャ)", await t_orch_no_dispatcher_unchanged())
     check("Fix#2: 予約タスク一覧を全刺激種別の system に注入", await t_orch_tasks_injected_all_kinds())

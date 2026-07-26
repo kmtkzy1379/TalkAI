@@ -16,7 +16,7 @@ import logging
 from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable, Optional
 
 from ..config import Config
-from ..context_assembler import ContextAssembler, RagChunk, Turn
+from ..context_assembler import OMITTED_SPEAKER, ContextAssembler, RagChunk, Turn
 from ..pipeline.audio_play_queue import AudioPlayQueue
 from ..pipeline.stimulus import CallFunctionResult, Stimulus, StimulusKind
 from ..speech.decider import AutonomousSpeech
@@ -40,6 +40,36 @@ REDELIVER_MAX_SPOKEN_CHARS = 5
 # 再配達の上限回数（マイクノイズ等で barge-in が連発しても無限に再試行しない）。
 REDELIVER_MAX_ATTEMPTS = 2
 
+# J-2 P2-1: 機能呼び出しのみで発話ゼロの無言ターン対策（フォールバック相槌）。
+# 応答LLM(gpt-5.4-mini 系)は前置き無しで tool だけ呼ぶことがある（実測 8回中6回・
+# プロンプトの必須化だけでは治らない＝規律はコードで強制）。tool_schemas() で応答LLMに
+# 見えるのは delegate_task/cancel_task のみ（他は agent_tool 専用で tool_sink に出ない）。
+_FALLBACK_ACK = {"delegate_task": "やっとくね。", "cancel_task": "確認するね。"}
+_DEFAULT_ACK = "うん。"
+
+
+def _fallback_ack(tool_sink: list) -> str:
+    """機能呼び出しのみで発話が空だったターン用の最小限の相槌（J-2 P2-1）。"""
+    for tc in tool_sink:
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        name = (fn or {}).get("name") if fn else None
+        if name in _FALLBACK_ACK:
+            return _FALLBACK_ACK[name]
+    return _DEFAULT_ACK
+
+
+def _render_recent(turns: Optional[list]) -> str:
+    """J-2 P1-1: 配達確認 judge へ渡す直近会話の簡易描画（省略マーカは除く）。"""
+    if not turns:
+        return ""
+    lines = []
+    for t in turns:
+        if getattr(t, "speaker", None) == OMITTED_SPEAKER:
+            continue
+        label = "イブ" if getattr(t, "speaker", None) == "eve" else "ユーザ"
+        lines.append(f"[{label}] {getattr(t, 'text', '')}")
+    return "\n".join(lines)
+
 
 class ResponseOrchestrator:
     def __init__(
@@ -57,6 +87,7 @@ class ResponseOrchestrator:
         dispatcher=None,  # J 任意: FunctionDispatcher（tool_calls を応答完了後に submit）
         tasks_provider: Optional[Callable[[], list[str]]] = None,  # J-1 任意: 予約タスク一覧（整形済み行）
         redeliver_fn: Optional[Callable[[Stimulus], None]] = None,  # 任意: 潰れた報告の再投入（同期・非ブロッキング）
+        delivery_checker=None,  # J-2 P1-1 任意: barge-in なしで完了した報告ターンの配達確認サイドカー
     ) -> None:
         self._audio = audio
         self._stream_fn = stream_fn
@@ -82,6 +113,8 @@ class ResponseOrchestrator:
         # 任意注入: barge-in で発話前に潰れた CALLFUNCTION_RESULT を再投入するコールバック。
         # 「いつ再投入するか」（ユーザ発話が先に並ぶ保証）は提供側（VoiceLoop）が所有する。
         self._redeliver_fn = redeliver_fn
+        # 任意注入(J-2 P1-1): barge-in の有無に関わらず、報告内容が実際に発話されたか確認するサイドカー。
+        self._delivery_checker = delivery_checker
         self.last_response = ""  # 生成済み全文（自然さの目視・テスト用。記憶には使わない＝C5）
 
     def _tools_enabled_for(self, stimulus: Stimulus) -> bool:
@@ -95,6 +128,15 @@ class ResponseOrchestrator:
             and stimulus.kind == StimulusKind.USER_UTTERANCE
         )
 
+    def _vision_for(self, stimulus: Stimulus) -> Optional[str]:
+        """この刺激の応答文脈に入れる画面情報（層分離の唯一の分岐点）。"""
+        if self._vision_state is None:
+            return None
+        if stimulus.kind == StimulusKind.USER_UTTERANCE:
+            return self._vision_state.vision_for_user(
+                Config.VLM_VISION_TTL_SEC, Config.VLM_STATIC_VISION_MAX_SEC)
+        return self._vision_state.fresh_vision(Config.VLM_VISION_TTL_SEC)
+
     def _build_messages(
         self,
         stimulus: Stimulus,
@@ -102,8 +144,12 @@ class ResponseOrchestrator:
         rag_chunks: Optional[list[RagChunk]] = None,
     ) -> list[dict]:
         last_feedback = self._state.last_feedback if self._state is not None else None
-        # 鮮度 TTL 内の画面のみ注入（古い画面は渡さない＝明らか過去を参照させない）。
-        vision = self._vision_state.fresh_vision(Config.VLM_VISION_TTL_SEC) if self._vision_state is not None else None
+        # 画面の注入は**刺激種別で鮮度の意味を変える**（層分離）:
+        # - USER 発話: 変化していない間は据え置き可（静止画面でも「今何が見える?」に答えられる。
+        #   注入文言に「N秒前・以降変化なし」が付くので捏造にならない）。
+        # - 自発発話/機能報告: 鮮度 TTL 内＝「今さっき変化した画面」だけ。静止中に画面が入り続けて
+        #   同じ画面要素の話を繰り返す固執を断つ（実機実測で判定136回中135回に画面が入っていた）。
+        vision = self._vision_for(stimulus)
         # F5 自発発話: payload は AutonomousSpeech(content, reason)。content は**ユーザ発話でなく
         # イブ自身の下書き**として autonomous_content へ（ユーザ枠に入れると応答LLMが自分の発話に
         # 返事して話者を取り違える＝Fix3）。reason は発話判定理由。USER 等は従来どおり user_text。
@@ -209,6 +255,26 @@ class ResponseOrchestrator:
         except Exception:
             logger.exception("再配達の予約に失敗（この報告は断念）")
 
+    def _maybe_check_delivery(self, stimulus: Stimulus, gen: int, spoken: list[str], recent) -> None:
+        """J-2 P1-1: barge-in **なし**で完了した機能報告ターンが、実際に内容を伝えたか確認する。
+
+        barge-in された場合は `_maybe_redeliver` が既に再配達を判断する（世代変化が条件）ため、
+        ここは「正常完了はしたが報告内容に触れず終わった」（例: 直前の別発話への返事を優先した）
+        という barge-in では捉えられないケースだけを対象にする。判定はサイドカーへ投げて
+        非ブロッキングで返る（LLM 呼び出しで本ターンの完了を遅らせない）。
+        """
+        if self._delivery_checker is None or stimulus.kind != StimulusKind.CALLFUNCTION_RESULT:
+            return
+        if not isinstance(stimulus.payload, CallFunctionResult):
+            return
+        if self._audio.current_generation() != gen:
+            return  # barge-in された（_maybe_redeliver 側の担当・二重投入しない）
+        try:
+            self._delivery_checker.submit(
+                stimulus, recent_text=_render_recent(recent), spoken_text="".join(spoken))
+        except Exception:
+            logger.exception("配達確認の投入に失敗（この報告の確認は断念）")
+
     async def handle(self, stimulus: Stimulus) -> None:
         gen = self._audio.current_generation()
         # 記憶: 現ターンを記録する**前**に直近会話をスナップショット（現発話が二重表示されない）。
@@ -275,11 +341,13 @@ class ResponseOrchestrator:
                 # on_played は「実際に再生し終えた時」だけ呼ばれる → spoken に積む（C5）。
                 self._audio.enqueue(gen, seq, wav, text=sentence, on_played=spoken.append)
 
-        def _emit(sentence: str) -> None:
+        def _emit(sentence: str, *, auto: bool = False) -> None:
             clean = sanitize_for_speech(sentence)  # 残留マークダウン除去（コードゲート）
             if not clean:
                 return  # 記号だけの行は読み上げない
-            logger.info("🤖 %s", clean)  # 文ごとに表示（ストリーミング表示）
+            # J-2 P2-1: auto=True(コード生成のフォールバック相槌)はログタグで区別する
+            # （発話内容・記憶には印を付けない＝会話文脈を汚さない。デバッグ識別専用）。
+            logger.info("🤖(auto-ack) %s" if auto else "🤖 %s", clean)
             parts.append(clean)
             seq = self._audio.reserve_seq(gen)  # stream 順に予約（再生は seq 昇順）
             tasks.append(asyncio.create_task(_tts_and_enqueue(seq, clean)))
@@ -304,6 +372,10 @@ class ResponseOrchestrator:
             except Exception:
                 # A3: LLM/stream の一時エラーは起こりうる → ログして途中までで打ち切り、継続。
                 logger.exception("応答生成中にエラー（途中までで打ち切り）")
+            if stream_complete and tool_sink and not parts:
+                # J-2 P2-1: 機能を呼びつつ発話ゼロで終わったターンへの最小限のフォールバック
+                # （barge-in等で stream_complete=False の時は追加しない＝古い世代を起こさない）。
+                _emit(_fallback_ack(tool_sink), auto=True)
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             self.last_response = "".join(parts)
@@ -323,6 +395,9 @@ class ResponseOrchestrator:
             # parts は stream 完走時のみ「全文」として渡す（途中 break の parts と spoken が偶然
             # 一致しても「短い前置きだけ再生済み＝配達済み」と誤判定しないため）。
             self._maybe_redeliver(stimulus, gen, spoken, parts if stream_complete else [])
+            # J-2 P1-1: barge-in が無かった（gen 不変）場合のみ、内容を実際に伝えたか確認する
+            # （barge-in された分は上の _maybe_redeliver が担当・二重チェック/二重配達を避ける）。
+            self._maybe_check_delivery(stimulus, gen, spoken, recent)
         except asyncio.CancelledError:
             # barge-in: ここまでに**実際に喋った分だけ**を記憶に記録（生成途中の文は残さない）。
             _record_eve()

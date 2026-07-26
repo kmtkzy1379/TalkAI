@@ -23,13 +23,14 @@ from .pipeline.orchestrator import PipelineRunner
 from .pipeline.stimulus import StimulusKind
 from .pipeline.stimulus_queue import StimulusQueue
 from .capability import CapabilityRegistry
+from .response.delivery_checker import DeliveryChecker
 from .response.function_dispatcher import FunctionDispatcher
 from .task import (
     CancelResolver, ReconcileTimer, TaskAgent, TaskExecutor, TaskStore,
     active_tasks_for_context, register_task_capabilities,
 )
 from .response.input_source import MicSttInputSource
-from .response.orchestrator import ResponseOrchestrator
+from .response.orchestrator import REDELIVER_MAX_ATTEMPTS, ResponseOrchestrator
 from .response.player import RealAudioPlayer
 from .response.style import SPEECH_STYLE
 from .response.tts import VoicevoxTTS
@@ -51,7 +52,9 @@ class VoiceLoop:
         self.tts = VoicevoxTTS()
         self.stt = make_stt()
         self.cache = ConversationCache()  # 短期記憶（会話ログ・直近注入・実発話記録）
-        self.rag = RagStore(make_embedder())  # 長期記憶（連想想起）
+        # 埋め込みは RAG と自発発話の同内容抑制（意味の重複）で共有する（モデルの二重ロードを避ける）。
+        self.embedder = make_embedder()
+        self.rag = RagStore(self.embedder)  # 長期記憶（連想想起）
 
         # F4 内分泌系: 各応答後に非同期で内省 → RAG 書込 + surprise + 直近フィードバック注入。
         self.prediction = PredictionState()  # loop 所有・単一書込（feedback/VLM が書く）
@@ -68,6 +71,12 @@ class VoiceLoop:
             prediction_state=self.prediction, queue=self.queue,
             decide_fn=make_decide_fn(self.registry),  # role=speech_decide
             vision_state=self.vision_state,  # F6: 発話判定に直近画面を入れる
+            embedder=self.embedder,  # J-2 ②-2: 言い換えただけの再提案を意味類似で抑える二段目
+            # J-2 P2-3: self.task_store は下の TASK_ENABLED ブロックで後から確定するため、
+            # 呼び出し時点の値を読む遅延 lambda にする（is_busy=lambda: self.runner... と同じ流儀）。
+            tasks_provider=lambda: (
+                active_tasks_for_context(self.task_store) if self.task_store is not None else None
+            ),
         )
 
         # F6 VLM サイドカー: 専用スレッドが capture→gate→on_frame、single-flight worker が
@@ -75,7 +84,7 @@ class VoiceLoop:
         self.vlm_worker = VlmWorker(
             vision_state=self.vision_state, prediction_state=self.prediction,
             narrate_fn=make_narrate_fn(self.registry),  # role=vlm_leaf
-            speak_trigger=self.speech_decider.trigger,
+            speak_trigger=lambda: self.speech_decider.trigger("vlm"),  # source は観測用（③分析の反省）
             speak_guard=self._vision_can_speak,  # A5/Q4: busy/ユーザ発話中/decider 処理中なら叩かない
             frames_per_call=Config.VLM_MAX_FRAMES_PER_CALL,
             min_interval_sec=Config.VLM_MIN_INTERVAL_SEC,
@@ -97,6 +106,12 @@ class VoiceLoop:
             qsize=lambda: self.queue.qsize(),
         )
         self.dispatcher = FunctionDispatcher(registry=self.capabilities, queue=self.queue)
+        # J-2 P1-1: barge-in なしで完了した機能報告ターンの配達確認（redeliver_fn は下で定義する
+        # self._redeliver_stimulus をそのまま束縛・既存の再配達経路を再利用する）。
+        self.delivery_checker = DeliveryChecker(
+            model_registry=self.registry, redeliver_fn=self._redeliver_stimulus,
+            max_attempts=REDELIVER_MAX_ATTEMPTS,
+        )
 
         # J-1 タスク管理（既定 off・CALLFUNCTION_ENABLED 前提）: read-only 能力に予約/自動実行を足す。
         # create_task/list_tasks/cancel_task は同じ registry に登録＝dispatcher 経由で応答LLM に提示される。
@@ -140,7 +155,9 @@ class VoiceLoop:
                     logger.warning("SEARCH_ENABLED=1 だが ddgs 未導入のため検索を無効化（pip install ddgs）")
                 else:
                     from .search import SearchClient, register_search_capability
-                    self.search_client = SearchClient()
+                    from .search.deep import DeepResearcher
+                    self.search_client = SearchClient(
+                        deep_researcher=DeepResearcher(self.registry))  # inc2: 隔離要約はツールなしロール
                     register_search_capability(self.capabilities, self.search_client)
         elif Config.SEARCH_ENABLED:
             logger.warning("SEARCH_ENABLED=1 だが TASK_ENABLED=0 のため検索は無効（TaskAgent 専用能力）")
@@ -168,6 +185,7 @@ class VoiceLoop:
             dispatcher=self.dispatcher,  # J: tool_calls を応答完了後に submit（gate は CALLFUNCTION_ENABLED）
             tasks_provider=tasks_provider,  # J-1/Fix#2: 予約タスク状態の毎ターン注入（TASK_ENABLED 時のみ）
             redeliver_fn=self._redeliver_stimulus,  # barge-in で潰れたタスク報告の再配達（WHEN はこちらが所有）
+            delivery_checker=self.delivery_checker,  # J-2 P1-1: barge-in なし完了ターンの配達確認
         )
         self.runner = PipelineRunner(self.queue, self.orchestrator, self.audio)
         # 沈黙監視は応答中(runner busy)/ユーザ発話中は発火しない（is_busy をガードに使う）。
@@ -178,6 +196,8 @@ class VoiceLoop:
             self.queue, self.stt,
             on_speech_start=self._barge_in,                      # ユーザ発話開始（barge-in）
             on_utterance=self.speech_state.mark_user_utterance,  # 発話終了→沈黙時計リセット
+            on_stt_start=self.speech_state.mark_stt_pending,     # J-2 ③-A: STT待ち窓を開く
+            on_stt_end=self.speech_state.clear_stt_pending,      # J-2 ③-A: 投入完了で窓を閉じる
         )
         self._tasks: list[asyncio.Task] = []
         # 再配達（barge-in で潰れた機能報告）の待機タスク。done で自己除去・stop() で cancel。
@@ -229,10 +249,15 @@ class VoiceLoop:
         task.add_done_callback(self._redeliver_waiters.discard)
 
     def _vision_can_speak(self) -> bool:
-        """F6 画面起因の発話ガード（A5/Q4）: 応答中/ユーザ発話中/判定処理中なら起こさない。"""
+        """F6 画面起因の発話ガード（A5/Q4）: 応答中/ユーザ発話中/STT待ち/判定処理中なら起こさない。
+
+        stt_pending は J-2 ③-A: VLM 経由トリガは沈黙5秒閾値を迂回するため、発話終了〜STT完了の
+        窓（1〜3秒）に自発発話が差し込まれ、直後に届くユーザ発話の処理を遅らせていた（E2E S8）。
+        """
         return (
             not self.runner.is_busy()
             and not self.speech_state.user_speaking
+            and not self.speech_state.stt_pending
             and self.speech_decider.is_idle()
         )
 
@@ -275,6 +300,7 @@ class VoiceLoop:
         # J: Call-Function 実行サイドカー（既定 off）。read-only 能力のみ。
         if Config.CALLFUNCTION_ENABLED:
             self.dispatcher.start()
+            self.delivery_checker.start()  # J-2 P1-1: 報告ターンの配達確認
             logger.info("Call-Function 稼働（read-only 能力）")
         # J-1: タスク管理（既定 off）。store 復元 + executor/scheduler 起動。
         if self.task_store is not None:
@@ -324,6 +350,12 @@ class VoiceLoop:
         # J: Call-Function 実行サイドカーを drain/停止（進行中の能力実行を取りこぼさない）。
         try:
             await self.dispatcher.stop()
+        except Exception:
+            pass
+        # J-2 P1-1: 配達確認サイドカーを drain/停止（進行中の判定が再配達を予約する猶予を与える。
+        # 予約された再配達タスクは _redeliver_waiters に乗るので下の孤児化防止で回収される）。
+        try:
+            await self.delivery_checker.stop()
         except Exception:
             pass
         # J-1: タスク管理を停止（取消解決 drain→timer 停止→executor drain→store flush の順）。

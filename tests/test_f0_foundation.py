@@ -94,5 +94,17 @@ check("ctx ユーザ発話は user ロール末尾", msgs[-1]["role"] == "user" 
 check("ctx 過去発話は assistant/user ロール", any(m["role"] == "user" and "昔これ言った" in m["content"] for m in msgs))
 check("ctx system に SYS とロールアンカー", "SYS" in sysmsg and "イブ" in sysmsg)
 
+# J-2 ①: tools_active ブロックに「追加依頼は新しい部分だけを自己完結で委譲・実行中の内容を
+# goal に再包含しない」指示が入る（superset goal 重複タスクの回帰ガード）。
+tool_sys = ContextAssembler(system_prompt="SYS").assemble(
+    user_text="それと沖縄の人口も", tools_active=True,
+)[0]["content"]
+check("J-2 ①: 委譲 goal は自己完結の指示", "それ単体で意味が通る一文" in tool_sys)
+check("J-2 ①: 追加依頼は新しい部分だけ・実行中を再包含しない",
+      "新しく頼む部分だけ" in tool_sys and "再依頼しない" in tool_sys)
+# tools_active=False（自発発話/報告ターン等）ではブロックを出さない（1ホップ抑制と整合）。
+notool_sys = ContextAssembler(system_prompt="SYS").assemble(user_text="x", tools_active=False)[0]["content"]
+check("J-2 ①: tools 無効時は機能ブロックを出さない", "Call-Function" not in notool_sys)
+
 print(f"\n合計: PASS {_passed} / FAIL {_failed}")
 sys.exit(1 if _failed else 0)

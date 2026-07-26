@@ -83,14 +83,15 @@ async def should_speak(
     decide_fn: DecideFn,
     last_feedback: Optional[str] = None,  # イブの今の感情/要約（直近フィードバック）
     vision: Optional[str] = None,  # F6 直近の画面ナレーション（あれば判定材料に・None なら無し）
+    active_tasks: Optional[list] = None,  # J-2 P2-3 実行中タスク一覧（あれば材料に・None なら無し）
     pending_obligation: bool = False,
 ) -> SpeechDecision:
     if pending_obligation:
         # 唯一の hard ゲート（事実: 予約締切等。感情でないのでここだけ確定で沈黙）。
         # 将来 Call-Function/task が締切近接を計算して渡す（今は常に False）。
         return SpeechDecision(False, "保留中の予約/義務があるため沈黙", "")
-    # surprise + 感情(last_feedback) + 会話 + 話題の種 (+ 画面) を渡し、LLM が総合判断。
-    # vision は **非 None の時だけ** 転送する（A6: vision を受けない既存 decide_fn を壊さない）。
+    # surprise + 感情(last_feedback) + 会話 + 話題の種 (+ 画面 + 実行中タスク) を渡し、LLM が総合判断。
+    # vision/active_tasks は **非 None の時だけ** 転送する（A6: 受けない既存 decide_fn を壊さない）。
     kwargs = dict(
         surprise=surprise,
         silence_seconds=silence_seconds,
@@ -100,6 +101,8 @@ async def should_speak(
     )
     if vision is not None:
         kwargs["vision"] = vision
+    if active_tasks is not None:
+        kwargs["active_tasks"] = active_tasks
     d = await decide_fn(**kwargs)
     if d.speak and not (d.content or "").strip():
         # 話す判断だが content が空 → 全 speak 経路で最小ヒントを保証（応答LLMが膨らませる）。
@@ -119,13 +122,18 @@ SPEECH_DECIDE_SYSTEM = """\
 - 画面の内容を**過去の記憶と結びつける**（例:「前にチーズケーキ好きって言ってたね、これ良さそう」）。
 - 画面で相手が**探している/迷っているものに気づいて手伝う**（例:「スポッチャ、室内で雨でも遊べていいね」）。
 - 直近の会話を一歩進める／関連する**新しい話題を記憶から**振る／相手が一息ついた間に声をかける。
-- 画面が**代わり映えしない／「変化なし」が続く**ときは、相手の手が空いている合図。画面に無理に触れず、**過去の記憶や前の話題からそっと一言**振ってよい（「そういえば前に〜って言ってたね」）。
+- 「# 画面」ブロックが**無い**ときは、直近に画面の変化が無い（＝今の画面については何も分かっていない）。
+  画面の話はせず、**本当に良い一言が記憶や会話からある時だけ**にする（無ければ黙る方が自然）。
 
 【黙る(no)】
 - **直前にイブが自分から話して、相手がまだ返事していない**（畳みかけない・間を空けて相手の番を待つ）。
 - 本当に言うことがない／さっきと同じことの繰り返しになる。
-- 相手が**今まさに手を動かして**作業に没頭している（入力中・操作中で画面が動いている）など、口を挟むと**邪魔になりそう**な時。※**画面が止まっているだけで「集中中」と決めつけない**（静止＝手が空いている合図のこともある）。
+- 相手が**今まさに手を動かして**作業に没頭している（入力中・操作中で画面が動いている）など、口を挟むと**邪魔になりそう**な時。※画面の情報が無い時は画面について何も推測しない（止まっている＝手が空いている、とも、集中中、とも決めつけない）。
+- **画面に新しい変化が無いのに、こちらから画面の話題を持ち出さない**（変化していない画面に急に話しかけるのは不自然。「# 画面」ブロックが無い時に画面の話をするのは捏造になる）。
 - 相手が**疲れていたり休みたそう**な時（「疲れた」等の直後）は、話題を増やさずそっとしておく。
+- **実行中のタスク（検索/調べ物等）が扱っている内容そのものを、自分の知識で先回りして答えない**
+  （結果は完了後に別途届く。今ここで自分の記憶/知識から答えると、届く結果と食い違ったり
+  二重に伝わったりする。「まだ調べてるところだよ」等、進行に触れる一言は話してよい）。
 
 【禁止】
 - **毎回は話しかけない**。本当に良い一言・気の利いた一言がある時だけに絞る（質問の連投・実況の垂れ流しはしない）。
@@ -152,19 +160,33 @@ def _render_seeds(seeds) -> str:
     return "\n".join(lines) or "（なし）"
 
 
+def _render_active_tasks(active_tasks: Optional[list]) -> str:
+    """J-2 P2-3: 実行中タスクの簡易描画。None=ブロック自体を出さない（active_tasks_for_context
+    と同じ規約: 空リスト=ゼロ件を明示 / None=タスク機能未配線でブロック自体を注入しない）。"""
+    if active_tasks is None:
+        return ""
+    body = "\n".join(active_tasks) if active_tasks else "（実行中の予約タスクは無い）"
+    return (
+        "\n\n# 実行中のタスク（検索/調べ物等。結果は完了後に別途届く。今ここでは先回りして"
+        f"答えない）\n{body}"
+    )
+
+
 def build_decide_messages(
     *, surprise: int, silence_seconds: float, recent_turns, topic_seeds,
     last_feedback: Optional[str] = None, vision: Optional[str] = None,
+    active_tasks: Optional[list] = None,
 ) -> list[dict]:
     fb = (last_feedback or "").strip() or "（なし）"
     screen = (vision or "").strip()
     screen_block = f"\n\n# 画面（今この瞬間）\n{screen}" if screen else ""
+    tasks_block = _render_active_tasks(active_tasks)
     user = (
         "…\n\n"
         f"# 直近の会話\n{_render_turns(recent_turns)}\n\n"
         f"# 過去の記憶・話題の種（今の流れに合えば「そういえば前〜って言ってたね」と自然に話を広げてよい）\n{_render_seeds(topic_seeds)}\n\n"
         f"# イブの今の状態（直近フィードバック: 感情/要約）\n{fb}"
-        f"{screen_block}\n\n"
+        f"{screen_block}{tasks_block}\n\n"
         f"# 状況\n沈黙{silence_seconds:.0f}秒 / 予測差(surprise)={surprise}"
         "（指標。高=思考/感情が高ぶる・低=安定。これだけで決めない）"
     )
@@ -177,10 +199,12 @@ def build_decide_messages(
 def make_decide_fn(registry) -> DecideFn:
     """ModelRegistry role=speech_decide を叩く本番 decide_fn を作る。"""
 
-    async def decide_fn(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None, vision=None) -> SpeechDecision:
+    async def decide_fn(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None,
+                        vision=None, active_tasks=None) -> SpeechDecision:
         messages = build_decide_messages(
             surprise=surprise, silence_seconds=silence_seconds,
-            recent_turns=recent_turns, topic_seeds=topic_seeds, last_feedback=last_feedback, vision=vision,
+            recent_turns=recent_turns, topic_seeds=topic_seeds, last_feedback=last_feedback,
+            vision=vision, active_tasks=active_tasks,
         )
         try:
             resp = await registry.complete("speech_decide", messages)

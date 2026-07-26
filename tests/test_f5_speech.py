@@ -30,6 +30,7 @@ from eve.speech import (  # noqa: E402
     SpeechDecider,
     SpeechDecision,
     SpeechState,
+    build_decide_messages,
     make_decide_fn,
     parse_speech_decision,
     should_speak,
@@ -166,6 +167,48 @@ async def t_last_feedback_passed_to_decider() -> bool:
     return seen.get("fb") == "楽しい気分"
 
 
+# ===== J-2 P2-3: 実行中タスクを判定材料に渡す（先回り回答の防止） =====
+async def t_active_tasks_passed_to_decider() -> bool:
+    seen: dict = {}
+
+    async def capture(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None,
+                      active_tasks=None):
+        seen["tasks"] = active_tasks
+        return SpeechDecision(False, "r", "")
+
+    await should_speak(surprise=20, silence_seconds=5, recent_turns=[], topic_seeds=[],
+                       decide_fn=capture, active_tasks=["・「モンハンの検索」（実行中）"])
+    return seen.get("tasks") == ["・「モンハンの検索」（実行中）"]
+
+
+async def t_active_tasks_not_forwarded_when_none() -> bool:
+    # A6 と同じ規約: active_tasks=None(既定)の時は既存 decide_fn(active_tasks 未対応)を壊さない。
+    async def legacy_decide_fn(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None):
+        return SpeechDecision(True, "r", "x")
+
+    d = await should_speak(surprise=20, silence_seconds=5, recent_turns=[], topic_seeds=[],
+                           decide_fn=legacy_decide_fn)
+    return d.speak is True  # TypeError にならない
+
+
+def t_build_decide_messages_active_tasks_block() -> bool:
+    with_tasks = build_decide_messages(
+        surprise=10, silence_seconds=5, recent_turns=[], topic_seeds=[],
+        active_tasks=["・「富士山の標高」（実行中）"],
+    )[1]["content"]
+    zero_tasks = build_decide_messages(
+        surprise=10, silence_seconds=5, recent_turns=[], topic_seeds=[], active_tasks=[],
+    )[1]["content"]
+    no_block = build_decide_messages(
+        surprise=10, silence_seconds=5, recent_turns=[], topic_seeds=[],
+    )[1]["content"]
+    return (
+        "実行中のタスク" in with_tasks and "富士山の標高" in with_tasks
+        and "実行中のタスク" in zero_tasks and "実行中の予約タスクは無い" in zero_tasks
+        and "実行中のタスク" not in no_block  # None=ブロック自体を出さない
+    )
+
+
 # ===== パーサ =====
 def t_parse_yes() -> bool:
     d = parse_speech_decision("speak: yes\nreason: 話題がある\ncontent: 今日いい天気だね")
@@ -281,7 +324,7 @@ class _FakeDecider:
         self.triggers = 0
         self._idle = True
 
-    def trigger(self) -> None:
+    def trigger(self, source: str = "unknown") -> None:
         self.triggers += 1
 
     def is_idle(self) -> bool:
@@ -339,6 +382,351 @@ def t_monitor_guards() -> bool:
     )
 
 
+# ===== J-2 ②-1: 同内容の自発発話の抑制（コードゲート） =====
+# 実E2Eで観測された重複ペア（回帰の一次データそのもの）
+_DUP_A1 = "さっきの3つ、比べるとスカイツリーよりエベレストはかなり高いし、琵琶湖は面積で見るとまた別の大きさ感があって面白いね。"
+_DUP_A2 = "さっきの3つって、比べるとスカイツリーは高さの目安になって、エベレストは本当に別格だし、琵琶湖は面積で考えるとまた違うスケール感があって面白いね。"
+_DUP_B1 = "へえ、よかったんだね。どんな味だったのか気になるよ。"
+_DUP_B2 = "そのラーメン、どんな味だったのか気になるよ。こってり系だったのか、あっさり系だったのかも知りたいな。"
+_DIFF_1 = "そういえば前にチーズケーキが好きって言ってたよね。最近食べた？"
+_DIFF_2 = "まだ動いてるね、30秒の通知を待ってる間はこのまま見守るよ。"
+
+
+def t_content_similarity_calibration() -> bool:
+    from eve.speech.monitor import DUP_SIM_THRESHOLD, content_similarity
+    th = DUP_SIM_THRESHOLD
+    return (
+        content_similarity(_DUP_A1, _DUP_A2) >= th  # S10 重複ペア（実測0.453）
+        and content_similarity(_DUP_B1, _DUP_B2) >= th  # ラーメン2連発（実測0.286）
+        and content_similarity(_DUP_A1, _DIFF_1) < th  # 別話題（実測≤0.074）
+        and content_similarity(_DUP_A1, _DIFF_2) < th
+        and content_similarity(_DIFF_1, _DIFF_2) < th
+        and content_similarity("", _DUP_A1) == 0.0  # 空は常に0（ゼロ除算なし）
+    )
+
+
+async def t_decider_suppresses_duplicate_content() -> bool:
+    # 1回目 speak→投入 / 2回目 ほぼ同内容→抑制（投入なし・理由と下書きを記録）/ 3回目 別内容→投入。
+    state = SpeechState()
+    cache = ConversationCache(history_file=_tmp())
+    await cache.initialize()
+    cache.add_turn("user", "こんにちは")
+    rag = _store()
+    pred = PredictionState()
+    contents = [_DUP_A1, _DUP_A2, _DIFF_1]
+    calls = [0]
+
+    async def fake_decide(*, surprise, silence_seconds, recent_turns, topic_seeds,
+                          last_feedback=None, active_tasks=None):
+        c = contents[min(calls[0], len(contents) - 1)]
+        calls[0] += 1
+        return SpeechDecision(True, "話す", c)
+
+    q = StimulusQueue()
+    dec = SpeechDecider(state=state, cache=cache, rag=rag, prediction_state=pred,
+                        queue=q, decide_fn=fake_decide)
+    dec.start()
+    delivered = []  # 各回で drain（AUTONOMOUS は merge_key で畳まれるため qsize 累積では数えない）
+    for _ in range(3):
+        dec.trigger()
+        await asyncio.sleep(0.05)
+        while q.qsize() > 0:
+            delivered.append((await q.get()).payload.content)
+    await dec.stop()
+    await cache.shutdown()
+    log = list(state.speech_log)
+    suppressed = [e for e in log if "抑制" in e["reason"]]
+    return (
+        delivered == [_DUP_A1, _DIFF_1]  # 1回目と3回目だけ投入（2回目は抑制）
+        and len(suppressed) == 1
+        and suppressed[0]["speak"] is False
+        and suppressed[0]["content"] == _DUP_A2  # 何を言おうとしたかは記録に残す
+    )
+
+
+# ===== J-2 ②-2: 比較元を「自発発話専用の時間窓」に分離 + 意味の二段目 =====
+# 実E2E(2026-07-23 e2e_autospeech)で観測された「語彙を変えただけの再提案」ペア。
+# 文字bigram では 0.23 で閾値 0.25 をすり抜けた＝二段目（埋め込み）が要る理由の一次データ。
+_PARA_1 = "買い物リスト、必要なら抜け漏れだけさらっと一緒に確認するよ。"
+_PARA_2 = "じゃあ、次は買い物リストを軽く見て、抜けてるものだけさらっと確認しよっか。"
+
+
+class _FakeEmbedder:
+    """注入用 embedder（実モデルなし・決定論）。text→固定ベクトルの表引き。"""
+
+    def __init__(self, table: dict):
+        self.table = table
+        self.calls = 0
+
+    async def embed_query(self, text: str):
+        self.calls += 1
+        return self.table[text]
+
+
+class _BoomEmbedder:
+    async def embed_query(self, text: str):
+        raise RuntimeError("埋め込み失敗（テスト）")
+
+
+def t_cosine_basic() -> bool:
+    from eve.speech.monitor import cosine
+    return (
+        abs(cosine([1.0, 0.0], [1.0, 0.0]) - 1.0) < 1e-9
+        and abs(cosine([1.0, 0.0], [0.0, 1.0])) < 1e-9
+        and cosine([], [1.0]) == 0.0  # 長さ違い/空は0（例外にしない）
+        and cosine([0.0, 0.0], [1.0, 0.0]) == 0.0  # ゼロ除算なし
+    )
+
+
+def t_paraphrase_slips_bigram() -> bool:
+    # 二段目が必要な理由の回帰仕様: 同内容の言い換えは文字bigram では閾値未満（実測0.23）
+    from eve.speech.monitor import DUP_SIM_THRESHOLD, content_similarity
+    return content_similarity(_PARA_1, _PARA_2) < DUP_SIM_THRESHOLD
+
+
+async def _run_decider(state, contents, *, embedder=None, hook=None) -> tuple[list, list]:
+    """contents を順に返す fake decide で decider を回し、(投入内容, 発話判定ログ) を返す。"""
+    cache = ConversationCache(history_file=_tmp())
+    await cache.initialize()
+    cache.add_turn("user", "こんにちは")
+    rag = _store()
+    calls = [0]
+
+    async def fake_decide(*, surprise, silence_seconds, recent_turns, topic_seeds,
+                          last_feedback=None, active_tasks=None):
+        d = contents[min(calls[0], len(contents) - 1)]
+        calls[0] += 1
+        return d
+
+    q = StimulusQueue()
+    dec = SpeechDecider(state=state, cache=cache, rag=rag, prediction_state=PredictionState(),
+                        queue=q, decide_fn=fake_decide, embedder=embedder)
+    dec.start()
+    delivered = []
+    for i in range(len(contents)):
+        dec.trigger()
+        await asyncio.sleep(0.05)
+        while q.qsize() > 0:
+            delivered.append((await q.get()).payload.content)
+        if hook is not None:
+            hook(i)
+    await dec.stop()
+    await cache.shutdown()
+    return delivered, list(state.speech_log)
+
+
+async def t_seed_query_uses_last_user_turn() -> bool:
+    # 話題の種のクエリは**直近のユーザ発話**で引く（イブ自身の自発発話で引くと自己強化ループ）
+    state = SpeechState()
+    cache = ConversationCache(history_file=_tmp())
+    await cache.initialize()
+    cache.add_turn("user", "ラーメンの話をしてたね")
+    cache.add_turn("eve", "買い物リストの抜け漏れを確認しようか")  # イブの自発発話が最後のターン
+    captured = {}
+
+    class _SpyRag:
+        async def autonomous_memories(self, query, k):
+            captured["q"] = query
+            return []
+
+    async def fake_decide(*, surprise, silence_seconds, recent_turns, topic_seeds,
+                          last_feedback=None, active_tasks=None):
+        return SpeechDecision(False, "黙る", "")
+
+    dec = SpeechDecider(state=state, cache=cache, rag=_SpyRag(), prediction_state=PredictionState(),
+                        queue=StimulusQueue(), decide_fn=fake_decide)
+    dec.start()
+    dec.trigger()
+    await asyncio.sleep(0.05)
+    await dec.stop()
+    await cache.shutdown()
+    return "ラーメン" in captured.get("q", "") and "買い物" not in captured.get("q", "")
+
+
+async def t_dup_survives_speech_log_overflow() -> bool:
+    # ⭐②-2 死活: 黙る判定で観測ログが溢れても同内容抑制は効き続ける。
+    # 旧実装は比較元が speech_log（件数10・False 混在）だったため、放置中は 5-6秒毎の False で
+    # 約50-60秒で前回発話が押し出され、同じ提案が通っていた（実測 8回中4回すり抜け）。
+    state = SpeechState(log_max=10)
+    silent = SpeechDecision(False, "黙る", "")
+    contents = [SpeechDecision(True, "話す", _DUP_A1)] + [silent] * 12 + [SpeechDecision(True, "話す", _DUP_A2)]
+    delivered, log = await _run_decider(state, contents)
+    pushed_out = all(e["content"] != _DUP_A1 for e in log)  # 観測ログからは押し出されている
+    return delivered == [_DUP_A1] and pushed_out and "抑制" in log[-1]["reason"]
+
+
+async def t_dup_window_expires() -> bool:
+    # 時間窓の外に出た自発発話とは比較しない（永久に同じ話題を封じない）
+    clk = [1000.0]
+    state = SpeechState(now_fn=lambda: clk[0], dup_window_sec=600.0)
+
+    def advance(i):
+        clk[0] += 601.0  # 1回目の直後に窓を跨ぐ
+
+    contents = [SpeechDecision(True, "話す", _DUP_A1), SpeechDecision(True, "話す", _DUP_A2)]
+    delivered, _ = await _run_decider(state, contents, hook=advance)
+    return delivered == [_DUP_A1, _DUP_A2]
+
+
+async def t_dup_embedding_second_stage() -> bool:
+    # ⭐二段目: 文字bigram をすり抜けた言い換え(0.23)を埋め込み cos で抑制。別話題は通す。
+    emb = _FakeEmbedder({
+        _PARA_1: [1.0, 0.0],
+        _PARA_2: [0.93, 0.3676],  # cos≈0.93 ≥ 0.87 → 抑制
+        _DIFF_1: [0.8, 0.6],      # cos=0.80 < 0.87 → 通す
+    })
+    state = SpeechState()
+    contents = [SpeechDecision(True, "話す", c) for c in (_PARA_1, _PARA_2, _DIFF_1)]
+    delivered, log = await _run_decider(state, contents, embedder=emb)
+    suppressed = [e for e in log if "抑制" in e["reason"]]
+    return (
+        delivered == [_PARA_1, _DIFF_1]
+        and len(suppressed) == 1
+        and "意味" in suppressed[0]["reason"]  # 二段目で捕まえたと分かる
+        and emb.calls == 3  # 判定ごとに1回だけ（投入時の記録に再利用する）
+    )
+
+
+async def t_dup_embedding_failure_falls_back() -> bool:
+    # 埋め込みが失敗しても落とさず、一段目(文字bigram)のみで継続する
+    state = SpeechState()
+    contents = [SpeechDecision(True, "話す", c) for c in (_PARA_1, _PARA_2, _DUP_A1, _DUP_A2)]
+    delivered, log = await _run_decider(state, contents, embedder=_BoomEmbedder())
+    return (
+        delivered == [_PARA_1, _PARA_2, _DUP_A1]  # 言い換えは通る（二段目なし）が文字重複は止まる
+        and any("抑制" in e["reason"] for e in log)
+    )
+
+
+# ===== J-2 ③-A: STT 待ち窓（発話終了〜テキスト投入）ガード =====
+def t_stt_pending_flag_and_expiry() -> bool:
+    clk = [1000.0]
+    state = SpeechState(now_fn=lambda: clk[0], stt_pending_max_sec=10.0)
+    none_before = not state.stt_pending
+    state.mark_stt_pending()
+    active = state.stt_pending
+    clk[0] = 1009.9
+    still = state.stt_pending
+    clk[0] = 1010.0
+    expired = not state.stt_pending  # 最大寿命で自動失効（STTハング/クリア漏れで固着しない）
+    state.mark_stt_pending()
+    state.clear_stt_pending()
+    cleared = not state.stt_pending
+    return none_before and active and still and expired and cleared
+
+
+def t_monitor_blocks_during_stt_pending() -> bool:
+    clk = [1000.0]
+    state = SpeechState(now_fn=lambda: clk[0])
+    fd = _FakeDecider()
+    mon = SilenceMonitor(state=state, decider=fd, is_busy_fn=lambda: False, threshold_sec=5.0, tick_sec=0.7)
+    clk[0] = 1006.0
+    state.mark_stt_pending()
+    blocked = mon.tick()  # 窓内 → 5秒沈黙でも発火しない
+    state.clear_stt_pending()
+    fired = mon.tick()  # 窓が閉じたら発火
+    return blocked is False and fired is True and fd.triggers == 1
+
+
+async def t_decider_discards_when_stt_pending_at_completion() -> bool:
+    # 保留トリガで判定が窓内から開始した形の簡約: 判定中に窓が開く（seq は不変）→ 完了時に破棄。
+    state = SpeechState()
+    cache = ConversationCache(history_file=_tmp())
+    await cache.initialize()
+    cache.add_turn("user", "こんにちは")
+    rag = _store()
+    pred = PredictionState()
+
+    async def decide_then_window(*, surprise, silence_seconds, recent_turns, topic_seeds,
+                                 last_feedback=None, active_tasks=None):
+        state.mark_stt_pending()  # 判定 LLM 実行中に発話セグメント到着（STT 開始）を模す
+        return SpeechDecision(True, "話す", "こんばんは")
+
+    q = StimulusQueue()
+    dec = SpeechDecider(state=state, cache=cache, rag=rag, prediction_state=pred,
+                        queue=q, decide_fn=decide_then_window)
+    dec.start()
+    dec.trigger()
+    await asyncio.sleep(0.05)
+    await dec.stop()
+    await cache.shutdown()
+    log = list(state.speech_log)
+    return (q.qsize() == 0 and len(log) == 1
+            and log[0]["speak"] is False and "STT処理中" in log[0]["reason"])
+
+
+class _FakeAIOnce:
+    """1回だけ pcm を返し、以後は永久待ち（_consume ループの単発駆動用）。"""
+
+    def __init__(self) -> None:
+        self._sent = False
+
+    async def get_audio(self):
+        if self._sent:
+            await asyncio.Event().wait()
+        self._sent = True
+        return b"pcm"
+
+
+async def t_input_source_stt_window_order() -> bool:
+    # 窓は transcribe 前に開き、put 完了後に閉じる（put 前に閉じる微小窓を作らない）。
+    from eve.response.input_source import MicSttInputSource
+
+    events: list = []
+    release = asyncio.Event()
+
+    class FakeStt:
+        async def transcribe(self, pcm):
+            events.append("stt_begin")
+            await release.wait()
+            return "こんにちは"
+
+    q = StimulusQueue()
+    src = MicSttInputSource(
+        q, FakeStt(),
+        on_utterance=lambda: events.append("utterance"),
+        on_stt_start=lambda: events.append("open"),
+        on_stt_end=lambda: events.append("close"),
+    )
+    src._ai = _FakeAIOnce()
+    task = asyncio.create_task(src._consume())
+    await asyncio.sleep(0.05)
+    during = list(events)  # STT 実行中: close は未発火のはず
+    release.set()
+    await asyncio.sleep(0.05)
+    task.cancel()
+    got = q.qsize() == 1
+    s = await q.get() if got else None
+    return (
+        during == ["utterance", "open", "stt_begin"]
+        and events == ["utterance", "open", "stt_begin", "close"]
+        and got and s.payload == "こんにちは"
+    )
+
+
+async def t_input_source_stt_window_closes_on_failure() -> bool:
+    # STT 失敗/空認識でも窓は必ず閉じる（固着防止）・投入なし・ループ継続（無クラッシュ）。
+    from eve.response.input_source import MicSttInputSource
+
+    events: list = []
+
+    class FailStt:
+        async def transcribe(self, pcm):
+            raise RuntimeError("stt down")
+
+    q = StimulusQueue()
+    src = MicSttInputSource(
+        q, FailStt(),
+        on_stt_start=lambda: events.append("open"),
+        on_stt_end=lambda: events.append("close"),
+    )
+    src._ai = _FakeAIOnce()
+    task = asyncio.create_task(src._consume())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    return events == ["open", "close"] and q.qsize() == 0
+
+
 async def t_decider_speak_injects() -> bool:
     state = SpeechState()
     cache = ConversationCache(history_file=_tmp())
@@ -367,6 +755,66 @@ async def t_decider_speak_injects() -> bool:
         and isinstance(s.payload, AutonomousSpeech) and s.payload.content == "天気の話を振る"
         and len(log) == 1 and log[0]["speak"] is True
     )
+
+
+async def t_decider_tasks_provider_wired() -> bool:
+    # J-2 P2-3: tasks_provider の戻り値が decide_fn に active_tasks として届く。
+    state = SpeechState()
+    cache = ConversationCache(history_file=_tmp())
+    await cache.initialize()
+    cache.add_turn("user", "こんにちは")
+    rag = _store()
+    pred = PredictionState()
+    seen: dict = {}
+
+    async def capture(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None,
+                      active_tasks=None):
+        seen["tasks"] = active_tasks
+        return SpeechDecision(False, "r", "")
+
+    q = StimulusQueue()
+    dec = SpeechDecider(
+        state=state, cache=cache, rag=rag, prediction_state=pred, queue=q, decide_fn=capture,
+        tasks_provider=lambda: ["・「検索中のタスク」（実行中）"],
+    )
+    dec.start()
+    dec.trigger()
+    await asyncio.sleep(0.05)
+    await dec.stop()
+    await cache.shutdown()
+    return seen.get("tasks") == ["・「検索中のタスク」（実行中）"]
+
+
+async def t_decider_tasks_provider_exception_safe() -> bool:
+    # tasks_provider が例外を投げても発話判定自体はクラッシュせず継続する（注入なしで継続）。
+    state = SpeechState()
+    cache = ConversationCache(history_file=_tmp())
+    await cache.initialize()
+    cache.add_turn("user", "こんにちは")
+    rag = _store()
+    pred = PredictionState()
+    seen: dict = {}
+
+    async def capture(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None,
+                      active_tasks=None):
+        seen["tasks"] = active_tasks
+        seen["called"] = True
+        return SpeechDecision(False, "r", "")
+
+    def boom():
+        raise RuntimeError("store 未初期化")
+
+    q = StimulusQueue()
+    dec = SpeechDecider(
+        state=state, cache=cache, rag=rag, prediction_state=pred, queue=q, decide_fn=capture,
+        tasks_provider=boom,
+    )
+    dec.start()
+    dec.trigger()
+    await asyncio.sleep(0.05)
+    await dec.stop()
+    await cache.shutdown()
+    return seen.get("called") is True and seen.get("tasks") is None
 
 
 async def t_decider_silence_no_stimulus() -> bool:
@@ -504,6 +952,9 @@ async def main() -> None:
     check("speak は LLM の content を使う", await t_speak_uses_llm_content())
     check("speak で content 空→fallback(全 speak 経路)", await t_empty_content_fallback())
     check("last_feedback(感情)を decider に渡す", await t_last_feedback_passed_to_decider())
+    check("J-2 P2-3: active_tasks を decide_fn に渡す", await t_active_tasks_passed_to_decider())
+    check("J-2 P2-3: active_tasks=None は旧decide_fnを壊さない", await t_active_tasks_not_forwarded_when_none())
+    check("J-2 P2-3: build_decide_messages の実行中タスクブロック", t_build_decide_messages_active_tasks_block())
     check("parse yes", t_parse_yes())
     check("parse no", t_parse_no())
     check("parse 全角コロン", t_parse_fullwidth())
@@ -523,6 +974,24 @@ async def main() -> None:
     check("C3 decider speak→AUTONOMOUS 刺激+ログ", await t_decider_speak_injects())
     check("C3 decider silence→刺激なし+ログ記録", await t_decider_silence_no_stimulus())
     check("C3 decider single-flight(同時=1)", await t_decider_single_flight())
+    check("J-2 P2-3: tasks_provider の戻り値が届く", await t_decider_tasks_provider_wired())
+    check("J-2 P2-3: tasks_provider 例外でも継続", await t_decider_tasks_provider_exception_safe())
+    # J-2 ②-1: 同内容の自発発話の抑制
+    check("J-2 ②-1: 類似度指標の実データ校正（重複≥閾値/別話題<閾値）", t_content_similarity_calibration())
+    check("J-2 ②-1: 同内容の自発発話をコードゲートで抑制", await t_decider_suppresses_duplicate_content())
+    check("話題の種は直近ユーザ発話で引く(自己強化しない)", await t_seed_query_uses_last_user_turn())
+    check("cosine 基本(同一/直交/空/ゼロ)", t_cosine_basic())
+    check("言い換えは文字bigramをすり抜ける(二段目の根拠)", t_paraphrase_slips_bigram())
+    check("⭐②-2: 黙る判定でログが溢れても抑制が効く", await t_dup_survives_speech_log_overflow())
+    check("②-2: 時間窓を出たら比較しない", await t_dup_window_expires())
+    check("⭐②-2: 二段目(埋め込み)で言い換えを抑制・別話題は通す", await t_dup_embedding_second_stage())
+    check("②-2: 埋め込み失敗は一段目で継続(落とさない)", await t_dup_embedding_failure_falls_back())
+    # J-2 ③-A: STT 待ち窓ガード
+    check("J-2 ③-A: stt_pending フラグ+最大寿命失効", t_stt_pending_flag_and_expiry())
+    check("J-2 ③-A: 窓内は monitor が発火しない", t_monitor_blocks_during_stt_pending())
+    check("J-2 ③-A: 判定完了時に窓内なら破棄", await t_decider_discards_when_stt_pending_at_completion())
+    check("J-2 ③-A: 窓は transcribe 前に開き put 後に閉じる", await t_input_source_stt_window_order())
+    check("J-2 ③-A: STT失敗でも窓は閉じる（固着防止）", await t_input_source_stt_window_closes_on_failure())
     # C4
     check("C4 Eve 発話で沈黙時計リセット + user_speaking トグル", t_eve_activity_resets_silence())
     # Fix1

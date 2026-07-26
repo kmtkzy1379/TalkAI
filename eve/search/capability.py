@@ -22,7 +22,8 @@ def _as_bool(v) -> bool:
 def register_search_capability(registry: CapabilityRegistry, client: SearchClient) -> None:
     async def _search(args: dict) -> str:
         return await client.search(
-            (args or {}).get("query", ""), _as_bool((args or {}).get("fresh")))
+            (args or {}).get("query", ""), _as_bool((args or {}).get("fresh")),
+            _as_bool((args or {}).get("deep")))
 
     registry.register(Capability(
         name="search_web",
@@ -33,6 +34,8 @@ def register_search_capability(registry: CapabilityRegistry, client: SearchClien
         params_schema={
             "query": {"type": "string", "description": "検索キーワード（日本語可・短く要点だけ）"},
             "fresh": {"type": "boolean", "description": "キャッシュを使わず再検索する（省略=false）"},
+            "deep": {"type": "boolean", "description": "上位ページの本文まで読んで要約する（時間がかかる。"
+                     "スニペットで足りない詳しい調査のときだけ true）"},
         },
         async_handler=_search,
         offered=False, agent_tool=True,

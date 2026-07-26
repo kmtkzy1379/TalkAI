@@ -13,3 +13,5 @@ torch
 # Tier-1 決定論テストには不要（fake embed_fn 注入）。
 sentence-transformers
 ddgs  # J-2 Web検索（キー不要メタ検索・遅延 import）
+curl_cffi  # J-2 inc2 取得（TLS偽装・403回避・遅延 import）
+trafilatura  # J-2 inc2 本文抽出（遅延 import）

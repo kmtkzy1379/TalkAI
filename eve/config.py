@@ -114,6 +114,15 @@ class Config:
     RAG_TOPIC_JITTER = float(os.getenv("RAG_TOPIC_JITTER", "0.4"))
     # 発話判定ログ（True/False とも記録・ロケット鉛筆・処理には関与しない＝観測専用）。
     SPEECH_LOG_MAX = int(os.getenv("SPEECH_LOG_MAX", "10"))
+    # 自発発話の同内容抑制で「直近」とみなす時間窓[秒]（この窓の自発発話とだけ比較する）。
+    # 観測用 speech_log（件数上限・黙る判定も混在）を比較元にしていた時は実効約50-60秒しかなく、
+    # 90秒空くと前回発話が押し出されて同じ提案が通っていた（実測 2026-07-23: 8回中4回すり抜け）。
+    SPEECH_DUP_WINDOW_SEC = float(os.getenv("SPEECH_DUP_WINDOW_SEC", "600.0"))
+    SPEECH_DUP_LOG_MAX = int(os.getenv("SPEECH_DUP_LOG_MAX", "50"))  # 窓内件数の安全上限（メモリ bound）
+    # 二段目ゲート: 埋め込み cos がこれ以上なら「言い換えただけの同内容」として抑制。
+    # 実測校正(2026-07-26・実発話8文/Ruri v3): 同話題 0.909-0.932 / 別話題 0.780-0.834 → 0.87 で分離。
+    # 文字bigram だけでは語彙を変えた再提案（実測 0.23 < 0.25）を取りこぼすため二段構えにする。
+    SPEECH_DUP_EMB_THRESHOLD = float(os.getenv("SPEECH_DUP_EMB_THRESHOLD", "0.87"))
 
     # 画面認識（F6・snapshot モード）。**すべてインフラ/コスト knob（Eve の挙動を数値で決めない）**。
     VLM_ENABLED = os.getenv("VLM_ENABLED", "0") == "1"  # 既定 off（実機で明示 on）
@@ -128,8 +137,12 @@ class Config:
     # 軽量化(1024/Q60/3枚)は実機で遅延に効かず(遅延は Gemini API 変動)・OCR を悪化させたので 1280/70/4 へ戻した。
     VLM_DOWNSCALE_MAX = int(os.getenv("VLM_DOWNSCALE_MAX", "1280"))  # 長辺上限（トークン/レイテンシ削減）
     VLM_JPEG_QUALITY = int(os.getenv("VLM_JPEG_QUALITY", "70"))  # 送信 JPEG 品質
-    # 画面情報の鮮度上限。これより古い latest_vision は応答/判定に渡さない（「明らか過去を参照しない」を構造保証）。
+    # 画面情報の鮮度上限。これより古い latest_vision は自発発話系に渡さない（「明らか過去を参照しない」を構造保証）。
     VLM_VISION_TTL_SEC = float(os.getenv("VLM_VISION_TTL_SEC", "7.0"))
+    # ユーザ発話への応答に限り、画面が**変化していない間**は古い実況を据え置ける上限[秒]。
+    # 「今何が見える?」に静止画面でも答えるため（注入時は「N秒前・以降変化なし」と正直に付す）。
+    # 自発発話・発話判定はこの据え置きを使わない（静止中に画面へ引っ張られる固執を断つ層分離）。
+    VLM_STATIC_VISION_MAX_SEC = float(os.getenv("VLM_STATIC_VISION_MAX_SEC", "180.0"))
     VLM_BLANK_STD_THRESHOLD = float(os.getenv("VLM_BLANK_STD_THRESHOLD", "6.0"))  # 黒/空白検出（std 未満=取得不可・A11）
 
     # Call-Function（J-0 即時 Call-Function・increment 1 は read-only 能力のみ）。

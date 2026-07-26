@@ -236,6 +236,19 @@ def t_prompt_summary_is_episodic() -> bool:
     return "出来事の記憶" in sys_msg and "手続き" in sys_msg
 
 
+def t_prompt_forbids_inference_as_fact() -> bool:
+    """J-2 P2-4: summary はユーザ自身の発言が無い限り意図/要望を断定しないよう明示され、
+    next_prediction/reason は推測専用・前回予測の単純な引き継ぎを禁じる指示が入っている
+    （実機事故: イブ自身の未回答オファーが「ユーザは待っている」と断定されRAGに永続化→
+    自律発話の話題の種として自分に戻ってくる自己参照ループの回帰ガード）。"""
+    sys_msg = build_messages([_turn("user", "x")], None)[0]["content"]
+    return (
+        "ユーザ自身の発言が今回の会話に無い限り書かない" in sys_msg
+        and "推測であり事実ではない" in sys_msg
+        and "前回はあくまで前回時点の推測" in sys_msg
+    )
+
+
 # ========== B4 FeedbackLLM.run ==========
 async def t_fb_cold_start() -> bool:
     fb = FeedbackLLM(_reg_const(_FULL))  # rag 無し・state 新規(last_prediction None)
@@ -509,6 +522,7 @@ async def main() -> None:
     check("B3 prompt 前回予測+会話を含む", t_prompt_includes_prediction_and_turns())
     check("B3 prompt cold センチネル", t_prompt_cold_sentinel())
     check("B3 prompt summary はエピソード記憶を促す", t_prompt_summary_is_episodic())
+    check("J-2 P2-4: summary/next_prediction の事実/推測分離指示", t_prompt_forbids_inference_as_fact())
     # B4
     check("B4 cold start(surprise 中立・next 繰越)", await t_fb_cold_start())
     check("B4 FEP ループ閉(last_prediction 更新)", await t_fb_fep_close())

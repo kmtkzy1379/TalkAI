@@ -263,6 +263,28 @@ async def t_capabilities():
     )
 
 
+async def t_duplicate_running_goal_rejected():
+    """J-2 P1-2: 実行中(Running)の同一ゴール再委譲が dedup で弾かれる（重複検索/重複報告の防止）。
+
+    実機事故(2026-07-18 E2E): 検索実行中に無関係な話題転換発話で応答LLMが同じゴールを
+    再委譲し、新規タスクが作られて検索/報告が2重になった。旧実装は PENDING のみ照合の
+    ため claim_due() で Running 化した瞬間から素通りしていた。
+    """
+    s = TaskStore(task_file=_tmp(), now_fn=lambda: BASE)
+    await s.initialize()
+    reg = CapabilityRegistry()
+    register_task_capabilities(reg, s)
+    r1 = reg.execute("delegate_task", {"goal": "モンハンの最新アップデートを調べて"})
+    running = s.claim_due()  # PENDING→Running(atomic)。when=None なので即 due。
+    r2 = reg.execute("delegate_task", {"goal": "モンハンの最新アップデートを調べて"})  # 再委譲(事故の再現)
+    await s.shutdown()
+    return (
+        "引き受けた" in r1 and len(s) == 1  # Running 中の再委譲でも新規タスクは作られない
+        and running is not None and running.status == RUNNING
+        and "今ちょうど調べてるところ" in r2  # Running 向けの自然な文言
+    )
+
+
 async def t_executor_drain_slow_async():
     # 遅い async 能力の実行中に stop(短drain) → 偽の報告刺激を残さず、store は Running のまま
     # （次回起動の孤児 age-out が回収＝既存設計と整合。レッドチーム §2-2）。
@@ -335,6 +357,7 @@ async def main():
     check("cancel: Running も / ID省略で直近", await t_cancel_running_and_latest())
     check("Scheduler: when 到来で trigger・busy ガード", await t_scheduler_triggers_when_due())
     check("capabilities: create/cancel/remind/markers", await t_capabilities())
+    check("J-2 P1-2: Running中の同一ゴール再委譲は dedup で弾く", await t_duplicate_running_goal_rejected())
     check("Executor: 遅いasync能力中のstop→偽報告なし/Running温存", await t_executor_drain_slow_async())
     check("Fix#2: active_tasks_for_context(状態/ETA/ID leak なし)", await t_active_tasks_context())
     check("Fix#2: 一覧上限+humanize_eta 丸め境界", await t_active_tasks_limit_and_eta())

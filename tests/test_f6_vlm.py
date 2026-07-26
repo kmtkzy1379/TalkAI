@@ -182,6 +182,53 @@ def t_fresh_vision_ttl() -> bool:
     return fresh == "画面の内容" and stale is None and none0 is None
 
 
+def t_vision_for_user_static_hold() -> bool:
+    # 層分離: 画面が変化していない間、ユーザ応答用は据え置き可（正直な注記つき）。
+    # 一方で自発発話系(fresh_vision)には渡らない＝静止中の画面固執を構造で断つ。
+    vs = VisionState()
+    vs.add_frame(_frame(0), True, now=100.0)   # 変化フレーム
+    vs.set_latest("メモ帳が開いている", mono=101.0)
+    vs.add_frame(_frame(1), False, now=129.5)  # 静止のまま capture は生きている
+    held = vs.vision_for_user(ttl=7.0, static_max=180.0, now=130.0)
+    strict = vs.fresh_vision(ttl=7.0, now=130.0)
+    return (
+        held is not None
+        and "メモ帳" in held
+        and "変化なし" in held  # 「N秒前の画面」だと明示（捏造しない）
+        and strict is None      # 自発発話・発話判定には据え置きを渡さない
+    )
+
+
+def t_vision_for_user_invalidated() -> bool:
+    # 据え置きが無効になる3条件: 実況後に変化が来た / capture 停止 / 上限超過
+    vs = VisionState()
+    vs.add_frame(_frame(0), True, now=100.0)
+    vs.set_latest("メモ帳が開いている", mono=101.0)
+    vs.add_frame(_frame(1), True, now=140.0)  # 実況より後に変化（まだ実況が追いついていない）
+    after_change = vs.vision_for_user(7.0, 180.0, now=141.0)
+
+    vs2 = VisionState()
+    vs2.add_frame(_frame(0), True, now=100.0)
+    vs2.set_latest("メモ帳が開いている", mono=101.0)  # capture は以後止まっている
+    capture_dead = vs2.vision_for_user(7.0, 180.0, now=130.0)
+
+    vs3 = VisionState()
+    vs3.add_frame(_frame(0), True, now=100.0)
+    vs3.set_latest("メモ帳が開いている", mono=101.0)
+    vs3.add_frame(_frame(1), False, now=299.5)
+    too_old = vs3.vision_for_user(7.0, 180.0, now=300.0)  # age 199s > 上限 180s
+    return after_change is None and capture_dead is None and too_old is None
+
+
+def t_vision_for_user_marker_not_held() -> bool:
+    # A11 の正直マーカ（視認不可）は据え置かない（「30秒前は取得できなかった」は無意味/紛らわしい）
+    vs = VisionState()
+    vs.add_frame(_frame(0), True, now=100.0)
+    vs.set_latest(BLANK_MARKER, mono=101.0, narration=False)
+    vs.add_frame(_frame(1), False, now=129.5)
+    return vs.vision_for_user(7.0, 180.0, now=130.0) is None
+
+
 # ===== surprise 合成（most-recent-wins・A4/Q2）=====
 def t_surprise_cold_neutral() -> bool:
     return PredictionState().surprise == NEUTRAL_SURPRISE
@@ -271,6 +318,47 @@ async def t_last_frame_never_stranded() -> bool:
         and narr.calls[1][-1] == 1  # 最新ウィンドウの末尾＝今のフレーム
         and vs.latest_vision == "画面1番"
     )
+
+
+async def t_static_no_self_retrigger() -> bool:
+    # ⭐A1 死活: narrate 中に来たのが**変化なし**フレームだけなら自己再トリガしない。
+    # （旧実装は ring 末尾の frame_id で判定したため、capture が静止中も 2fps で積む＝常に真＝
+    #  一度起動すると永久ループ。実機実測 229回/1061s・15秒以上の空白 0 の再発防止テスト）
+    vs, pred = VisionState(), PredictionState()
+    gate = asyncio.Event()
+    narr = FakeNarrator(gate=gate)
+    w = _mkworker(vs, pred, narr)
+    w.start()
+    w.on_frame(_frame(0), True)
+    await _pump()  # narrate([0]) gate 待ち
+    for i in range(1, 4):  # 処理中に「変化なし」フレームだけが積まれる
+        w.on_frame(_frame(i), False)
+    await _pump()
+    gate.set()
+    await _pump()
+    for i in range(4, 8):  # 完了後も静止が続く
+        w.on_frame(_frame(i), False)
+    await _pump()
+    await w.stop()
+    return len(narr.calls) == 1  # 呼び出しは最初の1回だけ（静止では回さない）
+
+
+async def t_change_after_static_retriggers() -> bool:
+    # A1 の逆側（過剰修正の検出）: 静止が続いた後の**変化**フレームでは必ず起きる。
+    vs, pred = VisionState(), PredictionState()
+    narr = FakeNarrator()
+    w = _mkworker(vs, pred, narr)
+    w.start()
+    w.on_frame(_frame(0), True)
+    await _pump()
+    for i in range(1, 4):
+        w.on_frame(_frame(i), False)  # 静止（起きない）
+    await _pump()
+    stayed = len(narr.calls) == 1
+    w.on_frame(_frame(4), True)  # 変化（起きる）
+    await _pump()
+    await w.stop()
+    return stayed and len(narr.calls) == 2 and narr.calls[1][-1] == 4
 
 
 async def t_latest_vision_written() -> bool:
@@ -497,6 +585,9 @@ async def main() -> None:
     check("ring 上限 drop-oldest", t_ring_cap_drop_oldest())
     check("snapshot 直近k枚 value-copy", t_snapshot_last_k())
     check("鮮度TTL: 新しい→返す/古い→None", t_fresh_vision_ttl())
+    check("⭐層分離: 静止中はユーザ応答のみ据え置き(自発は渡さない)", t_vision_for_user_static_hold())
+    check("据え置き無効: 変化後/capture停止/上限超", t_vision_for_user_invalidated())
+    check("正直マーカは据え置かない", t_vision_for_user_marker_not_held())
     check("surprise cold→NEUTRAL", t_surprise_cold_neutral())
     check("surprise vlm 単独", t_surprise_vlm_only())
     check("A4 surprise most-recent-wins(maxでない)", t_surprise_most_recent_wins())
@@ -505,6 +596,8 @@ async def main() -> None:
     check("⭐backpressure: 最新ウィンドウ1回・累積なし", await t_backpressure_one_call_freshest())
     check("⭐single-flight ≤1", await t_single_flight_max_one())
     check("⭐A1 最後フレーム非取り残し(自己再トリガ)", await t_last_frame_never_stranded())
+    check("⭐A1 静止中は自己再トリガしない(永久ループ死活)", await t_static_no_self_retrigger())
+    check("A1 静止後の変化では必ず起きる", await t_change_after_static_retriggers())
     check("latest_vision 書込 + surprise 反映", await t_latest_vision_written())
     check("A9 min-interval で連続変化を律速", await t_min_interval_paces())
     check("dedup: 同一実況は発話再トリガしない", await t_dedup_no_retrigger())

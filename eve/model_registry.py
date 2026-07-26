@@ -22,6 +22,12 @@ ROLE_ENV: dict[str, tuple[str, str]] = {
     "vlm_merge": ("VLM_MERGE_MODEL", "gemini/gemini-2.5-pro"),
     "youtube": ("YOUTUBE_MODEL", "openai/gpt-4o"),
     "summarize": ("SUMMARIZE_MODEL", "openai/gpt-4o-mini"),
+    # J-2 inc2: Web本文の隔離要約（タスクLLM2）。**ツールを一切渡さない**専用ロール＝
+    # 信頼できない Web 本文を読むのはこのロールだけ（injection がツール実行に到達しない構造）。
+    "search_summarize": ("SEARCH_SUMMARIZE_MODEL", "openai/gpt-4o-mini"),
+    # J-2 P1-1: 機能実行結果が実際に発話へ反映されたか(delivered/withheld/forgotten)の
+    # 安価な確認係。ツールは渡さない（判定専用・実行系に触れない）。
+    "delivery_check": ("DELIVERY_CHECK_MODEL", "openai/gpt-4o-mini"),
 }
 
 CompletionFn = Callable[..., Awaitable[object]]

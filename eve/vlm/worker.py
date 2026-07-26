@@ -1,8 +1,8 @@
 """VlmWorker — single-flight 画面認識サイドカー（staleness/backpressure を構造的に解決）。
 
 FeedbackWorker / SpeechDecider と同形（Event トリガ・idle gate・start/stop drain）。差分は **A1
-自己再トリガ**（latest-wins には watermark が無いので、narrate 中に来た最後のフレームを取り残さない）
-と **min-interval pacing**（A9・連続変化のコスト上限。トリガを捨てず deferred で律速）。
+自己再トリガ**（latest-wins には watermark が無いので、narrate 中に来た最後の**変化**フレームを
+取り残さない）と **min-interval pacing**（A9・連続変化のコスト上限。トリガを捨てず deferred で律速）。
 
 不変条件:
 - single-flight: 長寿命タスク1本。narrate 中に何枚変化が来ても呼び出しは重ねない。終わったら
@@ -61,6 +61,10 @@ class VlmWorker:
         self._idle.set()
         self._last_call_ts = -1e9  # 初回は即時許可
         self._last_narration = ""
+        # 変化フレームの単調カウンタ。A1 の「narrate 中に取り残しが出たか」判定はこの差分で行う
+        # （ring 末尾の frame_id で見ると capture が変化と無関係に 2fps で積むため常に真になり、
+        #  一度起動すると静止画面でも永久に自己再トリガし続ける＝実測 229回/1061s・空白0）。
+        self._change_seq = 0
 
     # --- ライフサイクル ---
     def start(self) -> None:
@@ -92,15 +96,15 @@ class VlmWorker:
     # --- bridge 着地点（capture スレッド→loop の call_soon_threadsafe で呼ばれる・means-1）---
     def on_frame(self, frame: Frame, changed: bool) -> None:
         """全キャプチャを ring に積み（A8）、変化フレームなら worker を起こす。loop 上で実行。"""
-        self._vs.add_frame(frame)
+        self._vs.add_frame(frame, changed, self._now())
         if changed:
+            self._change_seq += 1
             self._event.set()
 
     # --- worker 本体 ---
     async def _run_forever(self) -> None:
         while not self._stopping:
             await self._event.wait()
-            self._event.clear()
             if self._stopping:
                 break
             # A9: min-interval pacing（トリガは捨てず deferred で律速）。
@@ -112,6 +116,9 @@ class VlmWorker:
                     raise
                 if self._stopping:
                     break
+            # clear は pacing 待ちの**後**（待機中に来た変化はこの1回に吸収する＝latest-window。
+            # 先に clear すると同じ変化で余計にもう1回呼ぶ）。
+            self._event.clear()
             try:
                 await self._process_once()
             except asyncio.CancelledError:
@@ -123,12 +130,12 @@ class VlmWorker:
         frames = self._vs.snapshot(self._k)  # await 前に value-copy（A2）
         if not frames:
             return
-        snap_id = frames[-1].frame_id
+        seq0 = self._change_seq  # snapshot と同一同期区間で読む（間に await 無し＝取り零し無し）
         # A11: 最新が blank → 視認不可。VLM に語らせず正直マーカ。surprise/発話に触れない。
         if frames[-1].blank:
             if self._vs.latest_vision != BLANK_MARKER:
                 logger.info("👁 視認不可（画面を取得できず）")
-            self._vs.set_latest(BLANK_MARKER, self._now())
+            self._vs.set_latest(BLANK_MARKER, self._now(), narration=False)
             return
         self._last_call_ts = self._now()  # 呼び出し開始＝pacing 起点
         self._idle.clear()
@@ -137,15 +144,17 @@ class VlmWorker:
         finally:
             self._idle.set()
         self._apply(result)
-        # A1: narrate 中に新フレームが来ていたら自己再トリガ（min-interval で律速される）。
-        ring = self._vs.ring
-        if ring and ring[-1].frame_id != snap_id:
+        # A1: narrate 中に**変化**フレームが来ていたら自己再トリガ（min-interval で律速される）。
+        # 変化していないフレーム（capture は静止中も 2fps で積む）では起こさない＝静止画面で VLM を
+        # 回し続けない（回し続けると latest_vision が常時新鮮になり、発話判定に画面が入りっぱなしで
+        # 同話題固執を生む／surprise も VLM 自己申告で上書きされ続ける）。
+        if self._change_seq != seq0:
             self._event.set()
 
     def _apply(self, result: VisionResult) -> None:
         if not result.visible:
             # A11: 視認不可（黒/判読不能）→ 正直マーカ・surprise/発話に触れない。
-            self._vs.set_latest(BLANK_MARKER, self._now())
+            self._vs.set_latest(BLANK_MARKER, self._now(), narration=False)
             return
         if not result.narration:
             return  # 空（パース失敗等）→ no-op（落とさない）

@@ -71,10 +71,13 @@ def active_tasks_for_context(store, *, now: Optional[datetime] = None, limit: in
 
 def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resolver=None) -> None:
     def _find_duplicate(goal: str, when: Optional[str]):
-        # 同じ goal かつ when が近接の PENDING があれば重複（混乱ターンの再作成を弾く＝RC2）。
+        # 同じ goal かつ when が近接の PENDING/Running があれば重複（混乱ターンの再作成を弾く＝RC2。
+        # Running も見るのは、実行中に応答LLMが同じゴールを再委譲する事故＝二重検索/二重報告を
+        # 構造的に防ぐため。claim_due() は when を変更しないので when 近接判定は Running でも成立）。
         target = _parse_iso(when)
         for t in store.list_all():
-            if t.status == PENDING and (t.goal or "").strip() == goal and _near(_parse_iso(t.when), target):
+            if (t.status in (PENDING, RUNNING) and (t.goal or "").strip() == goal
+                    and _near(_parse_iso(t.when), target)):
                 return t
         return None
 
@@ -85,6 +88,8 @@ def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resol
         when = _iso_in(args.get("when_seconds"))
         dup = _find_duplicate(goal, when)
         if dup is not None:
+            if dup.status == RUNNING:
+                return f"それ、今ちょうど調べてるところだよ（ID:{dup.task_id}）。"
             return f"それはもう予約してるよ（ID:{dup.task_id}）。"
         task = Task(task_id=new_task_id(), what="", goal=goal, when=when)
         store.add(task)

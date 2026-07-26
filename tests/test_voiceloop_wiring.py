@@ -60,7 +60,11 @@ try:
     check("SpeechDecider に VisionState を配線", vl.speech_decider._vision_state is vl.vision_state)
     check("VlmWorker に vision_state/prediction を配線",
           vl.vlm_worker._vs is vl.vision_state and vl.vlm_worker._pred is vl.prediction)
-    check("VlmWorker の発話トリガ=speech_decider.trigger", vl.vlm_worker._speak_trigger == vl.speech_decider.trigger)
+    # J-2 ③: trigger は source ラベル付き lambda 経由（同一性でなく挙動＝decider の event が立つこと）
+    vl.speech_decider._event.clear()
+    vl.vlm_worker._speak_trigger()
+    check("VlmWorker の発話トリガが speech_decider を起こす", vl.speech_decider._event.is_set())
+    vl.speech_decider._event.clear()  # 後続チェックへの汚染防止
     check("VLM 既定 off では capture スレッド未生成(構築は可)", vl.capture_thread is None)
     # play_fn が should_stop を取れる＝文途中 barge-in(B3) の配線が生きている
     check("audio が mid-sentence stop 対応 play_fn を保持", vl.audio._play_takes_stop is True)

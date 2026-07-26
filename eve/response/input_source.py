@@ -44,12 +44,18 @@ class MicSttInputSource(InputSource):
     （VoiceLoop が audio.interrupt + runner.interrupt を束ねて渡す）。
     """
 
-    def __init__(self, queue: StimulusQueue, stt: Stt, on_speech_start=None, on_utterance=None) -> None:
+    def __init__(self, queue: StimulusQueue, stt: Stt, on_speech_start=None, on_utterance=None,
+                 on_stt_start=None, on_stt_end=None) -> None:
         super().__init__(queue)
         self._stt = stt
         self._on_speech_start = on_speech_start
         # 発話セグメント到着（＝ユーザが話し終えた）時に呼ぶ。F5 の沈黙時計リセット用。
         self._on_utterance = on_utterance
+        # J-2 ③-A: STT 待ち窓（発話終了〜テキスト投入）の可視化フック。この窓は user_speaking=False
+        # かつ沈黙時計リセット済みで「静か」に見え、自発発話が差し込まれてユーザ応答を遅らせた
+        # （E2E S8 実測）。start=transcribe 直前 / end=投入完了（失敗・空認識含む）後に呼ぶ。
+        self._on_stt_start = on_stt_start
+        self._on_stt_end = on_stt_end
         self._ai = None
         self._task = None
 
@@ -61,24 +67,33 @@ class MicSttInputSource(InputSource):
         self._ai.start()
         self._task = asyncio.create_task(self._consume())
 
+    def _hook(self, fn, name: str) -> None:
+        if fn is None:
+            return
+        try:
+            fn()
+        except Exception:
+            logger.exception("%s フックで例外（無視して継続）", name)
+
     async def _consume(self) -> None:
         assert self._ai is not None
         while True:
             pcm = await self._ai.get_audio()
             # 発話セグメントが届いた＝ユーザは話し終えた（F5: user_speaking 解除 + 沈黙時計リセット）。
-            if self._on_utterance is not None:
-                try:
-                    self._on_utterance()
-                except Exception:
-                    logger.exception("on_utterance フックで例外（無視して継続）")
+            self._hook(self._on_utterance, "on_utterance")
+            # J-2 ③-A: STT 待ち窓を開く（この間は自発発話を差し込まない）。
+            self._hook(self._on_stt_start, "on_stt_start")
+            text = None
             try:
                 text = await self._stt.transcribe(pcm)
             except Exception:  # STT 失敗はこの発話を捨てて継続（起こりうる）
                 logger.exception("STT 失敗（この発話を捨てて継続）")
-                continue
             if text:
                 logger.info("🧑 %s", text)
                 await self._queue.put(Stimulus(StimulusKind.USER_UTTERANCE, payload=text))
+            # J-2 ③-A: 窓を閉じるのは**投入完了後**（put 前に閉じると put の await 中に
+            # 自発発話が滑り込む微小窓が残る）。失敗/空認識でも必ず閉じる（固着防止）。
+            self._hook(self._on_stt_end, "on_stt_end")
 
     def stop(self) -> None:
         if self._task:
