@@ -250,7 +250,10 @@ class SpeechDecider:
             # 続いた時にイブ自身の発話でイブの記憶を引く自己強化ループになり、同じ話題に留まる。
             last_user = next((t.text for t in reversed(recent) if t.speaker == "user"), None)
             q = " ".join(filter(None, [vision, last_user]))
-            seeds = await self._rag.autonomous_memories(q, self._k)
+            # J-2 ②-3: 今 recent として見せている会話区間から生まれた記憶は種にしない
+            # （「さっき自分が書いた今の会話」を過去の記憶として再提示しても新しい話題にならない）。
+            since = min((getattr(getattr(t, "stamp", None), "iso", "") or "") for t in recent) if recent else None
+            seeds = await self._rag.autonomous_memories(q, self._k, context_since_iso=since or None)
         else:
             seeds = []
         silence = self._state.silence_seconds()

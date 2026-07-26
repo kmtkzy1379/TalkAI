@@ -109,7 +109,7 @@ class FakeRag:
         self.queries.append(("search", q))
         return []
 
-    async def autonomous_memories(self, q, k=3):
+    async def autonomous_memories(self, q, k=3, *, context_since_iso=None):
         self.queries.append(("auto", q))
         return []
 

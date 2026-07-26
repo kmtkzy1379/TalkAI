@@ -211,13 +211,19 @@ class RagStore:
             summary=record.get("summary", ""),  # 話題の種はこの1行だけを使う（decider）
         )
 
-    async def _retrieve(self, query: str, k: int) -> tuple[list[dict], dict]:
+    async def _retrieve(
+        self, query: str, k: int, *, exclude_after: Optional[float] = None
+    ) -> tuple[list[dict], dict]:
         """memory-stream + フロア + top-1保証 + MMR の本体。
 
         選出された scored dict のリストと、デバッグ情報（フロア除外・候補プール）を返す。
         `search`（本番）と `search_debug`（実験ログ）の両方がここを使う＝ロジック一本化。
+
+        exclude_after: この epoch 秒**以降**に書かれたチャンクを候補から外す（自律発話専用）。
+        既定 None＝除外なし＝ユーザ発話への通常検索は一切影響を受けない（既定値で構造保証）。
         """
-        info: dict = {"floor_excluded": 0, "total": len(self._chunks), "pool": []}
+        info: dict = {"floor_excluded": 0, "recent_excluded": 0,
+                      "total": len(self._chunks), "pool": []}
         if k <= 0 or not self._chunks:
             return [], info
         q = np.asarray(await self._embedder.embed_query(query), dtype=float)
@@ -233,13 +239,19 @@ class RagStore:
         denom = max(1e-9, 1.0 - self.rel_baseline)
         scored: list[dict] = []
         for i, c in enumerate(chunks):
+            ts = _ts_epoch(c.get("timestamp", ""), now)
+            if exclude_after is not None and ts >= exclude_after:
+                # 「今まさに見えている会話」から生まれた記憶を、記憶として二重に想起しない。
+                # floor_excluded とは別カウント（無関係で落ちたのか新しすぎて落ちたのかを区別）。
+                info["recent_excluded"] += 1
+                continue
             cos = float(rel[i])
             # 異方性補正: 高ベースラインに圧縮された cos を [0,1] に広げて relevance を実効化。
             relevance = max(0.0, (cos - self.rel_baseline) / denom)
             if relevance < self.rel_floor:
                 info["floor_excluded"] += 1  # ① 無関係を排除（破綻防止）
                 continue
-            recency = math.exp(-(now - _ts_epoch(c.get("timestamp", ""), now)) / self.recency_tau)
+            recency = math.exp(-(now - ts) / self.recency_tau)
             importance = float(c.get("importance", 0.5))
             base = self.w_rel * relevance + self.w_imp * importance + self.w_rec * recency
             scored.append({
@@ -280,10 +292,15 @@ class RagStore:
 
         return selected, info
 
-    async def search(self, query: str, k: Optional[int] = None) -> list[RagChunk]:
-        """memory-stream + フロア + top-1保証 + MMR で関連記憶を返す。"""
+    async def search(
+        self, query: str, k: Optional[int] = None, *, exclude_after: Optional[float] = None
+    ) -> list[RagChunk]:
+        """memory-stream + フロア + top-1保証 + MMR で関連記憶を返す。
+
+        exclude_after は自律発話専用（既定 None＝ユーザ発話への通常検索は不変）。
+        """
         k = k if k is not None else self.top_k
-        selected, _ = await self._retrieve(query, k)
+        selected, _ = await self._retrieve(query, k, exclude_after=exclude_after)
         return [self._to_chunk(s["chunk"], as_topic_seed=False) for s in selected]
 
     async def search_debug(self, query: str, k: Optional[int] = None) -> dict:
@@ -324,12 +341,24 @@ class RagStore:
         random.shuffle(pool)  # プール内で更にバラけさせる（同じ重要記憶ばかりにしない）
         return [self._to_chunk(c, as_topic_seed=True) for c in pool[:k]]
 
-    async def autonomous_memories(self, query: Optional[str], k: int = 3) -> list[RagChunk]:
+    async def autonomous_memories(
+        self, query: Optional[str], k: int = 3, *, context_since_iso: Optional[str] = None
+    ) -> list[RagChunk]:
         """自律発話用: **関連記憶(search)** ＋ **完全ランダム1件** ＋ **重要度(topic_candidates)** を混ぜる。
         - 関連: 「今の画面↔過去の話」を結ぶ（例: 甘いもの検索→前のチーズケーキの話）。
         - ランダム1件: 関連度/重要度だけだと**毎回同じ記憶が選ばれて単調**になるため、関連度に依らない
           1件を必ず混ぜて新しい切り口・意外性を出す（ユーザ案。沈黙時はコンテキストに余裕がある）。
-        - 重要度: 残り枠を予測差の大きい印象的な記憶で埋める。"""
+        - 重要度: 残り枠を予測差の大きい印象的な記憶で埋める。
+
+        **記憶の自己参照を断つ（J-2 ②-3）**: 関連枠のクエリは直近ユーザ発話なので、FeedbackLLM が
+        その会話から数十秒前に書いたチャンクが relevance 最大で必ず先頭に来る（実測 2026-07-26:
+        関連枠 78回中53回が5分以内のチャンク・中央値2.2分・最短1.8秒・同一チャンクが27回連続）。
+        「今まさに会話として見えているもの」を「過去の記憶」として再提示しても新しい話題にならない
+        ので候補から外す。除外は**この関数の中だけ**（`search` 既定は不変＝応答経路に影響しない）。
+        context_since_iso: 今 recent_turns として注入されている会話の最古 iso（前回セッションの
+        復元分を含む）。時刻窓(RAG_AUTO_EXCLUDE_SEC)だけでは、9日前に中断した会話がそのまま
+        注入されている場合を捕まえられない（実測 round0）。
+        """
         out: list[RagChunk] = []
         seen: set[str] = set()
 
@@ -339,7 +368,10 @@ class RagStore:
                 seen.add(c.text)
 
         if query and query.strip():
-            for c in await self.search(query, max(1, k // 3)):  # 関連記憶（k=3→1件）
+            cutoff = time.time() - Config.RAG_AUTO_EXCLUDE_SEC
+            if context_since_iso:
+                cutoff = min(cutoff, _ts_epoch(context_since_iso, cutoff))
+            for c in await self.search(query, max(1, k // 3), exclude_after=cutoff):
                 _add(c)
         for c in self.random(2):  # 完全ランダム1件（関連度エコーチェンバーを破る）
             if len(out) >= k:

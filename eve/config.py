@@ -107,6 +107,11 @@ class Config:
     SILENCE_THRESHOLD_SEC = float(os.getenv("SILENCE_THRESHOLD_SEC", "5.0"))
     # surprise は数値で発話を絶対決定しない（指標）。発話判定LLM が surprise+感情+内容を総合判断する
     # （ユーザ裁定）。よって SURPRISE_SPEAK_FORCE/FLOOR の数値ゲートは廃止。
+    # 自律発話の「関連記憶」枠から、これより新しいチャンクを除外する[秒]（記憶の自己参照を断つ）。
+    # FeedbackLLM は応答ごとに会話の要約チャンクを書くため、直近ユーザ発話をクエリにすると
+    # 「数十秒前に自分が書いた今の会話」が relevance 最大で必ず返る（実測 2026-07-26: 関連枠の
+    # 68%が5分以内・最短1.8秒）。0 で無効化（ロールバック用）。応答経路の検索には影響しない。
+    RAG_AUTO_EXCLUDE_SEC = float(os.getenv("RAG_AUTO_EXCLUDE_SEC", "600"))
     # 沈黙時の「話題の種」取得件数（自律発話用）。沈黙時はコンテキストに余裕があるので 3
     # （関連1 + 完全ランダム1 + 重要度1 の構成＝毎回同じ記憶ばかりにせず新しい切り口を混ぜる）。
     RAG_RANDOM_K = int(os.getenv("RAG_RANDOM_K", "3"))

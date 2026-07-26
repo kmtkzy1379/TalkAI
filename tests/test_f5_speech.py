@@ -567,8 +567,9 @@ async def t_seed_query_uses_last_user_turn() -> bool:
     captured = {}
 
     class _SpyRag:
-        async def autonomous_memories(self, query, k):
+        async def autonomous_memories(self, query, k, *, context_since_iso=None):
             captured["q"] = query
+            captured["since"] = context_since_iso
             return []
 
     async def fake_decide(*, surprise, silence_seconds, recent_turns, topic_seeds,
@@ -582,7 +583,11 @@ async def t_seed_query_uses_last_user_turn() -> bool:
     await asyncio.sleep(0.05)
     await dec.stop()
     await cache.shutdown()
-    return "ラーメン" in captured.get("q", "") and "買い物" not in captured.get("q", "")
+    # ②-3: 今注入している会話区間（最古ターンの iso）を渡し、そこから生まれた記憶を除外させる
+    return (
+        "ラーメン" in captured.get("q", "") and "買い物" not in captured.get("q", "")
+        and captured.get("since")  # 会話区間が渡っている（落とすと自己参照が復活する）
+    )
 
 
 async def t_dup_survives_speech_log_overflow() -> bool:

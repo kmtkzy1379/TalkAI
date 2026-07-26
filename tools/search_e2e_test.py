@@ -224,11 +224,12 @@ class Harness:
         # 話題の種の記録: 自律発話が「記憶起点か」を事後に判定するため、判定へ渡った種を残す。
         _autonomous_memories = self.vl.rag.autonomous_memories
 
-        async def seeds_wrap(query, k=3):
-            seeds = await _autonomous_memories(query, k)
+        async def seeds_wrap(query, k=3, *, context_since_iso=None):
+            seeds = await _autonomous_memories(query, k, context_since_iso=context_since_iso)
             self.seed_calls.append({
                 "t": round(time.monotonic() - T0, 2),
                 "query": (query or "")[:80],
+                "since": context_since_iso,  # ②-3: 自己参照除外の起点（効いているかの一次データ）
                 "seeds": [(s.seed_text() if hasattr(s, "seed_text") else s.text)[:120] for s in seeds],
             })
             return seeds

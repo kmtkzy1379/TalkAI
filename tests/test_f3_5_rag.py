@@ -157,12 +157,21 @@ async def t_topic_candidates() -> bool:
     return len(res) == 2 and all(c.as_topic_seed for c in res) and empty == []
 
 
+def _iso_ago(sec: float) -> str:
+    """決定論のため timestamp を明示する（既定の now_iso だと自己参照除外に掛かる）。"""
+    from datetime import datetime, timedelta, timezone
+    return (datetime.now(timezone.utc) - timedelta(seconds=sec)).isoformat()
+
+
 async def t_autonomous_memories() -> bool:
     # 自律発話用: 関連記憶(search) + 新しい切り口(topic_candidates) を混ぜる
+    # timestamp を明示するのは、暗黙 now だと②-3(自己参照除外)で関連枠が落ち、
+    # ランダム/重要度枠が拾うかどうかの確率テストになってしまうため。
     store = _store()
     for txt, key, pd in [("夏の話", "夏 スイカ", 30), ("旅行の話", "旅行", 80),
                          ("音楽の話", "音楽", 20), ("仕事の話", "仕事", 50)]:
-        await store.add_chunk(text=txt, search_text=key, prediction_diff=pd)
+        await store.add_chunk(text=txt, search_text=key, prediction_diff=pd,
+                              timestamp=_iso_ago(3600))
     res = await store.autonomous_memories("夏 スイカ", 3)
     texts = [c.text for c in res]
     # 関連(夏の話)が含まれる + k件以下 + 重複なし
@@ -189,9 +198,53 @@ async def t_autonomous_memories_empty() -> bool:
 async def t_autonomous_memories_cold_one() -> bool:
     # 記憶1件のみ → その1件を返す（ランダム枠/重要度枠が空でも壊れない）
     store = _store()
-    await store.add_chunk(text="夏祭りの記憶", search_text="夏", prediction_diff=50)
+    await store.add_chunk(text="夏祭りの記憶", search_text="夏", prediction_diff=50,
+                          timestamp=_iso_ago(3600))
     res = await store.autonomous_memories("夏", 3)
     return len(res) == 1 and res[0].text == "夏祭りの記憶"
+
+
+# ===== J-2 ②-3: 記憶の自己参照を断つ（自律発話の関連枠のみ）=====
+async def t_autonomous_excludes_fresh_chunk() -> bool:
+    # ⭐死活: 「たった今の会話から書かれた記憶」を関連枠で引かない。
+    # 実測(2026-07-26): 関連枠78回中53回が5分以内のチャンク・最短1.8秒・同一チャンクが27回連続。
+    store = _store()
+    await store.add_chunk(text="去年の夏祭りでスイカを食べた", search_text="夏 スイカ",
+                          timestamp=_iso_ago(3600))
+    await store.add_chunk(text="いま夏スイカの話をした", search_text="夏 スイカ",
+                          timestamp=_iso_ago(60))  # FeedbackLLM が1分前に書いた「今の会話」
+    res = await store.autonomous_memories("夏 スイカ", 1)  # k=1＝関連枠だけを単離
+    return len(res) == 1 and res[0].text == "去年の夏祭りでスイカを食べた"
+
+
+async def t_user_search_unaffected_by_exclusion() -> bool:
+    # ⭐死活: ユーザ発話への通常検索は不変（除外は自律発話専用＝既定 None で構造保証）
+    store = _store()
+    await store.add_chunk(text="いま夏スイカの話をした", search_text="夏 スイカ",
+                          timestamp=_iso_ago(60))
+    res = await store.search("夏 スイカ", k=1)
+    return len(res) == 1 and res[0].text == "いま夏スイカの話をした"
+
+
+async def t_autonomous_excludes_injected_conversation_span() -> bool:
+    # ⭐死活: 前回セッションの続きが recent に復元されている場合、その区間の記憶も引かない。
+    # 時刻窓だけでは捕まらない（実測 round0: 9日前のチャンクがそのまま注入会話と同一区間だった）。
+    store = _store()
+    await store.add_chunk(text="ずっと前のスイカの記憶", search_text="夏 スイカ",
+                          timestamp=_iso_ago(30 * 86400))
+    await store.add_chunk(text="前回セッションのスイカの話", search_text="夏 スイカ",
+                          timestamp=_iso_ago(9 * 86400))
+    res = await store.autonomous_memories("夏 スイカ", 1,
+                                          context_since_iso=_iso_ago(9 * 86400 + 600))
+    return len(res) == 1 and res[0].text == "ずっと前のスイカの記憶"
+
+
+async def t_autonomous_all_fresh_still_returns_seeds() -> bool:
+    # 縮退: 全部が直近チャンクでも種は返る（関連枠が空になるだけでランダム/重要度で埋まる）
+    store = _store()
+    for i in range(3):
+        await store.add_chunk(text=f"さっきの話{i}", search_text="夏", timestamp=_iso_ago(10))
+    return len(await store.autonomous_memories("夏", 3)) == 3
 
 
 async def t_autonomous_memories_bounds_dedup() -> bool:
@@ -265,6 +318,10 @@ async def main() -> None:
     check("autonomous_memories: 空ストア/None でも破綻しない", await t_autonomous_memories_empty())
     check("autonomous_memories: 記憶1件(cold)でも返す", await t_autonomous_memories_cold_one())
     check("autonomous_memories: k件以下・重複なし(合流dedup)", await t_autonomous_memories_bounds_dedup())
+    check("⭐②-3 関連枠は「今の会話から書いた記憶」を引かない", await t_autonomous_excludes_fresh_chunk())
+    check("⭐②-3 ユーザ検索は不変（除外は自律専用）", await t_user_search_unaffected_by_exclusion())
+    check("⭐②-3 注入会話区間の記憶も引かない(復元セッション)", await t_autonomous_excludes_injected_conversation_span())
+    check("②-3 全部が直近でも種は返る(縮退)", await t_autonomous_all_fresh_still_returns_seeds())
     check("JSONL 永続化往復（embedding込み・復元）", await t_persistence_roundtrip())
     check("配線: 応答に「過去の記憶」が注入される", await t_orch_injects_rag())
 

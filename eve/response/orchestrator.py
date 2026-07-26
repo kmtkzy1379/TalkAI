@@ -287,7 +287,13 @@ class ResponseOrchestrator:
                     # 自発発話: 今の画面/内容に**関連する記憶** ＋ **新しい切り口** を混ぜる（user search とは別系統）。
                     vis = self._vision_state.fresh_vision(Config.VLM_VISION_TTL_SEC) if self._vision_state is not None else None
                     content = stimulus.payload.content if isinstance(stimulus.payload, AutonomousSpeech) else None
-                    rag_chunks = await self._rag.autonomous_memories(" ".join(filter(None, [vis, content])), Config.RAG_RANDOM_K)
+                    # J-2 ②-3: 判定側と同じく、今注入している会話区間から生まれた記憶は除外する
+                    # （実測でエコーは判定経路と応答経路の**両方**に出ていた）。
+                    since = min(
+                        (t.stamp.iso for t in (recent or []) if t.speaker != OMITTED_SPEAKER), default=None)
+                    rag_chunks = await self._rag.autonomous_memories(
+                        " ".join(filter(None, [vis, content])), Config.RAG_RANDOM_K,
+                        context_since_iso=since)
                 elif stimulus.kind == StimulusKind.CALLFUNCTION_RESULT and isinstance(stimulus.payload, CallFunctionResult):
                     # 機能実行結果は **content** で関連記憶を引く（payload の repr 文字列で検索しない）。
                     rag_chunks = await self._rag.search(stimulus.payload.content)
