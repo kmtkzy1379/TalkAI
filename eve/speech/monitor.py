@@ -20,7 +20,7 @@ from ..clock import now_iso, now_mono
 from ..config import Config
 from ..context_assembler import OMITTED_SPEAKER, Turn
 from ..pipeline.stimulus import Stimulus, StimulusKind
-from .decider import AutonomousSpeech, DecideFn, should_speak
+from .decider import AutonomousSpeech, DecideFn, is_topic_outsourcing, should_speak
 
 logger = logging.getLogger(__name__)
 
@@ -285,6 +285,22 @@ class SpeechDecider:
             self._state.record_decision(
                 speak=False, reason="STT処理中（ユーザ発話が到着直前）のため自発発話を破棄", content="")
             return
+        # J-2 ②-4: 根拠なく話題を相手へ丸投げするだけの下書きは抑制（同内容抑制より**前**＝
+        # 埋め込み1回分を節約）。材料は判定LLMへ実際に渡したもの（種は `seed_text` と同じ表現）。
+        if decision.speak:
+            materials = [t.text for t in recent]
+            materials += [s.seed_text() if hasattr(s, "seed_text") else getattr(s, "text", "")
+                          for s in (seeds or [])]
+            if vision:
+                materials.append(vision)
+            if is_topic_outsourcing(decision.content, materials):
+                self._state.record_decision(
+                    speak=False,
+                    reason="観測できる根拠なしに話題を相手へ丸投げするため抑制",
+                    content=decision.content,  # 何を言おうとしたかは残す（同内容抑制と同じ規約）
+                )
+                logger.info("🔇 空振り発話を抑制（材料に接地しない話題の丸投げ）: %.40s", decision.content)
+                return
         # J-2 ②-1/②-2: 直近（時間窓）の自発発話と同内容なら抑制（保証層のコードゲート）。
         emb = None
         if decision.speak:

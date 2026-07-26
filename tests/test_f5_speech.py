@@ -484,12 +484,12 @@ def t_paraphrase_slips_bigram() -> bool:
     return content_similarity(_PARA_1, _PARA_2) < DUP_SIM_THRESHOLD
 
 
-async def _run_decider(state, contents, *, embedder=None, hook=None) -> tuple[list, list]:
+async def _run_decider(state, contents, *, embedder=None, hook=None, rag=None) -> tuple[list, list]:
     """contents を順に返す fake decide で decider を回し、(投入内容, 発話判定ログ) を返す。"""
     cache = ConversationCache(history_file=_tmp())
     await cache.initialize()
     cache.add_turn("user", "こんにちは")
-    rag = _store()
+    rag = rag if rag is not None else _store()
     calls = [0]
 
     async def fake_decide(*, surprise, silence_seconds, recent_turns, topic_seeds,
@@ -643,6 +643,64 @@ async def t_dup_embedding_failure_falls_back() -> bool:
         delivered == [_PARA_1, _PARA_2, _DUP_A1]  # 言い換えは通る（二段目なし）が文字重複は止まる
         and any("抑制" in e["reason"] for e in log)
     )
+
+
+# ===== J-2 ②-4: 根拠なき話題の丸投げ（空振り発話）の抑制 =====
+# 実E2E(2026-07-26 実起動状態)で**実際に再生された**空振り発話＝回帰の一次データ
+_WHIFF_1 = "予定ない時間って、逆に「今ならできること」も見つけやすいよね。今ふと、気になってることとかある？"
+_WHIFF_2 = "じゃあ、今はのんびりタイムだね。もし気が向いたら、最近ちょっと気になってることをぽつっと聞かせて。"
+# 同E2Eで正当と判断した発話（誤検出してはならない）
+_CARE_1 = "休憩中なら、温かい飲み物でも用意してのんびりしよっか。"
+_MEMO_1 = "休憩中って、ふと別のこと思い出したりするよね。前に電子レンジの仕組みに興味持ってたけど、ああいう「なんで？」って気になる話、私はけっこう好きだよ。"
+_SEED_1 = "ユーザは電子レンジで食べ物が温まる仕組みに興味を持ち、マイクロ波と水分の関係を話題にしていた"
+_ASK_GROUNDED = "さっきから同じような検索を何度も打ち直してるけど、何か困ってる？"
+_VISION_1 = "検索ボックスに同じ語を打っては消す動作が繰り返されている"
+
+
+def t_outsourcing_calibration() -> bool:
+    from eve.speech.decider import is_topic_outsourcing as f
+    return (
+        f(_WHIFF_1, []) and f(_WHIFF_2, [])                    # 実測の空振り2件を捕まえる
+        and not f(_MEMO_1, [_SEED_1])                          # 記憶起点は通す
+        # ⭐死活A: 「丸投げ表現」アーム。これが死ぬと接地ゼロの気遣い発話まで潰れる
+        # （接地アーム単独は実発話198件中104件=53%を潰す実測）
+        and not f(_CARE_1, [])
+        # ⭐死活B: 「材料接地」アーム。材料の有無で結果が反転する＝「見えている根拠がある時だけ
+        # 困りごとを聞いてよい」がコードに配線されている保証
+        and f(_ASK_GROUNDED, []) and not f(_ASK_GROUNDED, [_VISION_1])
+        # 既存ゲートのテスト素材を巻き込まない（②-1/②-2 の意図が変わらない）
+        and not f(_DUP_A1, []) and not f(_PARA_1, [])
+    )
+
+
+async def t_decider_suppresses_topic_outsourcing() -> bool:
+    # worker 経路: 空振りは投入されず、記憶起点は投入される。何を言おうとしたかは記録に残す。
+    state = SpeechState()
+    contents = [SpeechDecision(True, "話す", _WHIFF_1), SpeechDecision(True, "話す", _MEMO_1)]
+
+    class _SeedRag:
+        async def autonomous_memories(self, query, k, *, context_since_iso=None):
+            class _C:
+                text = _SEED_1
+
+                def seed_text(self):
+                    return _SEED_1
+            return [_C()]
+
+    delivered, log = await _run_decider(state, contents, rag=_SeedRag())
+    whiff = [e for e in log if "丸投げ" in e["reason"]]
+    return (
+        delivered == [_MEMO_1]
+        and len(whiff) == 1 and whiff[0]["speak"] is False and whiff[0]["content"] == _WHIFF_1
+    )
+
+
+async def t_outsourcing_gate_precedes_dup_gate() -> bool:
+    # 空振りゲートは同内容抑制より前（無駄な埋め込み呼び出しをしない）
+    emb = _FakeEmbedder({})
+    state = SpeechState()
+    delivered, _ = await _run_decider(state, [SpeechDecision(True, "話す", _WHIFF_1)], embedder=emb)
+    return delivered == [] and emb.calls == 0
 
 
 # ===== J-2 ③-A: STT 待ち窓（発話終了〜テキスト投入）ガード =====
@@ -1029,6 +1087,9 @@ async def main() -> None:
     check("直近会話に経過時間を添える(古い会話を返事待ちと誤読しない)", t_turn_rendering_has_elapsed())
     check("話題の種は要約1行+相対時刻で描く", t_seed_rendering_summary_and_time())
     check("話題の種は直近ユーザ発話で引く(自己強化しない)", await t_seed_query_uses_last_user_turn())
+    check("⭐②-4 空振り判定の較正(丸投げ/接地の両アーム死活)", t_outsourcing_calibration())
+    check("⭐②-4 空振りは投入せず記憶起点は通す", await t_decider_suppresses_topic_outsourcing())
+    check("②-4 空振りゲートは同内容抑制より前(埋め込み節約)", await t_outsourcing_gate_precedes_dup_gate())
     check("cosine 基本(同一/直交/空/ゼロ)", t_cosine_basic())
     check("言い換えは文字bigramをすり抜ける(二段目の根拠)", t_paraphrase_slips_bigram())
     check("⭐②-2: 黙る判定でログが溢れても抑制が効く", await t_dup_survives_speech_log_overflow())
