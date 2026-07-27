@@ -239,6 +239,48 @@ async def t_autonomous_excludes_injected_conversation_span() -> bool:
     return len(res) == 1 and res[0].text == "ずっと前のスイカの記憶"
 
 
+# ===== J-2 ②-5: 関連枠の固着を切る（クエリ不変時スキップ + メタ要約除外）=====
+async def t_autonomous_skips_relevance_on_repeated_query() -> bool:
+    # ⭐死活: 放置中はクエリが変わらないので relevance top-1 は毎回同じ1件になる
+    # （実測 2026-07-26: 80回の呼び出しで関連枠の unique 8件・最頻26回）。同じクエリの
+    # 2回目以降は関連枠を空け、ランダム/重要度に回す。
+    # 関連検索が呼ばれたかで判定する（ランダム枠の中身に依存させない＝決定論）
+    store = _store()
+    await store.add_chunk(text="スイカの記憶", search_text="夏 スイカ", timestamp=_iso_ago(3600))
+    await store.add_chunk(text="旅行の記憶", search_text="旅行", timestamp=_iso_ago(3600))
+    calls: list = []
+    orig = store.search
+
+    async def spy(q, k=None, **kw):
+        calls.append(q)
+        return await orig(q, k, **kw)
+
+    store.search = spy  # type: ignore[assignment]
+    await store.autonomous_memories("夏 スイカ", 1)
+    await store.autonomous_memories("夏 スイカ", 1)  # 同じクエリ → 関連検索は走らない
+    await store.autonomous_memories("旅行", 1)       # クエリが変われば復活
+    return calls == ["夏 スイカ", "旅行"]
+
+
+async def t_topic_seeds_exclude_meta_summary() -> bool:
+    # ⭐死活: 「会話を区切った」「特に相談や予定は出ていない」等の中身の無い要約は種にしない。
+    # 実測: コーパス189件中8件(4%)のメタ要約が関連枠の26/78回(33%)を占拠していた。
+    meta = "ユーザは短く区切りをつけて会話を終え、特定の相談や予定は出ていない"
+    store = _store()
+    # 検索キーの軸をずらす（fake 埋め込みで同一ベクトルになると MMR の重複除去に掛かるため）
+    await store.add_chunk(text=meta, summary=meta, search_text="夏 ラーメン",
+                          prediction_diff=92, timestamp=_iso_ago(3600))
+    await store.add_chunk(text="去年の夏祭りでスイカを食べた", summary="去年の夏祭りでスイカを食べた",
+                          search_text="夏 スイカ", prediction_diff=10, timestamp=_iso_ago(3600))
+    seeds = [c.text for c in await store.autonomous_memories("夏", 3)]
+    rnd = [c.text for c in store.random(5)]
+    topic = [c.text for c in store.topic_candidates(5)]
+    # ユーザ発話への通常検索では従来どおり返る（記憶としては正しい・除外は種だけ）
+    user_search = [c.text for c in await store.search("夏", k=2)]
+    return (meta not in seeds and meta not in rnd and meta not in topic
+            and "去年の夏祭りでスイカを食べた" in seeds and meta in user_search)
+
+
 async def t_autonomous_all_fresh_still_returns_seeds() -> bool:
     # 縮退: 全部が直近チャンクでも種は返る（関連枠が空になるだけでランダム/重要度で埋まる）
     store = _store()
@@ -322,6 +364,8 @@ async def main() -> None:
     check("⭐②-3 ユーザ検索は不変（除外は自律専用）", await t_user_search_unaffected_by_exclusion())
     check("⭐②-3 注入会話区間の記憶も引かない(復元セッション)", await t_autonomous_excludes_injected_conversation_span())
     check("②-3 全部が直近でも種は返る(縮退)", await t_autonomous_all_fresh_still_returns_seeds())
+    check("⭐②-5 同じクエリでは関連枠を使わない(固着防止)", await t_autonomous_skips_relevance_on_repeated_query())
+    check("⭐②-5 メタ要約は種にしない(ユーザ検索では返る)", await t_topic_seeds_exclude_meta_summary())
     check("JSONL 永続化往復（embedding込み・復元）", await t_persistence_roundtrip())
     check("配線: 応答に「過去の記憶」が注入される", await t_orch_injects_rag())
 

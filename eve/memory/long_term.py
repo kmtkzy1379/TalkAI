@@ -19,6 +19,7 @@ import json
 import logging
 import math
 import random
+import re
 import time
 from collections import deque
 from datetime import datetime
@@ -35,6 +36,23 @@ from .embed import Embedder, make_embedder
 logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+# 話題の種として使えない「中身の無い要約」（会話の区切り/相談なし/反応なし 等）。
+# FeedbackLLM は毎ターン要約を書くので、無言や締めの往復もチャンク化される。それ自体は記憶として
+# 正しいが、**話題の種**にすると「もう話すことは無い」を毎回材料として渡すことになる。
+_META_SUMMARY = re.compile(
+    r"特に(の|)(相談|予定|話題|用件|すること)(は|も)(出て|)(い|)な"
+    r"|新しい(発言|話題|情報)(は|も)(無|な)"
+    r"|会話を(いったん|)(区切|終|締)"
+    r"|(返答|反応|返事)(や[^、。]{0,8})?(は|が|も)(まだ|)(無|な|して)"
+    r"|やり取りは(無|な)"
+    r"|短く(了承|区切)"
+)
+
+
+def _is_meta_summary(text: Optional[str]) -> bool:
+    return bool(_META_SUMMARY.search((text or "").splitlines()[0] if text else ""))
 
 
 def _ts_epoch(ts_iso: str, fallback: float) -> float:
@@ -74,6 +92,8 @@ class RagStore:
         self._chunks: "deque[dict]" = deque(maxlen=self.max_chunks)  # ロケット鉛筆
         self._write_queue: "asyncio.Queue[Optional[dict]]" = asyncio.Queue()
         self._write_task: Optional[asyncio.Task] = None
+        # J-2 ②-5: 自律発話の関連枠に使った直前クエリ（同じなら関連枠を使わない＝同じ記憶の固着防止）
+        self._last_auto_query: Optional[str] = None
 
     # --- ライフサイクル ---------------------------------------------------
 
@@ -310,9 +330,20 @@ class RagStore:
         selected, info = await self._retrieve(query, k)
         return {"query": query, "selected": selected, "info": info}
 
+    def _topic_pool(self) -> list[dict]:
+        """話題の種に使える記憶だけを残す（メタ要約を除外）。
+
+        「会話を区切った」「特に相談や予定は出ていない」等の**中身の無い要約**は、話題として
+        振れないうえ「もう話すことは無い」という含意を毎回注入して沈黙側に効く。実測
+        (2026-07-26): コーパス189件中8件(4%)のメタ要約が、関連枠の**26/78回(33%)**を占拠して
+        いた。ユーザ発話への通常検索(`search`)からは外さない（何が起きたかの記憶としては正しい）。
+        """
+        pool = [c for c in self._chunks if not _is_meta_summary(c.get("summary") or c.get("text"))]
+        return pool or list(self._chunks)  # 全部メタなら諦めて全件（種ゼロにはしない）
+
     def random(self, k: int = 2) -> list[RagChunk]:
         """無言時の「話題の種」用ランダム取得（埋め込み不要・同期）。"""
-        chunks = list(self._chunks)
+        chunks = self._topic_pool()
         if not chunks:
             return []
         picked = random.sample(chunks, min(k, len(chunks)))
@@ -332,7 +363,7 @@ class RagStore:
         （埋め込み不要・同期）。ユーザ会話の `search`（関連度重視）とは別系統＝relevance を使わず、
         重要度(予測差) + ランダム jitter で並べる（random の「過去に逸れない/新しい話題」狙いを保ちつつ
         重要な記憶を少し優遇）。"""
-        chunks = list(self._chunks)
+        chunks = self._topic_pool()
         if not chunks:
             return []
         jit = jitter if jitter is not None else Config.RAG_TOPIC_JITTER
@@ -358,6 +389,12 @@ class RagStore:
         context_since_iso: 今 recent_turns として注入されている会話の最古 iso（前回セッションの
         復元分を含む）。時刻窓(RAG_AUTO_EXCLUDE_SEC)だけでは、9日前に中断した会話がそのまま
         注入されている場合を捕まえられない（実測 round0）。
+
+        **クエリ不変なら関連枠を使わない（J-2 ②-5）**: 放置中はクエリ（画面+直近ユーザ発話）が
+        変化しないので、relevance top-1 は毎回**同じ1件**になる（実測: 80回の呼び出しで関連枠の
+        unique は8件・最頻26回）。同じ記憶を関連として出し続けると判定LLMがその話題に固着するため、
+        前回と同じクエリでは関連枠を空けてランダム/重要度に回す。ユーザが何か言えばクエリが変わり、
+        関連想起はその場で復活する。
         """
         out: list[RagChunk] = []
         seen: set[str] = set()
@@ -367,12 +404,16 @@ class RagStore:
                 out.append(c)
                 seen.add(c.text)
 
-        if query and query.strip():
+        q = (query or "").strip()
+        repeated = bool(q) and q == self._last_auto_query
+        self._last_auto_query = q or None
+        if q and not repeated:
             cutoff = time.time() - Config.RAG_AUTO_EXCLUDE_SEC
             if context_since_iso:
                 cutoff = min(cutoff, _ts_epoch(context_since_iso, cutoff))
             for c in await self.search(query, max(1, k // 3), exclude_after=cutoff):
-                _add(c)
+                if not _is_meta_summary(c.summary or c.text):  # メタ要約は種にしない
+                    _add(c)
         for c in self.random(2):  # 完全ランダム1件（関連度エコーチェンバーを破る）
             if len(out) >= k:
                 break
