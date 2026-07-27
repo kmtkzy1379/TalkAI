@@ -30,10 +30,15 @@ _FALLBACK_CONTENT = "（今の状況に自然に一言）"
 
 @dataclass(frozen=True)
 class AutonomousSpeech:
-    """自発発話の刺激 payload（content=応答LLMへ渡す内容 / reason=なぜ話すか）。"""
+    """自発発話の刺激 payload（content=応答LLMへ渡す内容 / reason=なぜ話すか）。
+
+    stale_reference: 下書きの時間表現が実際の経過と食い違う（②-6）。True の時だけ応答側に
+    「直して話す」許可を出す（常時出すと新しい会話でも不要に「前に」と言い出す・実測）。
+    """
 
     content: str
     reason: str
+    stale_reference: bool = False
 
 
 @dataclass(frozen=True)
@@ -140,6 +145,38 @@ _OUTSOURCE = re.compile(
     + r"|" + _VAGUE + r"[^。]{0,20}" + _INDEF + r"[^。]{0,6}(を|、)?(聞かせて|教えて|聞いてみたい)"
     + r"|" + r"(困っ|詰まっ|悩ん|大変)[^。]{0,10}(こと|の)?[^。]{0,6}[？\?]"
 )
+
+
+# ---- J-2 ②-6: 時制の混同（古い話を「さっき」と呼ぶ）の検出 ------------------
+# 実機事故(2026-07-26/27): 10日前に中断した会話を「さっきの件」「その件」と呼んだ。判定LLM の
+# reason は「10日前の調査タスクは…」と**正しく認識している**のに content だけが誤る＝下書きの
+# 生成時点で起きている（応答LLM は下書きを逐語コピーするだけ）。よって下書き層で捕まえる。
+# 判定は「直近**ユーザ**発話の古さ」で行う（直前ターンだとイブ自身の自発発話で新しくなり取り逃す。
+# 実データで1/3を取り逃すことを確認）。実測: イブ発話266件中、直近指示語を含む12件の経過は
+# 「正当=106秒以下」と「誤り=10日以上」に完全に分離しており、閾値はその間ならどこでも精度1.00。
+# 「さっき」系（時制の誤り）に加え、「その件/例の件」系（何を指すか分からない）も対象にする。
+# ユーザ指摘: 「さっきの件とかその件と言われても、どの件か分からない」＝時間が経っているほど
+# 指示語だけでは復元できない。古い話題は名指しさせる。
+_RECENCY_DEIXIS = re.compile(
+    r"さっき|さきほど|先ほど|たった今|ついさっき|今しがた|直前"
+    r"|(今|いま|そ|こ|あ|例)の(件|話|やつ)")
+STALE_RECENCY_SEC = 900.0  # 15分（分離帯 [107秒, 10日] の安全な中央）
+
+
+def stale_recency_deixis(content: str, recent_turns, now: Optional[str] = None,
+                         stale_sec: float = STALE_RECENCY_SEC) -> bool:
+    """下書きが「さっき」等の直近指示語を含むのに、直近ユーザ発話が古い（=誤り）か。"""
+    if not _RECENCY_DEIXIS.search(content or ""):
+        return False
+    n = now or now_iso()
+    ages = [
+        elapsed_wall(getattr(getattr(t, "stamp", None), "iso", "") or "", n)
+        for t in (recent_turns or []) if getattr(t, "speaker", "") == "user"
+        and (getattr(getattr(t, "stamp", None), "iso", "") or "")
+    ]
+    if not ages:
+        return False  # ユーザ発話が無い（判断材料なし）→ 誤りとみなさない
+    return min(ages) > stale_sec
 
 
 def _topic_tokens(text: Optional[str]) -> set:

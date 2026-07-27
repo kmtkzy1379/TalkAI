@@ -129,13 +129,19 @@ class ResponseOrchestrator:
         )
 
     def _vision_for(self, stimulus: Stimulus) -> Optional[str]:
-        """この刺激の応答文脈に入れる画面情報（層分離の唯一の分岐点）。"""
+        """この刺激の応答文脈に入れる画面情報（層分離の唯一の分岐点）。
+
+        3値: None=VLM 未配線（ブロックを出さない）/ ""=今は画面情報が無い**明示** / 本文。
+        「無い」を明示しないと、RAG に入った過去の画面描写を現在として語る（実機事故 2026-07-27）。
+        """
         if self._vision_state is None:
             return None
         if stimulus.kind == StimulusKind.USER_UTTERANCE:
-            return self._vision_state.vision_for_user(
+            v = self._vision_state.vision_for_user(
                 Config.VLM_VISION_TTL_SEC, Config.VLM_STATIC_VISION_MAX_SEC)
-        return self._vision_state.fresh_vision(Config.VLM_VISION_TTL_SEC)
+        else:
+            v = self._vision_state.fresh_vision(Config.VLM_VISION_TTL_SEC)
+        return v if v else ""
 
     def _build_messages(
         self,
@@ -158,9 +164,11 @@ class ResponseOrchestrator:
         user_text = None
         autonomous_content = None
         callfunction_result = None
+        stale_reference = False
         if stimulus.kind == StimulusKind.AUTONOMOUS_SPEECH and isinstance(payload, AutonomousSpeech):
             autonomous_content = payload.content
             speech_reason = payload.reason
+            stale_reference = payload.stale_reference
         elif stimulus.kind == StimulusKind.CALLFUNCTION_RESULT and isinstance(payload, CallFunctionResult):
             # 機能実行結果はユーザ発話ではない＝user 枠でなく「# 機能実行結果」ブロックへ（誤話者防止）。
             callfunction_result = payload.content
@@ -190,6 +198,7 @@ class ResponseOrchestrator:
             last_feedback=last_feedback,
             vision=vision,
             speech_decision_reason=speech_reason,
+            stale_reference=stale_reference,
             callfunction_result=callfunction_result,
             tools_active=self._tools_enabled_for(stimulus),
             active_tasks=active_tasks,

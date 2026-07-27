@@ -645,6 +645,44 @@ async def t_dup_embedding_failure_falls_back() -> bool:
     )
 
 
+# ===== J-2 ②-6: 時制の混同（古い話を「さっき」と呼ぶ）=====
+def t_stale_recency_deixis() -> bool:
+    # ⭐実機事故(2026-07-26/27): 10日前に中断した会話を「さっきの件」と呼んだ。判定LLM の reason は
+    # 「10日前の調査タスクは…」と正しいのに content だけ誤る＝下書き層で捕まえる。
+    # 実測: イブ発話266件中の直近指示語12件は「正当≤106秒 / 誤り≥10日」に完全分離。
+    from eve.clock import Stamp, now_iso
+    from eve.context_assembler import Turn
+    from eve.speech.decider import stale_recency_deixis as f
+    from datetime import datetime, timedelta, timezone
+
+    def iso_ago(sec):
+        return (datetime.now(timezone.utc) - timedelta(seconds=sec)).isoformat()
+    now = now_iso()
+    old_user = [Turn("user", "結果が出たら教えて", Stamp(iso_ago(10 * 86400), 0.0)),
+                Turn("eve", "うん、調べておくね", Stamp(iso_ago(10 * 86400), 0.0))]
+    fresh_user = [Turn("user", "さっきの話だけどさ", Stamp(iso_ago(30), 0.0))]
+    # 直前がイブ発話48秒前でも、直近**ユーザ**発話が10日前なら True（実データの取り逃し回帰）
+    mixed = old_user + [Turn("eve", "手がかり待ちだよ", Stamp(iso_ago(48), 0.0))]
+    return (
+        f("さっきの件、確定までは届かなかったから…", old_user, now) is True
+        and f("さっきの件、どうなった？", fresh_user, now) is False   # 新しければ正当
+        and f("前に話してた件、進んでる？", old_user, now) is False   # 指示語なし＝対象外
+        and f("その件、まだ確定できてないんだ", mixed, now) is True
+        and f("さっきの件", [], now) is False                        # ユーザ発話なし＝判断材料なし
+    )
+
+
+def t_stale_correction_only_when_flagged() -> bool:
+    # ⭐死活: 訂正指示は stale_reference が立った時だけ出す（常時出すと新しい会話でも
+    # 不要に「前に」と言い出す・実測 4/10）
+    from eve.context_assembler import ContextAssembler
+    ctx = ContextAssembler(system_prompt="S")
+    on = ctx.assemble(autonomous_content="さっきの件、絞れそうだよ", stale_reference=True)[-1]["content"]
+    off = ctx.assemble(autonomous_content="さっきの件、絞れそうだよ")[-1]["content"]
+    return ("時間表現が実際の経過と食い違" in on and "「前に」「この前」" in on
+            and "時間表現" not in off)
+
+
 # ===== J-2 ①: 既出の用件ブロック（言い換えた同用件の反復を止める）=====
 def t_prior_block_present_and_absent() -> bool:
     from eve.speech.decider import PRIOR_HEAD, build_decide_messages
@@ -1159,6 +1197,8 @@ async def main() -> None:
     check("直近会話に経過時間を添える(古い会話を返事待ちと誤読しない)", t_turn_rendering_has_elapsed())
     check("話題の種は要約1行+相対時刻で描く", t_seed_rendering_summary_and_time())
     check("話題の種は直近ユーザ発話で引く(自己強化しない)", await t_seed_query_uses_last_user_turn())
+    check("⭐②-6 時制ゲート: 古い会話を「さっき」と呼ぶのを検出", t_stale_recency_deixis())
+    check("⭐②-6 訂正指示は立った時だけ出す", t_stale_correction_only_when_flagged())
     check("①既出ブロック: 有無で出し分け", t_prior_block_present_and_absent())
     check("⭐①既出ブロック: 位置と2規則(沈黙化/畳みかけの死活)", t_prior_block_position_and_rules())
     check("①既出: 上限で実発話を残す/窓で消える", t_prior_items_cap_and_window())

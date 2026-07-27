@@ -147,7 +147,10 @@ class Config:
     # ユーザ発話への応答に限り、画面が**変化していない間**は古い実況を据え置ける上限[秒]。
     # 「今何が見える?」に静止画面でも答えるため（注入時は「N秒前・以降変化なし」と正直に付す）。
     # 自発発話・発話判定はこの据え置きを使わない（静止中に画面へ引っ張られる固執を断つ層分離）。
-    VLM_STATIC_VISION_MAX_SEC = float(os.getenv("VLM_STATIC_VISION_MAX_SEC", "180.0"))
+    # 実測(2026-07-27): 無実況区間の分布は二峰性（≤52秒 か 数分以上の放置）で、180 はちょうど谷＝
+    # どちらにも効いていなかった。328秒前の実況がまだ正しかったのに 180 で捨てて捏造した事故が
+    # 出たため 600 へ。上限を残すのは、pHash 閾値未満の局所変化が積もる可能性に対する保険。
+    VLM_STATIC_VISION_MAX_SEC = float(os.getenv("VLM_STATIC_VISION_MAX_SEC", "600.0"))
     VLM_BLANK_STD_THRESHOLD = float(os.getenv("VLM_BLANK_STD_THRESHOLD", "6.0"))  # 黒/空白検出（std 未満=取得不可・A11）
 
     # Call-Function（J-0 即時 Call-Function・increment 1 は read-only 能力のみ）。

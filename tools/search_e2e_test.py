@@ -68,6 +68,13 @@ def _seed_from_real(name: str, dest: str) -> str:
 
 
 if REAL_STATE:
+    # E2E_FEATURES=1: 記憶は実状態のまま、タスク/検索/Call-Function を明示的に有効化する。
+    # .env にこれらのフラグが無いため実起動では無効だが、機能自体のテストには必要
+    # （フラグの既定をどうするかは別途ユーザ判断）。
+    if os.getenv("E2E_FEATURES") == "1":
+        Config.CALLFUNCTION_ENABLED = True
+        Config.TASK_ENABLED = True
+        Config.SEARCH_ENABLED = True
     Config.HISTORY_FILE = _seed_from_real(Config.HISTORY_FILE, "history.jsonl")
     Config.RAG_FILE = _seed_from_real(Config.RAG_FILE, "rag_memory.jsonl")
     Config.TASK_FILE = _seed_from_real(Config.TASK_FILE, "tasks.jsonl")
@@ -766,7 +773,45 @@ async def s_vlm_states(h: Harness):
     await h.wait_idle(30)
 
 
+async def s_speech_sources(h: Harness):
+    """自発発話の**由来**を切り分ける（画面 / 直近会話 / 記憶）。
+
+    ユーザ要望「RAGだけでなく画面認識や直近会話からも自発発話するか」の確認。
+    各フェーズの自発発話を記録し、事後に語彙・画面ブロック有無で帰属を判定する。
+    """
+    dur = float(os.getenv("SRC_PHASE_SEC", "120"))
+
+    ev("═══", f"SRC-1 画面が動いている最中に放置{dur:.0f}s（画面起点が出るか）")
+    t0 = time.monotonic()
+    mover = asyncio.create_task(asyncio.to_thread(screen_activity_loop, dur))
+    await asyncio.sleep(dur)
+    await mover
+    for (m, k, d, tx, c) in h.handles:
+        if k == "AUTONOMOUS_SPEECH" and m >= t0:
+            ev("🗣", f"  SRC-1 +{m - t0:.0f}s {tx[:95]}")
+
+    ev("═══", f"SRC-2 具体的な話題を振ってから放置{dur:.0f}s（会話起点が出るか）")
+    await h.say("最近ぜんぜんゲームやってなくてさ、積んでるソフトばっかり増えてるんだよね。")
+    await h.wait_idle(40)
+    t1 = time.monotonic()
+    await asyncio.sleep(dur)
+    for (m, k, d, tx, c) in h.handles:
+        if k == "AUTONOMOUS_SPEECH" and m >= t1:
+            ev("🗣", f"  SRC-2 +{m - t1:.0f}s {tx[:95]}")
+
+    ev("═══", f"SRC-3 中立な区切りから放置{dur:.0f}s（記憶起点が出るか）")
+    await h.say("うん、まあそんな感じかな。")
+    await h.wait_idle(40)
+    t2 = time.monotonic()
+    await asyncio.sleep(dur)
+    for (m, k, d, tx, c) in h.handles:
+        if k == "AUTONOMOUS_SPEECH" and m >= t2:
+            ev("🗣", f"  SRC-3 +{m - t2:.0f}s {tx[:95]}")
+    await h.wait_idle(30)
+
+
 SCENARIOS = [
+    ("SSRC_自発発話の由来", s_speech_sources),
     ("SVLM_画面認識の全場面", s_vlm_states),
     ("SIDLE_3分放置頻度", s_idle3),
     ("SAUTO_自律発話計測", s_auto_speech),

@@ -475,6 +475,43 @@ def t_build_decide_vision_block() -> bool:
     return "# 画面（今この瞬間）" in uw and "ブラウザ閲覧中" in uw and "# 画面" not in un
 
 
+async def t_vision_absence_marker() -> bool:
+    # ⭐実機事故(2026-07-27): 画面情報が渡っていないのに「今はブラウザで近くのカフェの画像検索が
+    # 見えてるよ」と答えた（文言の出所は RAG にあった33日前の画面記憶）。応答側に「今は分からない」
+    # という否定情報が届かないと、過去の画面描写が現在の答えになる。3値規約で不在を明示する。
+    from eve.context_assembler import ContextAssembler
+    ctx = ContextAssembler(system_prompt="S")
+    absent = ctx.assemble(user_text="今何が見えてる?", vision="")[0]["content"]
+    unwired = ctx.assemble(user_text="今何が見えてる?", vision=None)[0]["content"]
+    present = ctx.assemble(user_text="今何が見えてる?", vision="メモ帳が開いている")[0]["content"]
+    return (
+        "画面情報なし" in absent and "過去の記憶から作らない" in absent
+        and "今は画面が見えていない" in absent
+        # 会話から言えることまで潰さない（強い文言だと全部「見えないから分からない」になる実測）
+        and "これまでどおり普通に話してよい" in absent
+        and "# 画面" not in unwired      # VLM 未配線: ブロック自体を出さない
+        and "画面情報なし" not in present and "メモ帳が開いている" in present
+    )
+
+
+async def t_orchestrator_reports_vision_absence() -> bool:
+    # ⭐配線: vision_state はあるが情報が無い時、orchestrator は None でなく ""（不在明示）を渡す
+    from eve.pipeline import AudioPlayQueue, Stimulus, StimulusKind
+    from eve.response import ResponseOrchestrator
+
+    async def stream_fn(m):
+        yield "ok"
+
+    async def tts(s):
+        return b"x"
+    vs = VisionState()  # 実況なし＝画面情報なし
+    orch = ResponseOrchestrator(AudioPlayQueue(), stream_fn, tts, vision_state=vs)
+    sysmsg = orch._build_messages(Stimulus(StimulusKind.USER_UTTERANCE, "今何が見えてる?"))[0]["content"]
+    no_vlm = ResponseOrchestrator(AudioPlayQueue(), stream_fn, tts)._build_messages(
+        Stimulus(StimulusKind.USER_UTTERANCE, "やあ"))[0]["content"]
+    return "画面情報なし" in sysmsg and "# 画面" not in no_vlm
+
+
 async def t_vision_injected_into_messages() -> bool:
     # ResponseOrchestrator が latest_vision を「# 画面（今この瞬間）」として注入する
     from eve.pipeline import AudioPlayQueue, Stimulus, StimulusKind
@@ -611,6 +648,8 @@ async def main() -> None:
     check("build_decide_messages の画面ブロック", t_build_decide_vision_block())
     check("T2 vlm: vlm surprise で should_speak 反転", await t_t2_vlm_surprise_flips())
     check("vision を応答文脈に注入(# 画面)", await t_vision_injected_into_messages())
+    check("⭐画面不在マーカ: 無い事を明示し捏造を禁じる(3値規約)", await t_vision_absence_marker())
+    check("⭐配線: 画面情報なしは None でなく不在明示を渡す", await t_orchestrator_reports_vision_absence())
     # capture / capture_thread
     check("capture: 黒→blank / 通常→有効 b64+phash", t_capture_blank_and_valid())
     check("capture_thread step: gate→deliver 橋渡し", t_capture_thread_step_delivers())

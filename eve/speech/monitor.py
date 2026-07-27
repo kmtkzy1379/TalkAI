@@ -20,7 +20,13 @@ from ..clock import humanize, now_iso, now_mono
 from ..config import Config
 from ..context_assembler import OMITTED_SPEAKER, Turn
 from ..pipeline.stimulus import Stimulus, StimulusKind
-from .decider import AutonomousSpeech, DecideFn, is_topic_outsourcing, should_speak
+from .decider import (
+    AutonomousSpeech,
+    DecideFn,
+    is_topic_outsourcing,
+    should_speak,
+    stale_recency_deixis,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -358,10 +364,14 @@ class SpeechDecider:
         if decision.speak:
             self._state.record_autonomous_speech(decision.content, emb)  # 次回以降の比較元
             self._state.record_prior_item(decision.content, played=True)
+            # ②-6: 「さっき」等が実際の経過と食い違うなら、応答側に訂正許可を渡す
+            stale = stale_recency_deixis(decision.content, recent)
+            if stale:
+                logger.info("🕒 下書きの時間表現が経過と食い違う（訂正を指示）: %.40s", decision.content)
             await self._queue.put(
                 Stimulus(
                     StimulusKind.AUTONOMOUS_SPEECH,
-                    AutonomousSpeech(decision.content, decision.reason),
+                    AutonomousSpeech(decision.content, decision.reason, stale_reference=stale),
                     merge_key="autonomous",
                 )
             )
