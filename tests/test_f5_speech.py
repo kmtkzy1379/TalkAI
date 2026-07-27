@@ -9,6 +9,7 @@ import asyncio
 import inspect
 import logging
 import os
+import re
 import sys
 import tempfile
 
@@ -646,6 +647,23 @@ async def t_dup_embedding_failure_falls_back() -> bool:
 
 
 # ===== J-2 ②-6: 時制の混同（古い話を「さっき」と呼ぶ）=====
+def t_no_verbatim_speech_examples() -> bool:
+    """⭐発話の逐語見本をプロンプトに置かない（J-2 ①-b）。
+
+    実測(2026-07-28・11局面×N=10): プロンプトにあった見本「そういえば前〜って言ってたね」等が
+    そのまま採用され、自発発話の先頭は「そういえば」系が 69%・最頻先頭6字の占有率0.47（人間の
+    実測は0.07・イブの応答発話は0.02）だった。見本2つを消すだけで 55%・0.24 に下がり、
+    speak率・記憶の使用率・具体語数はいずれも不変（副作用なし）。
+    「例があると分かりやすい」で再導入されるのを止めるコードゲート。
+    """
+    from eve.speech.decider import SPEECH_DECIDE_SYSTEM, build_decide_messages
+    text = SPEECH_DECIDE_SYSTEM + build_decide_messages(
+        surprise=20, silence_seconds=30.0, recent_turns=[], topic_seeds=[])[1]["content"]
+    has_example = re.search(r"「(そういえば|そういや|前に|さっき)[^」]*」", text)
+    # 種ヘッダの「振ってよい」という**許可**は残すこと（消すと沈黙化する実測: S1 で 10/10→2/10）
+    return has_example is None and "話を振ってよい" in text
+
+
 def t_stale_recency_deixis() -> bool:
     # ⭐実機事故(2026-07-26/27): 10日前に中断した会話を「さっきの件」と呼んだ。判定LLM の reason は
     # 「10日前の調査タスクは…」と正しいのに content だけ誤る＝下書き層で捕まえる。
@@ -1197,6 +1215,7 @@ async def main() -> None:
     check("直近会話に経過時間を添える(古い会話を返事待ちと誤読しない)", t_turn_rendering_has_elapsed())
     check("話題の種は要約1行+相対時刻で描く", t_seed_rendering_summary_and_time())
     check("話題の種は直近ユーザ発話で引く(自己強化しない)", await t_seed_query_uses_last_user_turn())
+    check("⭐①-b 発話の逐語見本をプロンプトに置かない", t_no_verbatim_speech_examples())
     check("⭐②-6 時制ゲート: 古い会話を「さっき」と呼ぶのを検出", t_stale_recency_deixis())
     check("⭐②-6 訂正指示は立った時だけ出す", t_stale_correction_only_when_flagged())
     check("①既出ブロック: 有無で出し分け", t_prior_block_present_and_absent())
