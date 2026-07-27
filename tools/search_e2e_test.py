@@ -26,6 +26,7 @@ import io
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -713,7 +714,60 @@ async def s_idle3(h: Harness):
         await h.wait_idle(20)
 
 
+async def s_vlm_states(h: Harness):
+    """画面認識まわりの全場面（J-2 ③ 沈黙バイアス撤廃の回帰）。
+
+    1. 静止画面で「今何が見える?」→ 変化していない間は据え置きで答えられる（層分離）
+    2. 画面変化中 → 画面に触れた応答/自発発話ができる
+    3. 静止で放置 → 自発発話が画面を**捏造しない**
+    4. イブの発話中にユーザが割り込む → 中断され、その後の応答が壊れない
+    判定は自動化せず一次データ（timeline/terminal.log）に残す。捏造だけ自動チェックする。
+    """
+    ev("═══", "VLM-1 静止画面で『今何が見えてる?』（据え置きが働くか・捏造しないか）")
+    await asyncio.sleep(25)  # 画面を触らない＝VLM が止まり latest_vision が TTL 超過する
+    await h.say("ねえ、今わたしの画面って何が見えてる？")
+    await h.wait_idle(40)
+
+    ev("═══", "VLM-2 画面変化中（メモ帳を開いて動かす）")
+    mover = asyncio.create_task(asyncio.to_thread(screen_move_sync))
+    await asyncio.sleep(8)  # 変化フレームが VLM に届くのを待つ
+    await h.say("今、画面どうなってる？")
+    await h.wait_idle(40)
+    await mover
+
+    ev("═══", "VLM-3 静止に戻して放置150s（自発発話が画面を捏造しないか）")
+    t0 = time.monotonic()
+    await asyncio.sleep(150)
+    autos = [(round(m - t0, 1), tx) for (m, k, d, tx, c) in h.handles
+             if k == "AUTONOMOUS_SPEECH" and m >= t0]
+    bad = [(s, tx) for s, tx in autos
+           if re.search(r"画面|表示|見え(て|る)|映っ|ウィンドウ|タブ", tx)
+           and not re.search(r"画面[^。]{0,8}(見えて(い)?な|分からな|無い|ない)", tx)]
+    ev("📊", f"VLM-3 自発発話 {len(autos)}件 / 画面に言及した疑い {len(bad)}件")
+    for s, tx in autos:
+        ev("🗣", f"  +{s}s {tx[:90]}")
+    for s, tx in bad:
+        ev("⚠", f"  画面捏造の疑い: {tx[:90]}")
+
+    ev("═══", "VLM-4 発話中の割り込みとその後")
+    prep = await h.prep("ごめん、今の話じゃなくて、ちょっと別のこと聞いていい？")
+    await h.say("なんでもいいから、最近の話をひとつ聞かせて。")
+    t1 = time.monotonic()
+    while h.cur_turn.get("first_audio") is None and time.monotonic() - t1 < 20:
+        await asyncio.sleep(0.05)
+    await asyncio.sleep(1.2)  # 発話が乗っている最中に割り込む
+    t_barge = time.monotonic()
+    await h.say_prepared(prep)
+    await h.wait_idle(60)
+    interrupted = any(t_barge - 30 <= m <= t_barge and k == "USER_UTTERANCE" and c
+                      for (m, k, d, tx, c) in h.handles)
+    ev("✅" if interrupted else "⚠", f"VLM-4 割り込みで前ターン中断: {interrupted}")
+    await asyncio.sleep(45)  # 割り込み直後の自発発話の様子も残す
+    await h.wait_idle(30)
+
+
 SCENARIOS = [
+    ("SVLM_画面認識の全場面", s_vlm_states),
     ("SIDLE_3分放置頻度", s_idle3),
     ("SAUTO_自律発話計測", s_auto_speech),
     ("S1_通常検索+別話題", s1_search_plus_topic),
