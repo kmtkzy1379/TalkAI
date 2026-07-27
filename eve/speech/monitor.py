@@ -16,7 +16,7 @@ import math
 from collections import deque
 from typing import Callable, Optional
 
-from ..clock import now_iso, now_mono
+from ..clock import humanize, now_iso, now_mono
 from ..config import Config
 from ..context_assembler import OMITTED_SPEAKER, Turn
 from ..pipeline.stimulus import Stimulus, StimulusKind
@@ -89,6 +89,8 @@ class SpeechState:
         # 実効約50-60秒まで縮み、前回の自発発話が押し出されて同じ提案が通っていた（実測 8回中4回）。
         # 保持するのは判定LLMの下書き（＝判定と同期・連続同発話も比較できる）とその埋め込み。
         self.autonomous_log: deque = deque(maxlen=Config.SPEECH_DUP_LOG_MAX)
+        # J-2 ①: 判定LLM に見せる「既出の用件」（実発話 + コードゲートが止めた下書き）。
+        self.prior_log: deque = deque(maxlen=Config.SPEECH_DUP_LOG_MAX)
         self._dup_window = dup_window_sec if dup_window_sec is not None else Config.SPEECH_DUP_WINDOW_SEC
 
     # --- 活動マーク（VoiceLoop から呼ぶ）---
@@ -137,6 +139,34 @@ class SpeechState:
         self.speech_log.append(
             {"ts": now_iso(), "speak": speak, "reason": reason, "content": content}
         )
+
+    def record_prior_item(self, content: str, *, played: bool) -> None:
+        """既出の用件を記録（J-2 ①）。played=True は実際に投入した下書き、False はコードゲートが
+        止めた下書き（丸投げ/同内容）。**同内容抑制の比較元(`autonomous_log`)とは別に持つ**
+        （抑制下書きを比較元に混ぜると ②-2 の閾値校正 0.25/0.87 が無効化されるため）。"""
+        if not (content or "").strip():
+            return
+        self.prior_log.append({"mono": self._now(), "content": content, "played": played})
+
+    def prior_items(self, cap: int = 8) -> list[str]:
+        """判定LLM へ見せる既出一覧（新しい順に整形・時間窓は同内容抑制と同じ）。
+
+        実発話は窓内の全件を必ず残し、残り枠を直近の「やめた」下書きで埋める（放置が続くと
+        抑制下書きが窓内に十数件たまるため上限が要る・実測 idle_fix5 で15件）。
+        """
+        cutoff = self._now() - self._dup_window
+        while self.prior_log and self.prior_log[0]["mono"] < cutoff:
+            self.prior_log.popleft()
+        entries = list(self.prior_log)
+        played = [e for e in entries if e["played"]]
+        others = [e for e in entries if not e["played"]]
+        keep = played + others[-max(0, cap - len(played)):] if cap > len(played) else played[-cap:]
+        keep.sort(key=lambda e: e["mono"])
+        now = self._now()
+        return [
+            f"[{humanize(now - e['mono'])}・{'発話済' if e['played'] else 'やめた'}] {e['content']}"
+            for e in keep
+        ]
 
     def record_autonomous_speech(self, content: str, embedding=None) -> None:
         """実際に刺激投入まで進んだ自発発話を、同内容抑制の比較元として記録。
@@ -264,6 +294,7 @@ class SpeechDecider:
                 active_tasks = self._tasks_provider()
             except Exception:
                 logger.exception("実行中タスク一覧の取得に失敗（注入なしで継続）")
+        prior = self._state.prior_items()  # J-2 ①: 既出の用件（実発話 + 止めた下書き）
         seq0 = self._state.user_activity_seq  # 判定中にユーザが話したか検出する基準
         self._idle.clear()
         try:
@@ -271,6 +302,7 @@ class SpeechDecider:
                 surprise=surprise, silence_seconds=silence,
                 recent_turns=recent, topic_seeds=seeds, decide_fn=self._decide_fn,
                 last_feedback=last_feedback, vision=vision, active_tasks=active_tasks,
+                prior_items=prior,
             )
         finally:
             self._idle.set()
@@ -299,6 +331,7 @@ class SpeechDecider:
                     reason="観測できる根拠なしに話題を相手へ丸投げするため抑制",
                     content=decision.content,  # 何を言おうとしたかは残す（同内容抑制と同じ規約）
                 )
+                self._state.record_prior_item(decision.content, played=False)
                 logger.info("🔇 空振り発話を抑制（材料に接地しない話題の丸投げ）: %.40s", decision.content)
                 return
         # J-2 ②-1/②-2: 直近（時間窓）の自発発話と同内容なら抑制（保証層のコードゲート）。
@@ -312,6 +345,7 @@ class SpeechDecider:
                     reason=f"直近の自発発話と同内容のため抑制（{kind}類似度{score:.2f}）",
                     content=decision.content,
                 )
+                self._state.record_prior_item(decision.content, played=False)
                 logger.info("🔇 自発発話を同内容抑制（%s類似度%.2f）: %.40s", kind, score, decision.content)
                 return
             # 二段目は await を挟む（埋め込み）。その間にユーザが話し始めていないか再確認。
@@ -323,6 +357,7 @@ class SpeechDecider:
         self._state.record_decision(speak=decision.speak, reason=decision.reason, content=decision.content)
         if decision.speak:
             self._state.record_autonomous_speech(decision.content, emb)  # 次回以降の比較元
+            self._state.record_prior_item(decision.content, played=True)
             await self._queue.put(
                 Stimulus(
                     StimulusKind.AUTONOMOUS_SPEECH,

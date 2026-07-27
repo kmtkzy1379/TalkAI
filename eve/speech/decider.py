@@ -86,6 +86,7 @@ async def should_speak(
     last_feedback: Optional[str] = None,  # イブの今の感情/要約（直近フィードバック）
     vision: Optional[str] = None,  # F6 直近の画面ナレーション（あれば判定材料に・None なら無し）
     active_tasks: Optional[list] = None,  # J-2 P2-3 実行中タスク一覧（あれば材料に・None なら無し）
+    prior_items: Optional[list] = None,  # J-2 ① 既出の用件（あれば材料に・None なら無し）
     pending_obligation: bool = False,
 ) -> SpeechDecision:
     if pending_obligation:
@@ -105,6 +106,8 @@ async def should_speak(
         kwargs["vision"] = vision
     if active_tasks is not None:
         kwargs["active_tasks"] = active_tasks
+    if prior_items:
+        kwargs["prior_items"] = prior_items
     d = await decide_fn(**kwargs)
     if d.speak and not (d.content or "").strip():
         # 話す判断だが content が空 → 全 speak 経路で最小ヒントを保証（応答LLMが膨らませる）。
@@ -236,6 +239,33 @@ def _render_seeds(seeds, now: Optional[str] = None) -> str:
     return "\n".join(lines) or "（なし）"
 
 
+PRIOR_HEAD = "# 自分がすでに出した用件（直近10分・話した / 言いかけてやめた）"
+_PRIOR_RULES = (
+    "言い回しや切り口を変えても、ここに挙げた用件をもう一度持ち出すのは繰り返しになる"
+    "（相手から新しい材料が来るまで、この件はこちらから追わない）。\n"
+    "話すなら**別の話題**にすること（「# 過去の記憶・話題の種」など、まだ触れていない材料を使ってよい）。\n"
+    "ただし、直前に自分から話したばかりなら、別の話題であっても間を空ける（続けて2回話しかけない）。"
+)
+
+
+def _render_prior(prior_items: Optional[list]) -> str:
+    """既出の用件ブロック（J-2 ①）。None/空ならブロック自体を出さない（active_tasks と同じ規約）。
+
+    判定LLMは自分の**実発話**なら「# 直近の会話」で既に見えているが、(a)コードゲートで止めた
+    下書き と (b)「言い換えても同じ用件なら繰り返し」という規則 を知らない。実測(2026-07-26
+    実起動状態E2E再現・N=10): 自分が23秒前に話した直後、現行は 6/10 が発話しその**6/6が同じ
+    用件**で、6件とも既存ゲート(bigram0.25/cos0.87)を素通りしていた。このブロックを入れると
+    同用件は 0 になり、直前に話していない通常の放置では発話率 10/10 のまま（過剰沈黙しない）。
+
+    3行の規則は全部必須。「別の切り口が無いなら黙る」型の文言に変えると実測で speak 0/10 まで
+    落ちる（沈黙化）。「話すなら**別の話題**にすること」という**指示形**が要点。
+    """
+    if not prior_items:
+        return ""
+    body = "\n".join(f"- {t}" for t in prior_items)
+    return f"\n\n{PRIOR_HEAD}\n{body}\n{_PRIOR_RULES}"
+
+
 def _render_active_tasks(active_tasks: Optional[list]) -> str:
     """J-2 P2-3: 実行中タスクの簡易描画。None=ブロック自体を出さない（active_tasks_for_context
     と同じ規約: 空リスト=ゼロ件を明示 / None=タスク機能未配線でブロック自体を注入しない）。"""
@@ -252,6 +282,7 @@ def build_decide_messages(
     *, surprise: int, silence_seconds: float, recent_turns, topic_seeds,
     last_feedback: Optional[str] = None, vision: Optional[str] = None,
     active_tasks: Optional[list] = None, now: Optional[str] = None,
+    prior_items: Optional[list] = None,
 ) -> list[dict]:
     fb = (last_feedback or "").strip() or "（なし）"
     screen = (vision or "").strip()
@@ -259,7 +290,8 @@ def build_decide_messages(
     tasks_block = _render_active_tasks(active_tasks)
     user = (
         "…\n\n"
-        f"# 直近の会話（[話者/いつの発話か]）\n{_render_turns(recent_turns, now)}\n\n"
+        f"# 直近の会話（[話者/いつの発話か]）\n{_render_turns(recent_turns, now)}"
+        f"{_render_prior(prior_items)}\n\n"
         f"# 過去の記憶・話題の種（今の流れに合えば「そういえば前〜って言ってたね」と自然に話を広げてよい）\n{_render_seeds(topic_seeds, now)}\n\n"
         f"# イブの今の状態（直近フィードバック: 感情/要約）\n{fb}"
         f"{screen_block}{tasks_block}\n\n"
@@ -276,11 +308,11 @@ def make_decide_fn(registry) -> DecideFn:
     """ModelRegistry role=speech_decide を叩く本番 decide_fn を作る。"""
 
     async def decide_fn(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None,
-                        vision=None, active_tasks=None) -> SpeechDecision:
+                        vision=None, active_tasks=None, prior_items=None) -> SpeechDecision:
         messages = build_decide_messages(
             surprise=surprise, silence_seconds=silence_seconds,
             recent_turns=recent_turns, topic_seeds=topic_seeds, last_feedback=last_feedback,
-            vision=vision, active_tasks=active_tasks,
+            vision=vision, active_tasks=active_tasks, prior_items=prior_items,
         )
         try:
             resp = await registry.complete("speech_decide", messages)

@@ -172,7 +172,7 @@ async def t_active_tasks_passed_to_decider() -> bool:
     seen: dict = {}
 
     async def capture(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None,
-                      active_tasks=None):
+                      active_tasks=None, **kw):
         seen["tasks"] = active_tasks
         return SpeechDecision(False, "r", "")
 
@@ -417,7 +417,7 @@ async def t_decider_suppresses_duplicate_content() -> bool:
     calls = [0]
 
     async def fake_decide(*, surprise, silence_seconds, recent_turns, topic_seeds,
-                          last_feedback=None, active_tasks=None):
+                          last_feedback=None, active_tasks=None, **kw):
         c = contents[min(calls[0], len(contents) - 1)]
         calls[0] += 1
         return SpeechDecision(True, "話す", c)
@@ -493,7 +493,7 @@ async def _run_decider(state, contents, *, embedder=None, hook=None, rag=None) -
     calls = [0]
 
     async def fake_decide(*, surprise, silence_seconds, recent_turns, topic_seeds,
-                          last_feedback=None, active_tasks=None):
+                          last_feedback=None, active_tasks=None, **kw):
         d = contents[min(calls[0], len(contents) - 1)]
         calls[0] += 1
         return d
@@ -573,7 +573,7 @@ async def t_seed_query_uses_last_user_turn() -> bool:
             return []
 
     async def fake_decide(*, surprise, silence_seconds, recent_turns, topic_seeds,
-                          last_feedback=None, active_tasks=None):
+                          last_feedback=None, active_tasks=None, **kw):
         return SpeechDecision(False, "黙る", "")
 
     dec = SpeechDecider(state=state, cache=cache, rag=_SpyRag(), prediction_state=PredictionState(),
@@ -643,6 +643,78 @@ async def t_dup_embedding_failure_falls_back() -> bool:
         delivered == [_PARA_1, _PARA_2, _DUP_A1]  # 言い換えは通る（二段目なし）が文字重複は止まる
         and any("抑制" in e["reason"] for e in log)
     )
+
+
+# ===== J-2 ①: 既出の用件ブロック（言い換えた同用件の反復を止める）=====
+def t_prior_block_present_and_absent() -> bool:
+    from eve.speech.decider import PRIOR_HEAD, build_decide_messages
+    with_ = build_decide_messages(surprise=20, silence_seconds=30.0, recent_turns=[],
+                                  topic_seeds=[], prior_items=["[23秒前・発話済] さっきの件、絞れそうだよ。"])
+    without = build_decide_messages(surprise=20, silence_seconds=30.0, recent_turns=[],
+                                    topic_seeds=[], prior_items=None)
+    u = with_[1]["content"]
+    return (PRIOR_HEAD in u and "さっきの件、絞れそうだよ。" in u
+            and PRIOR_HEAD not in without[1]["content"])
+
+
+def t_prior_block_position_and_rules() -> bool:
+    # ⭐死活: 位置（会話の直後・種の直前）と、実測で必須と分かった2つの規則。
+    # 「別の話題」が欠けると沈黙化（実測 speak 1/10）、「間を空ける」が欠けると畳みかけ（10/10）。
+    from eve.speech.decider import PRIOR_HEAD, SPEECH_DECIDE_SYSTEM, build_decide_messages
+    u = build_decide_messages(surprise=20, silence_seconds=30.0, recent_turns=[], topic_seeds=[],
+                              prior_items=["[1分前・やめた] ああ"])[1]["content"]
+    return (
+        u.index("# 直近の会話") < u.index(PRIOR_HEAD) < u.index("# 過去の記憶・話題の種")
+        and "別の話題" in u and "間を空ける" in u
+        and build_decide_messages(surprise=20, silence_seconds=30.0, recent_turns=[],
+                                  topic_seeds=[])[0]["content"] == SPEECH_DECIDE_SYSTEM
+    )
+
+
+def t_prior_items_cap_and_window() -> bool:
+    # 実発話は窓内全件を残し、残り枠を直近の「やめた」で埋める / 窓を出たら消える
+    clk = [1000.0]
+    st = SpeechState(now_fn=lambda: clk[0], dup_window_sec=600.0)
+    for i in range(3):
+        st.record_prior_item(f"実発話{i}", played=True)
+    for i in range(20):
+        st.record_prior_item(f"やめた{i}", played=False)
+    items = st.prior_items(cap=8)
+    kept_played = sum(1 for x in items if "実発話" in x)
+    clk[0] += 601.0
+    return len(items) == 8 and kept_played == 3 and st.prior_items() == []
+
+
+async def t_prior_records_played_and_suppressed() -> bool:
+    # 投入された下書きは「発話済」、コードゲートが止めた下書きは「やめた」で既出に入る。
+    # かつ同内容抑制の比較元(autonomous_log)には**実発話だけ**が入る（②-2 の校正を壊さない）。
+    state = SpeechState()
+    contents = [SpeechDecision(True, "話す", _DUP_A1), SpeechDecision(True, "話す", _DUP_A2)]
+    await _run_decider(state, contents)
+    prior = state.prior_items()
+    return (
+        len(prior) == 2 and "発話済" in prior[0] and "やめた" in prior[1]
+        and [e["content"] for e in state.recent_autonomous()] == [_DUP_A1]
+    )
+
+
+async def t_prior_forwarded_only_when_present() -> bool:
+    # A6 規約: prior_items は非空の時だけ decide_fn へ転送（受けない fake を壊さない）
+    seen = {}
+
+    async def fake(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None,
+                   **kw):
+        seen["kw"] = kw
+        return SpeechDecision(False, "黙る", "")
+
+    st = SpeechState()
+    await should_speak(surprise=20, silence_seconds=5.0, recent_turns=[], topic_seeds=[],
+                       decide_fn=fake, prior_items=None)
+    first = "prior_items" not in seen["kw"]
+    st.record_prior_item("既に言った件", played=True)
+    await should_speak(surprise=20, silence_seconds=5.0, recent_turns=[], topic_seeds=[],
+                       decide_fn=fake, prior_items=st.prior_items())
+    return first and "prior_items" in seen["kw"]
 
 
 # ===== J-2 ②-4: 根拠なき話題の丸投げ（空振り発話）の抑制 =====
@@ -743,7 +815,7 @@ async def t_decider_discards_when_stt_pending_at_completion() -> bool:
     pred = PredictionState()
 
     async def decide_then_window(*, surprise, silence_seconds, recent_turns, topic_seeds,
-                                 last_feedback=None, active_tasks=None):
+                                 last_feedback=None, active_tasks=None, **kw):
         state.mark_stt_pending()  # 判定 LLM 実行中に発話セグメント到着（STT 開始）を模す
         return SpeechDecision(True, "話す", "こんばんは")
 
@@ -842,7 +914,7 @@ async def t_decider_speak_injects() -> bool:
     await rag.add_chunk(text="夏祭りの思い出", summary="夏", search_text="夏", importance=0.5)
     pred = PredictionState()  # surprise=20(NEUTRAL) → 中間帯 → LLM 判断
 
-    async def fake_decide(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None):
+    async def fake_decide(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None, **kw):
         return SpeechDecision(True, "話題がある", "天気の話を振る")
 
     q = StimulusQueue()
@@ -873,7 +945,7 @@ async def t_decider_tasks_provider_wired() -> bool:
     seen: dict = {}
 
     async def capture(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None,
-                      active_tasks=None):
+                      active_tasks=None, **kw):
         seen["tasks"] = active_tasks
         return SpeechDecision(False, "r", "")
 
@@ -901,7 +973,7 @@ async def t_decider_tasks_provider_exception_safe() -> bool:
     seen: dict = {}
 
     async def capture(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None,
-                      active_tasks=None):
+                      active_tasks=None, **kw):
         seen["tasks"] = active_tasks
         seen["called"] = True
         return SpeechDecision(False, "r", "")
@@ -1087,6 +1159,11 @@ async def main() -> None:
     check("直近会話に経過時間を添える(古い会話を返事待ちと誤読しない)", t_turn_rendering_has_elapsed())
     check("話題の種は要約1行+相対時刻で描く", t_seed_rendering_summary_and_time())
     check("話題の種は直近ユーザ発話で引く(自己強化しない)", await t_seed_query_uses_last_user_turn())
+    check("①既出ブロック: 有無で出し分け", t_prior_block_present_and_absent())
+    check("⭐①既出ブロック: 位置と2規則(沈黙化/畳みかけの死活)", t_prior_block_position_and_rules())
+    check("①既出: 上限で実発話を残す/窓で消える", t_prior_items_cap_and_window())
+    check("⭐①既出: 発話済/やめた を記録し比較元は汚さない", await t_prior_records_played_and_suppressed())
+    check("①既出: 非空の時だけ転送(A6)", await t_prior_forwarded_only_when_present())
     check("⭐②-4 空振り判定の較正(丸投げ/接地の両アーム死活)", t_outsourcing_calibration())
     check("⭐②-4 空振りは投入せず記憶起点は通す", await t_decider_suppresses_topic_outsourcing())
     check("②-4 空振りゲートは同内容抑制より前(埋め込み節約)", await t_outsourcing_gate_precedes_dup_gate())
