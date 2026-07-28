@@ -1,9 +1,28 @@
 # Eve v2 — 統合パイプライン設計（契約ドキュメント）
 
-> **⚠ 実装で更新された点 (2026-06-20・コードが正)**: STT は **partial 投機を採用せず** VAD区間→gpt-4o-transcribe(final)。
-> **ソフト AEC は不採用**（イヤホン前提＋常時リッスン）。RAG は **500件・直近6ターン**（本文の 300件/5ターンは旧値）。
-> 埋め込みは ModelRegistry role でなく **make_embedder(ruri|openai)**。**FeedbackLLM+`PredictionState`(F4) と 発話判定`should_speak`+沈黙→自発発話(F5) は実装済**（surprise は指標として総合判断・数値強制ゲート撤廃=Fix2・T2=必須配線）。多生産者 `SurpriseBus`(VLM時)/VLM/UI は**未実装**。
-> 実装状況・未対応問題・最新仕様は `docs/HANDOFF.md` 参照。
+> ## ⚠ 本書の読み方（2026-07-29 更新・**コードが正**）
+>
+> 本書は「**守るべき不変条件の契約**」。実装状況・手順・既知問題は書かない（→ `docs/HANDOFF.md` が単一情報源）。
+> 本文には設計当初（2026-06）の記述が残っている箇所があるため、**下の訂正表が本文より優先する**。
+>
+> | 本文の記述 | 実際（コード） |
+> |---|---|
+> | STT partial 投機 | **不採用**。VAD区間 → final STT |
+> | ソフト AEC / 自己エコー除去 | **不採用**（イヤホン前提） |
+> | RAG 300件 / 直近5ターン | **500件 / 直近6ターン**（`eve/config.py`） |
+> | 埋め込みを ModelRegistry role で解決 | `make_embedder(ruri\|openai)`（別系統・`eve/memory/embed/`） |
+> | `SurpriseBus` が集約する | **そのクラスは無い**。`PredictionState` が2生産者を **most-recent-source-wins** で合成（`eve/feedback/prediction_state.py`） |
+> | `SurpriseBus` が drain 優先度を補正 | **しない**。`StimulusQueue` は kind + aging のみ（`eve/pipeline/stimulus_queue.py`） |
+> | `vision_update` 刺激が流れる | **producer ゼロ**（予約 kind）。VLM は `SpeechDecider.trigger("vlm")` を叩く（`eve/vlm/worker.py`） |
+> | VLM ×3 self-consistency（§8） | **廃止**。単発・複数フレーム VLM（`eve/vlm/narrator.py`） |
+> | OS スレッドは現状ゼロ（§9） | **1本稼働**（`vlm-capture`・`eve/vlm/capture_thread.py`） |
+> | 橋渡しの既定は手段3(queue)（§9.3） | 実装は **手段1 `call_soon_threadsafe`**（変化ゲート後の低頻度フレームのみ渡すため許容） |
+> | ModelRegistry は6 role | **10 role**（`task` `summarize` `search_summarize` `delivery_check` を追加。`vlm_merge` と `youtube` は定義のみで未使用） |
+> | 発話判定の入力は「ランダムRAG2」 | `autonomous_memories(k=3)` ＝ **関連1 + 完全ランダム1 + 重要度1**（`eve/memory/long_term.py`） |
+> | RAGチャンク = フィードバック1 + 応答1 | 実際は **FeedbackLLM 出力のみ**（応答本文は含まない・`eve/feedback/feedback_llm.py`） |
+> | T7 = E2E 4シナリオ | E2E ハーネスは **15シナリオ**（`tools/search_e2e_test.py`）。T1-T7 という ID はテストコード側に存在しない |
+>
+> **中核原理の現状**: surprise の消費者は `should_speak` の1本のみ。**(b) 文脈不整合の自己懐疑は未実装**（§0 の「2点をゲートする」は設計意図であって現状ではない）。
 
 > 本書は新企画書を契約として、**統合パイプラインの骨格**を定義する（実装ステップ②）。
 > 個別機能の深掘りは後続（③優先順位 → ④機能別プランニング）。本書は「まず流れとレイテンシを通す」ための最小骨格と、その不変条件を確定する。

@@ -15,3 +15,11 @@ sentence-transformers
 ddgs  # J-2 Web検索（キー不要メタ検索・遅延 import）
 curl_cffi  # J-2 inc2 取得（TLS偽装・403回避・遅延 import）
 trafilatura  # J-2 inc2 本文抽出（遅延 import）
+# F6 画面認識（すべて遅延 import。Tier-1 決定論テストには不要だが VLM_ENABLED=1 で必須）。
+# 2026-07-29: 実際に import しているのに未記載だったものを追加（新環境で VLM が起動時に死ぬ）。
+mss  # スクリーンキャプチャ（Windows）
+Pillow  # JPEG エンコード
+ImageHash  # pHash 変化ゲート
+opencv-python  # 黒/空白フレーム判定
+requests  # VOICEVOX HTTP・E2E ハーネス
+psutil  # pc_status 能力のメモリ情報（未導入でも動くが情報が減る）

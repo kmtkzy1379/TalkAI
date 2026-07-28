@@ -11,3 +11,5 @@ tools/audio_samples/
 # 会話ログ（F3 短期記憶・実行時に生成される永続ファイル）
 conversation_history.jsonl
 *.jsonl
+# E2E 実測ログ（実記憶のコピーを含むためコミットしない）
+e2e_logs/

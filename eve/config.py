@@ -134,14 +134,19 @@ class Config:
     VLM_MONITOR = int(os.getenv("VLM_MONITOR", "1"))  # mss モニタ番号（1=主）
     VLM_TARGET_FPS = float(os.getenv("VLM_TARGET_FPS", "2.0"))  # キャプチャ頻度
     VLM_RING_MAX = int(os.getenv("VLM_RING_MAX", "6"))  # リング上限（=レイテンシ bound・drop-oldest）
-    VLM_MAX_FRAMES_PER_CALL = int(os.getenv("VLM_MAX_FRAMES_PER_CALL", "4"))  # 1呼び出しの枚数（窓≈枚/fps≈2s）
+    VLM_MAX_FRAMES_PER_CALL = int(os.getenv("VLM_MAX_FRAMES_PER_CALL", "3"))  # 1呼び出しの枚数（窓≈枚/fps≈1.5s）
     VLM_PHASH_THRESHOLD = int(os.getenv("VLM_PHASH_THRESHOLD", "12"))  # 変化ゲート hamming 閾値
     VLM_PERIODIC_FRAMES = int(os.getenv("VLM_PERIODIC_FRAMES", "0"))  # 静止 N フレームで強制再評価（0=無効）
     VLM_MIN_INTERVAL_SEC = float(os.getenv("VLM_MIN_INTERVAL_SEC", "1.0"))  # コスト floor（自己再トリガを律速・A9）
     VLM_DEDUP_RATIO = float(os.getenv("VLM_DEDUP_RATIO", "0.85"))  # 同一実況とみなす類似度（再トリガ抑制）
-    # 軽量化(1024/Q60/3枚)は実機で遅延に効かず(遅延は Gemini API 変動)・OCR を悪化させたので 1280/70/4 へ戻した。
-    VLM_DOWNSCALE_MAX = int(os.getenv("VLM_DOWNSCALE_MAX", "1280"))  # 長辺上限（トークン/レイテンシ削減）
-    VLM_JPEG_QUALITY = int(os.getenv("VLM_JPEG_QUALITY", "70"))  # 送信 JPEG 品質
+    # 画質の経緯（**1024/Q70/3枚 が現行の正**・2026-07-29 裁定）:
+    # ① 初期は 1280/Q70/4枚。② 軽量化 1024/**Q60**/3枚 を試したが遅延に効かず(遅延は Gemini API 変動)
+    #    OCR が悪化したので 1280/70/4 へ戻した。③ その後 .env が 1024/**Q70**/3枚 で運用され、
+    #    2026-07-29 の通しE2E（実起動と同一設定）で OCR は正確だった（「買い物リスト」「起動方法と
+    #    テストすればいい？」等の日本語・タスクバーの時刻まで読めた）。**悪化の主因は解像度でなく
+    #    JPEG 品質(Q60)だった**と整理し、実測で問題の出なかった ③ を既定に採用。
+    VLM_DOWNSCALE_MAX = int(os.getenv("VLM_DOWNSCALE_MAX", "1024"))  # 長辺上限（トークン/レイテンシ削減）
+    VLM_JPEG_QUALITY = int(os.getenv("VLM_JPEG_QUALITY", "70"))  # 送信 JPEG 品質（60 に落とすと OCR 悪化）
     # 画面情報の鮮度上限。これより古い latest_vision は自発発話系に渡さない（「明らか過去を参照しない」を構造保証）。
     VLM_VISION_TTL_SEC = float(os.getenv("VLM_VISION_TTL_SEC", "7.0"))
     # ユーザ発話への応答に限り、画面が**変化していない間**は古い実況を据え置ける上限[秒]。

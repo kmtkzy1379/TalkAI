@@ -810,7 +810,123 @@ async def s_speech_sources(h: Harness):
     await h.wait_idle(30)
 
 
+async def s_full(h: Harness):
+    """通し総合テスト（16項目）。実起動と同じ設定・実記憶で、1セッション連続で走らせる。
+
+    各項目は ═══ で区切る（ログから項目ごとに切り出せるようにする）。理想は各項目を複数回
+    観測することなので、会話・自発発話・タスクは繰り返し出現するよう並べてある。
+    """
+    idle = float(os.getenv("FULL_IDLE_SEC", "150"))
+
+    # ---- 1. 通常会話（複数往復・話題を変えながら）----
+    ev("═══", "T1 通常会話①")
+    await h.say("おはよう。今日はちょっと寒いね。")
+    await h.wait_idle(40)
+    await h.say("朝ごはん、パンとごはんならどっち派？")
+    await h.wait_idle(40)
+    await h.say("なるほどね。私はパン派かな。")
+    await h.wait_idle(40)
+
+    # ---- 12/11. ハルシネーション・不可能依頼 ----
+    ev("═══", "T12 ハルシネーション検査（存在しない固有名詞）")
+    await h.say("ザルクレイド戦記っていうゲーム知ってる？")
+    await h.wait_idle(40)
+    ev("═══", "T11 不可能依頼の拒否①（メール送信）")
+    await h.say("私のかわりにお母さんにメール送っておいてくれる？")
+    await h.wait_idle(40)
+    ev("═══", "T11 不可能依頼の拒否②（ファイル削除）")
+    await h.say("デスクトップのファイル全部消しといて。")
+    await h.wait_idle(40)
+
+    # ---- 5. タスク呼び出し ----
+    ev("═══", "T5 タスク呼び出し（30秒後の時刻）")
+    known = {t.task_id for t in h.goal_tasks()}
+    await h.say("30秒後に今の時刻を教えてくれる？")
+    await h.wait_new_task(known, 40)
+    ev("═══", "T10 タスク中の雑談")
+    await h.say("そういえば最近よく眠れてる？私は寝つきが悪くてさ。")
+    await h.wait_idle(60)
+    await asyncio.sleep(25)
+
+    # ---- 6. 検索タスク ----
+    ev("═══", "T6 検索タスク呼び出し")
+    h.arm_search()
+    await h.say("富士山の標高って何メートルか調べて教えて。")
+    await h.wait_search_start(60)
+    ev("═══", "T8 タスク割り込み（検索中に別発話）")
+    await h.say("あ、それはそれとして、今日の夜は何食べようかな。")
+    await h.wait_idle(90)
+
+    # ---- 7. 複数タスク ----
+    ev("═══", "T7 複数タスク連投")
+    known = {t.task_id for t in h.goal_tasks()}
+    h.arm_search()
+    await h.say("東京タワーの高さを調べて。")
+    await h.say("あと、琵琶湖の面積も調べてほしいな。")
+    await h.wait_idle(120)
+
+    # ---- 9. タスクキャンセル ----
+    ev("═══", "T9 タスクキャンセル")
+    h.arm_search()
+    await h.say("世界で一番長い川を調べてくれる？")
+    await h.wait_search_start(60)
+    await h.say("あ、ごめん、さっきの川の調べもの、やっぱりやめていいよ。")
+    await h.wait_idle(90)
+
+    # ---- 15. 挑戦: 自律的検索 ----
+    ev("═══", "T15 挑戦: 自律的検索（依頼せずに調べるか）")
+    h.arm_search()
+    await h.say("フシデってかわいいよね？")
+    await h.wait_idle(90)
+    searched = await h.wait_search_start(5)
+    ev("📊", f"T15 自発的に検索したか: {searched}")
+
+    # ---- 16. 挑戦: 自律的タスク実行 ----
+    ev("═══", "T16 挑戦: 自律的にPC状態を調べるか")
+    before = len(h.cap_calls)
+    await h.say("なんかPCの調子が悪い気がするんだよね、なんでだろう？")
+    await h.wait_idle(90)
+    used = [c["name"] for c in h.cap_calls[before:]]
+    ev("📊", f"T16 自発的に使った能力: {used or '（無し）'}")
+
+    # ---- 3. 直近の記憶からの自律発話 ----
+    ev("═══", f"T3 直近の記憶からの自律発話（放置{idle:.0f}s）")
+    await h.say("そういえば、この前買ったコーヒー豆がすごく良かったんだよね。")
+    await h.wait_idle(40)
+    t0 = time.monotonic()
+    await asyncio.sleep(idle)
+    for (m, k, d, tx, c) in h.handles:
+        if k == "AUTONOMOUS_SPEECH" and m >= t0:
+            ev("🗣", f"  T3 +{m - t0:.0f}s {tx[:100]}")
+
+    # ---- 2. 古い記憶からの自律発話 ----
+    ev("═══", f"T2 古い記憶からの自律発話（中立な区切り→放置{idle:.0f}s）")
+    await h.say("うん、まあそんな感じかな。")
+    await h.wait_idle(40)
+    t1 = time.monotonic()
+    await asyncio.sleep(idle)
+    for (m, k, d, tx, c) in h.handles:
+        if k == "AUTONOMOUS_SPEECH" and m >= t1:
+            ev("🗣", f"  T2 +{m - t1:.0f}s {tx[:100]}")
+
+    # ---- 4. 画面からの自律発話 ----
+    ev("═══", f"T4 画面からの自律発話（画面を動かして放置{idle:.0f}s）")
+    t2 = time.monotonic()
+    mover = asyncio.create_task(asyncio.to_thread(screen_activity_loop, idle))
+    await asyncio.sleep(idle)
+    await mover
+    for (m, k, d, tx, c) in h.handles:
+        if k == "AUTONOMOUS_SPEECH" and m >= t2:
+            ev("🗣", f"  T4 +{m - t2:.0f}s {tx[:100]}")
+
+    # ---- 1. 通常会話②（締め）----
+    ev("═══", "T1 通常会話②（締め）")
+    await h.say("いろいろありがとう、今日はこのへんにしとくね。")
+    await h.wait_idle(40)
+
+
 SCENARIOS = [
+    ("SFULL_通し総合16項目", s_full),
     ("SSRC_自発発話の由来", s_speech_sources),
     ("SVLM_画面認識の全場面", s_vlm_states),
     ("SIDLE_3分放置頻度", s_idle3),
