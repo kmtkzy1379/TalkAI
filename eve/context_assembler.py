@@ -11,13 +11,25 @@
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from .clock import Stamp, elapsed_wall, humanize
+
+logger = logging.getLogger(__name__)
 
 # 注入セレクション（ConversationCache.recent_for_injection）が差し込む省略マーカの話者名。
 OMITTED_SPEAKER = "__omitted__"
 SPEAKER_EVE = "eve"
+
+# D1: 「会話の間隔」ブロックを出す閾値。
+# **`decider.py` の STALE_RECENCY_SEC(900) と値は同じだが根拠は別タスク**なので import しない
+# （あちらは「イブの下書きの指示語が誤りか」の校正値・母数はイブ発話266件中の指示語12件）。
+# こちらは「前の依頼がまだ生きているとみなすか」で、本番履歴426ターンでの実測は:
+#   閾値 300s→15回 / 900s→14回 / 1800s→14回 / 3600s→12回 発火（user ターン187件が母数）
+# ＝300〜3600秒の広い平坦域にあり、値の微調整に敏感でない。最小の実発火は 38.9分。
+SESSION_GAP_SEC = 900.0
 
 # system に置く役割アンカー（assistant=イブ自身を明示し、自分の発話への自答を防ぐ）。
 ROLE_ANCHOR = (
@@ -58,6 +70,58 @@ class RagChunk:
         return lines[0].strip() if lines else ""
 
 
+def _parse_iso(raw: str | None) -> datetime | None:
+    """Turn.stamp.iso を datetime に。空/破損は None（`elapsed_wall` は 0.0＝「たった今」に
+    倒す設計だが、ここでその既定を継ぐと**壊れた時刻が「間隔なし」を意味してしまい
+    ガードが自分で自分を切る**ため、明示的に分ける（D1 R6）。"""
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def session_gap_seconds(recent_turns, now: Stamp, threshold: float = SESSION_GAP_SEC) -> float | None:
+    """会話のタイムラインに閾値超の空白があればその秒数を返す（無ければ None）。
+
+    D1（2026-07-29 実機）: 起動直後、5時間前の未応答依頼「PCの状態を教えてくれる?」を
+    「さっきの」と呼んで勝手に実行した。会話ターンだけが時刻接地を持たないことが土台。
+
+    測り方の根拠:
+    - **最後の"ユーザ"発話**からの経過で測る。直前ターン（話者不問）で測ると、イブ自身の
+      自発発話でタイムラインが新しくなり取り逃す（`decider.py:154-155` が同じ判断を
+      「実データで1/3を取り逃す」と実測済み）。
+    - 注入窓の**内部**にある空白も見る（セッション2ターン目以降は境界が窓の中に来る）。
+    - **省略マーカ(OMITTED_SPEAKER)が挟まる窓では出さない**。マーカは「間に実在するターンを
+      省略した」印であって「会話が途切れた」印ではない。ここで空白を主張すると、連続稼働中の
+      セッションでユーザの直前の依頼を失効と宣言してしまう。
+    """
+    turns = list(recent_turns or [])
+    if not turns:
+        return None
+    if any(getattr(t, "speaker", "") == OMITTED_SPEAKER for t in turns):
+        return None  # 省略された実ターンがある＝空白ではない
+    now_dt = _parse_iso(now.iso)
+    if now_dt is None:
+        return None
+    stamps = [(t, _parse_iso(getattr(getattr(t, "stamp", None), "iso", None))) for t in turns]
+    if any(dt is None for _, dt in stamps):
+        # 壊れた/欠損した時刻が混ざる窓は判定を諦める。**黙って 0 にしない**（無言で
+        # ガードが外れるのを防ぐ＝観測できる形で降りる）。
+        logger.info("⏳ 会話ギャップ判定を見送り（時刻が欠損/破損したターンを含む）")
+        return None
+    gaps: list[float] = []
+    last_user = next((dt for t, dt in reversed(stamps) if getattr(t, "speaker", "") != SPEAKER_EVE), None)
+    if last_user is not None:
+        gaps.append((now_dt - last_user).total_seconds())
+    for (_, a), (_, b) in zip(stamps, stamps[1:]):
+        gaps.append((b - a).total_seconds())
+    widest = max(gaps, default=0.0)
+    return widest if widest > threshold else None
+
+
 def messages_to_text(messages: list[dict]) -> str:
     """messages を1本のテキストに（テスト/デバッグ用の可読化）。"""
     return "\n\n".join(f"<{m.get('role')}>\n{m.get('content', '')}" for m in messages)
@@ -68,7 +132,8 @@ class ContextAssembler:
         self.system_prompt = system_prompt
 
     def _build_system(self, *, rag_chunks, last_feedback, vision, speech_decision_reason, now,
-                      callfunction_result=None, tools_active=False, active_tasks=None) -> str:
+                      callfunction_result=None, tools_active=False, active_tasks=None,
+                      last_feedback_iso=None, session_gap_sec=None) -> str:
         parts: list[str] = []
         if self.system_prompt:
             parts.append(self.system_prompt)
@@ -102,7 +167,35 @@ class ContextAssembler:
                 "画面以外（会話の流れ・相手の様子）から言えることは、これまでどおり普通に話してよい。"
             )
         if last_feedback:
-            parts.append(f"# 直近フィードバック\n{last_feedback}")
+            # D1 の主経路: 起動時 catch-up の内省が**前セッション末尾**を要約し、それが
+            # 時刻ラベル無しで「# 直近フィードバック」として出ていた。実機(2026-07-29)では
+            # 挨拶の5.5秒前に書かれた内省が「ユーザは…PCの状態を教えてくれるかと発言した /
+            # 次の予測: ユーザはPCの状態確認…を求めるかもしれない」と述べ、応答LLM に
+            # 「未処理の依頼が今ある」と読ませていた。
+            # 接地は**内省が書かれた時刻ではなく、内省が対象にした会話スパンの末尾**
+            # (`PredictionState.watermark`＝`worker.py:92` の snapshot[-1].stamp.iso) で行う。
+            # 書かれた時刻で測ると D1 では「たった今」となり、古い内容を新鮮だと**追認**してしまう。
+            age = elapsed_wall(last_feedback_iso, now.iso) if last_feedback_iso else None
+            if age is not None and age > SESSION_GAP_SEC:
+                head = (f"# 直近フィードバック（{humanize(age)}の会話についての内省。"
+                        "今この場で出ている依頼ではない）")
+            else:
+                head = "# 直近フィードバック"
+            parts.append(f"{head}\n{last_feedback}")
+        if session_gap_sec is not None:
+            # D1: 会話ターンだけが時刻接地を持たないので、空白の存在を system で1度だけ述べる。
+            # **語彙は指定しない**（「さっき」「前に」等の逐語トークンを渡すと、それが採用されて
+            # 発話の入り方が単調になる＝J-2 ①-b の実測: 見本があると先頭69%が「そういえば」系。
+            # 逐語見本の再導入を止めるコードゲートが tests/test_f5_speech.py:650 にある）。
+            # 実際に生きている予約は `# 予約タスク` が正なので、そちらへ明示的に道を譲る。
+            parts.append(
+                f"# 会話の間隔（状況把握用・そのまま読み上げない）\n"
+                f"直前のやりとりから約{humanize(session_gap_sec).replace('前', '')}空いている。"
+                "ここから先はその続きではなく、新しく始まった会話。\n"
+                "空白より前に出ていた依頼・質問・約束は、まだ生きているとは限らない。"
+                "ユーザーが自分から触れたときだけその話として扱い、こちらから実行し直したり"
+                "続きを始めたりしない。実際に残っている予約は「# 予約タスク」が正。"
+            )
         if speech_decision_reason:
             parts.append(f"# 発話判定理由\n{speech_decision_reason}")
         if callfunction_result:
@@ -173,9 +266,15 @@ class ContextAssembler:
         callfunction_result: str | None = None,
         tools_active: bool = False,
         active_tasks: list[str] | None = None,
+        last_feedback_iso: str | None = None,  # D1: 内省が対象にした会話スパンの末尾(watermark)
         now: Stamp | None = None,
     ) -> list[dict]:
         now = now or Stamp.now()
+        # D1: 自発発話経路には出さない。判定LLM は「何時間も/何日も前の会話は返事待ちではない…
+        # そこで止まっている話題を振るのはむしろ自然」と**逆を明示的に許可**されており
+        # (`decider.py:218-220`)、しかも「間隔ブロックが出る条件」＝「古い話題を振ってよい条件」
+        # なので衝突は常態になる。ここで蒸し返しを禁じると T2（古い記憶の自律発話）を壊す。
+        gap = None if autonomous_content is not None else session_gap_seconds(recent_turns, now)
         messages: list[dict] = [
             {
                 "role": "system",
@@ -183,7 +282,8 @@ class ContextAssembler:
                     rag_chunks=rag_chunks, last_feedback=last_feedback, vision=vision,
                     speech_decision_reason=speech_decision_reason, now=now,
                     callfunction_result=callfunction_result, tools_active=tools_active,
-                    active_tasks=active_tasks,
+                    active_tasks=active_tasks, last_feedback_iso=last_feedback_iso,
+                    session_gap_sec=gap,
                 ),
             }
         ]

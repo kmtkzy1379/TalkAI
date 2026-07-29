@@ -154,6 +154,10 @@ class ResponseOrchestrator:
         rag_chunks: Optional[list[RagChunk]] = None,
     ) -> list[dict]:
         last_feedback = self._state.last_feedback if self._state is not None else None
+        # D1: 内省が**いつの会話**を対象にしたか（watermark = そのスパン末尾の iso）。
+        # 起動時 catch-up では前セッション末尾を要約するので、これが無いと
+        # 「# 直近フィードバック」が5時間前の依頼を現在の依頼として提示する。
+        last_feedback_iso = self._state.watermark if self._state is not None else None
         # 画面の注入は**刺激種別で鮮度の意味を変える**（層分離）:
         # - USER 発話: 変化していない間は据え置き可（静止画面でも「今何が見える?」に答えられる。
         #   注入文言に「N秒前・以降変化なし」が付くので捏造にならない）。
@@ -200,6 +204,7 @@ class ResponseOrchestrator:
             recent_turns=recent_turns,
             rag_chunks=rag_chunks,
             last_feedback=last_feedback,
+            last_feedback_iso=last_feedback_iso,
             vision=vision,
             speech_decision_reason=speech_reason,
             stale_reference=stale_reference,
