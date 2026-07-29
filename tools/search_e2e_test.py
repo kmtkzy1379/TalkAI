@@ -86,6 +86,54 @@ else:
     Config.RAG_FILE = os.path.join(ART, "rag_memory.jsonl")
     Config.TASK_FILE = os.path.join(ART, "tasks.jsonl")
 
+# D1 再現用の種まき: コピー済み履歴の**末尾**に「未応答のユーザ依頼」を1行足し、
+# 前セッションが依頼を残したまま終わった状態を作る（実機 2026-07-29 の D1 と同じ形）。
+# 末尾であることが必須（recent_for_injection は tail に user があればそのまま返す）。
+# コピー後・ConversationCache 構築前でなければならないのでこの位置に置く。
+if os.getenv("D1_SEED") == "1":
+    import datetime as _dt
+    _gap_h = float(os.getenv("D1_SEED_GAP_H") or 5.0)
+    _cut = _dt.datetime.now(_dt.timezone.utc) - _dt.timedelta(hours=_gap_h)
+    _ts = _cut.isoformat()
+
+    def _truncate(path: str, key: str) -> int:
+        """`_cut` より新しい行を落とす（＝そこでセッションが終わった状態を作る）。"""
+        if not os.path.exists(path):
+            return 0
+        kept = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    ts = _dt.datetime.fromisoformat(json.loads(line).get(key) or "")
+                except (ValueError, TypeError, json.JSONDecodeError):
+                    continue
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=_dt.timezone.utc)
+                if ts <= _cut:
+                    kept.append(line)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(kept) + ("\n" if kept else ""))
+        return len(kept)
+
+    # **履歴と RAG の両方**を切る。RAG を切らないと watermark(=RAG 最新 ts) が種より
+    # 新しくなり、起動時 catch-up が種を span に含めない＝`# 直近フィードバック` が
+    # 前セッションの依頼を語らない＝**D1 の主経路が再現しない**（実測で確認済み）。
+    _nh = _truncate(Config.HISTORY_FILE, "ts")
+    _nr = _truncate(Config.RAG_FILE, "timestamp")
+    with open(Config.HISTORY_FILE, "a", encoding="utf-8") as _f:
+        _f.write(json.dumps(
+            {"ts": _ts, "speaker": "user", "text": "じゃあPCの状態を教えてくれる?"},
+            ensure_ascii=False) + "\n")
+    print(f"[D1_SEED] {_gap_h}時間前で打ち切り（履歴{_nh}件/RAG{_nr}件）+ 未応答依頼を末尾に追加")
+if os.getenv("D1_NOTE_OFF") == "1":
+    # 対照実験（修正を無効化）: ギャップ閾値を実質無限にして注記を出さなくする。
+    import eve.context_assembler as _ca_mod
+    _ca_mod.SESSION_GAP_SEC = 10 ** 9
+    print("[D1_NOTE_OFF] ギャップ注記を無効化（対照実験）")
+
 from eve.logsetup import configure  # noqa: E402
 from eve.pipeline.stimulus import Stimulus, StimulusKind  # noqa: E402
 from eve.task.schema import CANCELLED, DONE, FAILED  # noqa: E402
@@ -243,6 +291,17 @@ class Harness:
             return seeds
 
         self.vl.rag.autonomous_memories = seeds_wrap
+
+        # D1: 応答LLM に**実際に渡った messages** を貯める（LLM 出力ではなく入力で判定する）。
+        self.assembled = []
+        _assemble = self.vl.orchestrator._ctx.assemble
+
+        def assemble_wrap(**kw):
+            msgs = _assemble(**kw)
+            self.assembled.append(msgs)
+            return msgs
+
+        self.vl.orchestrator._ctx.assemble = assemble_wrap  # type: ignore
 
         async def handle_wrap(stim):
             t0 = time.monotonic()
@@ -988,7 +1047,48 @@ async def sd2_cancel_after_done(h: Harness):
     await h.wait_idle()
 
 
+async def sd1_stale_request(h: Harness):
+    """D1 回帰: 起動直後、前セッションの未応答依頼を勝手に実行しないこと。
+
+    前提: `D1_SEED=1` で履歴末尾に「5時間前の未応答依頼」を仕込んである。
+    ここでは挨拶を1回するだけ。実機 2026-07-29 はこの1手で
+    「さっきのPCの状態も確認してみるね」→ delegate_task が走った。
+
+    判定は**応答LLM に何が渡ったか**（assemble の戻り値）と**実際の行動/発話**の両方で見る。
+    LLM 出力だけだと、たまたま実行しなかったのか注記が効いたのかを区別できない。
+    """
+    before_tasks = {t.task_id for t in h.goal_tasks()}
+    before_caps = len(h.cap_calls)
+    await h.say("おはよう。今日はちょっと寒いね。", must=("おはよう",))
+    await h.wait_idle(90)
+
+    # (1) 文脈: ギャップブロックが system に入り、ユーザ発話は汚染されていない
+    sys_blocks = [m[0]["content"] for m in h.assembled if m and m[0]["role"] == "system"]
+    gap_in_system = any("# 会話の間隔" in s for s in sys_blocks)
+    fb_grounded = any("の会話についての内省" in s for s in sys_blocks)
+    polluted = any("会話の間隔" in m["content"] for msgs in h.assembled for m in msgs[1:])
+    ev("✅" if gap_in_system else "❌", f"D1 ギャップ注記が system に届いた: {gap_in_system}")
+    ev("✅" if not polluted else "❌", f"D1 会話メッセージへの混入: {'無し(正)' if not polluted else 'あり(誤)'}")
+    ev("📋", f"D1 内省に時刻ラベルが付いた: {fb_grounded}")
+
+    # (2) 行動: 勝手にタスクを起こしていない
+    new_tasks = [t for t in h.goal_tasks() if t.task_id not in before_tasks]
+    caps = [c["name"] for c in h.cap_calls[before_caps:]]
+    ev("✅" if not new_tasks else "❌",
+       f"D1 勝手なタスク実行: {'無し(正)' if not new_tasks else '有り(誤)=' + str([t.goal[:30] for t in new_tasks])}")
+    ev("✅" if not caps else "❌", f"D1 能力呼出: {caps or '無し(正)'}")
+
+    # (3) 発話: 時制の誤りと、注記そのものの読み上げ leak
+    spoken = " ".join(t for (_m, _k, _d, t, _c) in h.handles)
+    stale_words = [w for w in ("さっき", "先ほど", "今の件") if w in spoken]
+    leak = [w for w in ("注記", "会話の間隔", "読み上げない", "内省") if w in spoken]
+    ev("✅" if not stale_words else "❌", f"D1 時制の誤り: {stale_words or '無し(正)'}")
+    ev("✅" if not leak else "❌", f"D1 注記の読み上げ leak: {leak or '無し(正)'}")
+    ev("💬", f"D1 実際の発話: {spoken[:150]}")
+
+
 SCENARIOS = [
+    ("SD1_前セッション未応答依頼", sd1_stale_request),
     ("SD2_完了後キャンセル", sd2_cancel_after_done),
     ("SFULL_通し総合16項目", s_full),
     ("SSRC_自発発話の由来", s_speech_sources),

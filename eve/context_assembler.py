@@ -83,7 +83,7 @@ def _parse_iso(raw: str | None) -> datetime | None:
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
-def session_gap_seconds(recent_turns, now: Stamp, threshold: float = SESSION_GAP_SEC) -> float | None:
+def session_gap_seconds(recent_turns, now: Stamp, threshold: float | None = None) -> float | None:
     """会話のタイムラインに閾値超の空白があればその秒数を返す（無ければ None）。
 
     D1（2026-07-29 実機）: 起動直後、5時間前の未応答依頼「PCの状態を教えてくれる?」を
@@ -98,6 +98,9 @@ def session_gap_seconds(recent_turns, now: Stamp, threshold: float = SESSION_GAP
       省略した」印であって「会話が途切れた」印ではない。ここで空白を主張すると、連続稼働中の
       セッションでユーザの直前の依頼を失効と宣言してしまう。
     """
+    # 既定は呼び出し時にモジュール変数を引く（def 時に束縛しない＝対照実験や設定変更で
+    # 差し替えられる）。
+    threshold = SESSION_GAP_SEC if threshold is None else threshold
     turns = list(recent_turns or [])
     if not turns:
         return None
