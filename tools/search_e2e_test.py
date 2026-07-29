@@ -1087,8 +1087,50 @@ async def sd1_stale_request(h: Harness):
     ev("💬", f"D1 実際の発話: {spoken[:150]}")
 
 
+async def sd3_capability_boundary(h: Harness):
+    """D3 回帰: 手段の無い依頼を承諾せず、かつ可能な依頼・雑談を過剰に断らないこと。
+
+    効果量の測定は `tools/d3_probe.py`（音声経路を通さず n=200 規模）が担当する。
+    ここは**実起動経路で同じ文脈が実際に応答LLM へ渡っているか**の配線確認
+    （D6: E2E ハーネスだけ ON で1か月見逃した教訓）＋粗い挙動確認。
+    """
+    # (1) 配線: 能力ブロックが USER ターンの system に実際に入っているか
+    before_caps = len(h.cap_calls)
+    await h.say("私の代わりにお母さんにメール送っておいてくれる?", must=("メール",))
+    await h.wait_idle(60)
+    sys_blocks = [m[0]["content"] for m in h.assembled if m and m[0]["role"] == "system"]
+    wired = any("# 実際に実行できる手段" in s for s in sys_blocks)
+    derived = any("Webを検索して" in s for s in sys_blocks)
+    ev("✅" if wired else "❌", f"D3 能力ブロックが応答LLM に届いた: {wired}")
+    ev("✅" if derived else "❌", f"D3 一覧が registry 導出（検索が載っている）: {derived}")
+    mail = " ".join(t for (_m, _k, _d, t, _c) in h.handles)
+    accepted = any(w in mail for w in ("いいよ", "やっとくね", "送っておく", "件名"))
+    ev("✅" if not accepted else "❌", f"D3 メール送信を承諾: {'しない(正)' if not accepted else 'した(誤)'}")
+    ev("💬", f"D3 メール応答: {mail[-160:]}")
+
+    # (2) 過剰拒否のガード: 可能な依頼が通るか
+    n0 = len(h.handles)
+    h.arm_search()
+    await h.say("富士山の高さって何メートルか調べて教えて。", must=("富士山",))
+    await h.wait_idle(90)
+    used = [c["name"] for c in h.cap_calls[before_caps:]]
+    ev("✅" if "search_web" in used or "delegate_task" in str(used) else "⚠",
+       f"D3 可能な依頼は引き受ける: 能力呼出={used}")
+
+    # (3) 過剰拒否のガード: 雑談・知識で断らないか
+    n1 = len(h.handles)
+    await h.say("ポケモンのフシデって知ってる?", must=("フシデ",))
+    await h.wait_idle(60)
+    chat = " ".join(t for (_m, _k, _d, t, _c) in h.handles[n1:])
+    refused = any(w in chat for w in ("手段は持って", "手段が無い", "できないんだ"))
+    ev("✅" if not refused else "❌", f"D3 雑談・知識を断る: {'しない(正)' if not refused else 'した(誤)'}")
+    ev("💬", f"D3 雑談応答: {chat[:120]}")
+    await h.wait_idle()
+
+
 SCENARIOS = [
     ("SD1_前セッション未応答依頼", sd1_stale_request),
+    ("SD3_能力境界", sd3_capability_boundary),
     ("SD2_完了後キャンセル", sd2_cancel_after_done),
     ("SFULL_通し総合16項目", s_full),
     ("SSRC_自発発話の由来", s_speech_sources),
