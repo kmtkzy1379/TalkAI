@@ -61,20 +61,20 @@ Get-ChildItem tests\test_*.py | ForEach-Object {
 "PASS $tot / FAIL $fail"
 ```
 
-**実測 2026-07-29: 18ファイル 421件 PASS / FAIL 0**（2回連続一致・flaky なし）
+**実測 2026-07-29: 18ファイル 422件 PASS / FAIL 0**（2回連続一致・flaky なし）
 
 | ファイル | 件数 | ファイル | 件数 |
 |---|---|---|---|
 | test_callfunction_phase1.py | 45 | test_f4_feedback.py | 25 |
 | test_cancel_resolver_phase1.py | 19 | test_f5_speech.py | 61 |
 | test_delivery_checker.py | 10 | test_f6_vlm.py | 44 |
-| test_f0_foundation.py | 44 | test_search_phase1.py | 23 |
+| test_f0_foundation.py | 45 | test_search_phase1.py | 23 |
 | test_f1_pipeline.py | 26 | test_stt_filter.py | 10 |
 | test_f2_5_integration.py | 4 | test_task_agent_phase1.py | 13 |
 | test_f2_5_robustness.py | 5 | test_task_phase1.py | 14 |
 | test_f2_response.py | 18 | test_voiceloop_wiring.py | 29 |
 | test_f3_5_rag.py | 21 | | |
-| test_f3_memory.py | 10 | **合計** | **421** |
+| test_f3_memory.py | 10 | **合計** | **422** |
 
 規律: 機能ごと **2回連続 PASS で合格** / 最終統合マージは **5回連続**。
 `test_f6_vlm.py` は例外注入テストで traceback をログ出力するが FAIL ではない。
