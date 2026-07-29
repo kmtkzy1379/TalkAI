@@ -91,6 +91,12 @@ try:
         _Cfg.SEARCH_ENABLED = _prev_search_enabled
     # 再配達（barge-in で潰れた機能報告の救済）の配線と WHEN ポリシー実挙動
     check("orchestrator に再配達 fn を配線", vl.orchestrator._redeliver_fn == vl._redeliver_stimulus)
+    # D2: 抑止判定は同一 queue の is_suppressed でなければならない。resolver 側に hasattr
+    # フォールバックを置かず直接呼ぶ設計なので、配線切れはここで落として気づく。
+    check("orchestrator に抑止判定(is_suppressed)を配線",
+          vl.orchestrator._is_suppressed == vl.queue.is_suppressed)
+    check("CancelResolver が runner と同じ queue を持つ",
+          vl.cancel_resolver is None or vl.cancel_resolver._queue is vl.queue)
 
     import asyncio as _aio  # noqa: E402
     from eve.pipeline.stimulus import CallFunctionResult as _CFR, Stimulus as _St, StimulusKind as _SK  # noqa: E402

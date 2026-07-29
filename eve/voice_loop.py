@@ -186,6 +186,7 @@ class VoiceLoop:
             tasks_provider=tasks_provider,  # J-1/Fix#2: 予約タスク状態の毎ターン注入（TASK_ENABLED 時のみ）
             redeliver_fn=self._redeliver_stimulus,  # barge-in で潰れたタスク報告の再配達（WHEN はこちらが所有）
             delivery_checker=self.delivery_checker,  # J-2 P1-1: barge-in なし完了ターンの配達確認
+            is_suppressed=self.queue.is_suppressed,  # D2: 取消済み報告は発話前に捨てる（put の第2関門）
         )
         self.runner = PipelineRunner(self.queue, self.orchestrator, self.audio)
         # 沈黙監視は応答中(runner busy)/ユーザ発話中は発火しない（is_busy をガードに使う）。

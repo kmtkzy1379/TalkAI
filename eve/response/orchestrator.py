@@ -88,6 +88,7 @@ class ResponseOrchestrator:
         tasks_provider: Optional[Callable[[], list[str]]] = None,  # J-1 任意: 予約タスク一覧（整形済み行）
         redeliver_fn: Optional[Callable[[Stimulus], None]] = None,  # 任意: 潰れた報告の再投入（同期・非ブロッキング）
         delivery_checker=None,  # J-2 P1-1 任意: barge-in なしで完了した報告ターンの配達確認サイドカー
+        is_suppressed: Optional[Callable[[Optional[str]], bool]] = None,  # D2 任意: 取消済み報告の判定（同期）
     ) -> None:
         self._audio = audio
         self._stream_fn = stream_fn
@@ -115,6 +116,9 @@ class ResponseOrchestrator:
         self._redeliver_fn = redeliver_fn
         # 任意注入(J-2 P1-1): barge-in の有無に関わらず、報告内容が実際に発話されたか確認するサイドカー。
         self._delivery_checker = delivery_checker
+        # 任意注入(D2): この dedup_key の報告が取消済みかを同期判定（StimulusQueue.is_suppressed）。
+        # 依存の向きは tasks_provider と同型のクロージャ注入＝response 層は task 層を import しない。
+        self._is_suppressed = is_suppressed
         self.last_response = ""  # 生成済み全文（自然さの目視・テスト用。記憶には使わない＝C5）
 
     def _tools_enabled_for(self, stimulus: Stimulus) -> bool:
@@ -315,6 +319,17 @@ class ResponseOrchestrator:
                 raise
             except Exception:
                 logger.exception("RAG 取得に失敗（記憶なしで継続）")
+        # D2 二重関門: RAG の await 中に取消が走った場合、この刺激は put の関門より後ろに居るので
+        # 墓標を素通りしている。**まだ一文字も喋っていない**この地点で捨てる（実機 D2 では
+        # pop→初回発話に 1.3 秒あった）。put 側だけに頼らないのは、resolver の suppress と
+        # runner の pop の順序差が call_soon 1スロットしかなく、設計上の保証にならないため。
+        if self._is_suppressed is not None and stimulus.kind == StimulusKind.CALLFUNCTION_RESULT:
+            try:
+                if self._is_suppressed(stimulus.dedup_key):
+                    logger.info("⚰ 抑止済みの報告ターンを中止: dedup=%s", stimulus.dedup_key)
+                    return  # 再配達もしない（_maybe_redeliver を通さずに抜ける）
+            except Exception:
+                logger.exception("抑止判定で例外（無視して通常配達）")
         messages = self._build_messages(stimulus, recent, rag_chunks)
         # J Call-Function: USER ターンのみ tools を渡す。tool_calls はここに溜め、応答完了後に submit。
         tools = self._dispatcher.tool_schemas() if self._tools_enabled_for(stimulus) else None

@@ -105,6 +105,122 @@ async def t1c_aging_no_starvation() -> bool:
     return drained_at is not None and drained_at <= 10
 
 
+# ---------- D2 墓標(suppress) ----------
+async def t_d2_suppress_removes_and_blocks() -> bool:
+    """待機中の報告を除去し、以後の同 dedup_key の put も落とす。別キーは無傷（陽性対照）。"""
+    q = StimulusQueue()
+    await q.put(Stimulus(StimulusKind.CALLFUNCTION_RESULT, "river", dedup_key="task:t1"))
+    await q.put(Stimulus(StimulusKind.CALLFUNCTION_RESULT, "tower", dedup_key="task:t2"))
+    removed = q.suppress("task:t1")
+    await q.put(Stimulus(StimulusKind.CALLFUNCTION_RESULT, "river-again", dedup_key="task:t1"))
+    keys = sorted((s.dedup_key or "") for s in q.snapshot())
+    return removed == 1 and keys == ["task:t2"]
+
+
+async def t_d2_suppress_when_not_queued() -> bool:
+    """キューに実体が無い時は 0 を返す（=配達済み/配達中/再配達待ち）が、墓標は張られる。"""
+    q = StimulusQueue()
+    removed = q.suppress("task:t1")
+    await q.put(Stimulus(StimulusKind.CALLFUNCTION_RESULT, "late", dedup_key="task:t1"))
+    return removed == 0 and q.qsize() == 0 and q.is_suppressed("task:t1")
+
+
+async def t_d2_death_late_redelivery() -> bool:
+    """【death-detection】barge-in 再配達/forgotten 再送が墓標を貫通しないこと。
+
+    put 側の墓標チェックを外すと落ちる（＝この assert が守っている挙動そのもの）。
+    """
+    q = StimulusQueue()
+    q.suppress("task:t1")
+    await q.put(Stimulus(StimulusKind.CALLFUNCTION_RESULT, "retry", dedup_key="task:t1"))
+    blocked = q.qsize() == 0
+    # 陽性対照: 抑止していないキーは必ず通る（「全部捨てる」実装で空振り PASS しない）
+    await q.put(Stimulus(StimulusKind.CALLFUNCTION_RESULT, "other", dedup_key="task:t9"))
+    return blocked and q.qsize() == 1
+
+
+async def t_d2_death_queued_then_suppress() -> bool:
+    """【death-detection】実機 D2 の順序（put 済み→取消）で配達されないこと。
+
+    計画当初のテストは「suppress 先・put 後」で実機と逆順だった。実機(2026-07-29 02:27:56→58)は
+    executor の put が先に済んでキューで待機している状態に取消が来る。
+    """
+    q = StimulusQueue()
+    await q.put(Stimulus(StimulusKind.CALLFUNCTION_RESULT, "river", dedup_key="task:t1"))
+    q.suppress("task:t1")
+    return q.qsize() == 0
+
+
+async def t_d2_ttl_boundary() -> bool:
+    """TTL 境界: 失効ちょうど(now>=expiry)で通り、それ未満では落ちる。二重 suppress は後勝ちで延長。"""
+    now = [100.0]
+    q = StimulusQueue(clock_fn=lambda: now[0])
+    q.suppress("task:t1", ttl_sec=10.0)
+    now[0] = 109.9
+    blocked_before = q.is_suppressed("task:t1")
+    now[0] = 110.0  # 境界ちょうど = 失効
+    expired_at_boundary = not q.is_suppressed("task:t1")
+    # 延長（後勝ち）
+    now[0] = 200.0
+    q.suppress("task:t2", ttl_sec=10.0)
+    now[0] = 205.0
+    q.suppress("task:t2", ttl_sec=10.0)  # 失効を 215 へ延ばす
+    now[0] = 212.0
+    extended = q.is_suppressed("task:t2")
+    return blocked_before and expired_at_boundary and extended
+
+
+async def t_d2_none_key_safe() -> bool:
+    """dedup_key=None の刺激（ユーザ発話）を巻き込まない。suppress(None/'') は墓標を作らない。"""
+    q = StimulusQueue()
+    q.suppress("task:t1")
+    n1 = q.suppress(None)  # type: ignore[arg-type]
+    n2 = q.suppress("")
+    await q.put(Stimulus(StimulusKind.USER_UTTERANCE, "こんにちは"))  # dedup_key=None
+    return (n1 == 0 and n2 == 0 and q.qsize() == 1
+            and not q.is_suppressed(None) and not q.is_suppressed(""))
+
+
+async def t_d2_merge_key_still_blocked() -> bool:
+    """merge_key を併せ持つ抑止済み刺激も落ちる（墓標チェックが merge 分岐より前にある）。"""
+    q = StimulusQueue()
+    q.suppress("task:t1")
+    await q.put(Stimulus(StimulusKind.CALLFUNCTION_RESULT, "x",
+                         merge_key="m", dedup_key="task:t1"))
+    blocked = q.qsize() == 0
+    # 陽性対照: 同じ merge_key でも抑止外なら通常どおり畳まれる
+    await q.put(Stimulus(StimulusKind.VISION_UPDATE, "v1", merge_key="m"))
+    await q.put(Stimulus(StimulusKind.VISION_UPDATE, "v2", merge_key="m"))
+    return blocked and q.qsize() == 1
+
+
+async def t_d2_namespace_exact() -> bool:
+    """キーは完全一致（prefix 一致で実装すると落ちる）。"""
+    q = StimulusQueue()
+    q.suppress("task:t1")
+    for k in ("cancel:t1", "cf:t1", "task:t10"):
+        await q.put(Stimulus(StimulusKind.CALLFUNCTION_RESULT, k, dedup_key=k))
+    return q.qsize() == 3
+
+
+async def t_d2_tombstone_swept() -> bool:
+    """失効した墓標は遅延掃除で消える（長時間セッションでの単調増加を防ぐ）。"""
+    now = [0.0]
+    q = StimulusQueue(clock_fn=lambda: now[0])
+    for i in range(20):
+        q.suppress(f"task:t{i}", ttl_sec=5.0)
+    grew = len(q._tombstones) == 20
+    now[0] = 100.0
+    q.suppress("task:fresh", ttl_sec=5.0)  # 掃除の契機
+    return grew and len(q._tombstones) == 1
+
+
+def t_d2_suppress_is_sync() -> bool:
+    """suppress/is_suppressed は同期（await を挟まない＝単一ループ上で atomic）という契約。"""
+    return not (asyncio.iscoroutinefunction(StimulusQueue.suppress)
+                or asyncio.iscoroutinefunction(StimulusQueue.is_suppressed))
+
+
 # ---------- T3 順序 + 世代 ----------
 async def t3_seq_order() -> bool:
     played, play_fn = _recorder()
@@ -231,6 +347,17 @@ async def main() -> None:
     check("T3 barge-inで文の途中でも停止", await t3_midsentence_stop())
 
     check("P2 単一ループ所有(set_loop/_loop 削除・interrupt は世代+1)", t_p2_single_loop_only())
+
+    check("D2 suppress が待機中を除去し以後も遮断", await t_d2_suppress_removes_and_blocks())
+    check("D2 未待機なら0件だが墓標は張る", await t_d2_suppress_when_not_queued())
+    check("D2 death: 遅れて来た再配達を遮断", await t_d2_death_late_redelivery())
+    check("D2 death: put 済み→取消(実機順)で配達されない", await t_d2_death_queued_then_suppress())
+    check("D2 TTL 境界と後勝ち延長", await t_d2_ttl_boundary())
+    check("D2 dedup_key=None を巻き込まない", await t_d2_none_key_safe())
+    check("D2 merge_key 併用でも遮断（チェック順）", await t_d2_merge_key_still_blocked())
+    check("D2 キーは完全一致(prefix 誤爆なし)", await t_d2_namespace_exact())
+    check("D2 失効墓標は遅延掃除される", await t_d2_tombstone_swept())
+    check("D2 suppress は同期メソッド", t_d2_suppress_is_sync())
 
     r = await t7_e2e()
     check("T7 例外なし", r["raised"] is None)

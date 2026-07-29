@@ -24,12 +24,17 @@ import re
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
-from typing import Optional
+from datetime import datetime, timezone
+from typing import Callable, Optional
 
 from ..pipeline.stimulus import CallFunctionResult, Stimulus, StimulusKind
-from .schema import CANCELLED, PENDING, RUNNING
+from .schema import CANCELLED, DONE, FAILED, PENDING, RUNNING
 
 logger = logging.getLogger(__name__)
+
+# 「ついさっき終わった」とみなす窓（キューに実体が無い＝配達済み/再配達待ちの場合の保険用）。
+# 未配達の報告はキュー実体で一意に決まるのでこの窓に依存しない（_undelivered_candidates）。
+RECENT_TERMINAL_SEC = 90.0
 
 
 @dataclass
@@ -96,10 +101,14 @@ def _display_name(t) -> str:
 
 
 class CancelResolver:
-    def __init__(self, *, store, model_registry, queue) -> None:
+    def __init__(
+        self, *, store, model_registry, queue,
+        now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    ) -> None:
         self._store = store
         self._model = model_registry
         self._queue = queue
+        self._now = now_fn  # TaskStore と同じシグネチャ（決定論テストで注入する）
         self._inbox: "asyncio.Queue[CancelRequest]" = asyncio.Queue()
         self._task: Optional[asyncio.Task] = None
         self._stopping = False
@@ -143,14 +152,95 @@ class CancelResolver:
     def _actives(self):
         return [t for t in self._store.list_all() if t.status in (PENDING, RUNNING)]
 
+    # --- terminal 直後の取消（D2: 完了が取消要求を追い越すレース）-------------
+
+    def _terminal_age_sec(self, t) -> Optional[float]:
+        """terminal タスクの経過秒。updated_at が空/壊れていれば None（＝候補に含めない）。
+
+        `clock.elapsed_wall` は壊れた ISO を 0.0（＝たった今）へ倒す設計（応答を落とさないため）
+        だが、ここでその既定を継ぐと「timestamp が壊れたタスクは必ず抑止する」ことになり、
+        『迷ったら配達側に倒す』方針と真逆になるので明示的に弾く。
+        """
+        raw = getattr(t, "updated_at", None)
+        if not raw:
+            return None
+        try:
+            dt = datetime.fromisoformat(raw)
+        except (ValueError, TypeError):
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (self._now() - dt).total_seconds()
+
+    def _undelivered_candidates(self) -> list:
+        """**まだ発話されていない報告**を持つ terminal タスク（＝抑止してよい対象）。
+
+        時計だけで「直近の terminal」を選ぶと実機で誤る: 2026-07-29 E2E の D2 時点では
+        90秒窓に3件（東京タワー56.2s前 / 琵琶湖46.5s前 / 川1.9s前）あったが、先の2件は
+        既に発話済みで、未配達はユーザが指した川の1件だけだった。キューの実体と突き合わせれば
+        候補は一意に決まる。起動時 age-out の孤児（store が updated_at を打ち直す）も
+        put を出さないので自動的に候補外になる。
+        """
+        queued = {s.dedup_key for s in self._queue.snapshot() if (s.dedup_key or "").startswith("task:")}
+        return [t for t in self._store.list_all()
+                if t.status in (DONE, FAILED) and f"task:{t.task_id}" in queued]
+
+    def _recent_terminals(self) -> list:
+        """キューに実体が無い terminal のうち「ついさっき終わった」もの（再配達の抑止用）。"""
+        out = []
+        for t in self._store.list_all():
+            if t.status not in (DONE, FAILED):
+                continue
+            age = self._terminal_age_sec(t)
+            if age is not None and 0 <= age <= RECENT_TERMINAL_SEC:
+                out.append(t)
+        return out
+
+    async def _handle_terminal_race(self, req: CancelRequest) -> None:
+        """アクティブが無い時に「ついさっき終わったタスクの報告」を止める（D2）。
+
+        **この関数は最初の `await` までに suppress を終える**こと。resolver が起きてから
+        runner が次の刺激を pop するまでの猶予は call_soon 1スロットしかない
+        （実測プローブ: dispatcher→resolver 起床→suppress→runner pop の順）。
+        ここに await を1つ挟むと報告が先に配達され、D2 が再発する。
+        """
+        queued = self._undelivered_candidates()  # ← 同期。await 禁止区間ここから
+        if len(queued) == 1:
+            t = queued[0]
+            name = _display_name(t)
+            removed = self._queue.suppress(f"task:{t.task_id}")
+            logger.info("⚰ 報告を抑止: task=%s 「%.40s」 除去%d件", t.task_id, name, removed)
+            # 「取り消した」「止めた」とは言わない: status は Done のままで、止めたのは報告だけ。
+            await self._report(req, f"「{name}」はもう終わってたよ。結果はまだ言ってないから、"
+                                    "このまま流さないでおくね。", ok=True)
+            return
+        if len(queued) >= 2:
+            # 【ユーザ裁定】どれを止めるべきか特定できない → 抑止しない（誤破棄より誤配達に倒す）。
+            await self._report(req, "ごめん、ちょうど終わったのがいくつかあって、どの報告のことか"
+                                    "特定できないから、そのまま伝えるね。", ok=False)
+            return
+        recent = self._recent_terminals()  # キューに実体なし＝配達済み or 再配達待ち
+        if len(recent) == 1:
+            t = recent[0]
+            name = _display_name(t)
+            self._queue.suppress(f"task:{t.task_id}")  # 再配達（barge-in/配達確認）だけは止まる
+            logger.info("⚰ 報告を抑止(再配達のみ): task=%s 「%.40s」", t.task_id, name)
+            # 未来の約束をしない: 既に喋った/今喋っている可能性を排除できない（suppress の 0 は3義）。
+            await self._report(req, f"「{name}」はもう終わってたよ。結果、もう伝えちゃってたかも。", ok=False)
+            return
+        if len(recent) >= 2:
+            await self._report(req, "ごめん、それもう終わったあとだったみたい。", ok=False)
+            return
+        ref = req.reference.strip()
+        msg = f"「{ref}」ってタスクは入ってないよ。今は止められる予約も無いよ。" if ref else "今は止められるタスクは無いよ。"
+        await self._report(req, msg, ok=False)
+
     async def _handle_one(self, req: CancelRequest) -> None:
         actives = self._actives()
         # 観測性: 取消要求の入口を必ず1行残す（2026-07-13 実機事故はここの判断が無ログで追跡困難だった）。
         logger.info("🚫 取消要求 ref=%.60r actives=%d", req.reference, len(actives))
         if not actives:
-            ref = req.reference.strip()
-            msg = f"「{ref}」ってタスクは入ってないよ。今は止められる予約も無いよ。" if ref else "今は止められるタスクは無いよ。"
-            await self._report(req, msg, ok=False)
+            await self._handle_terminal_race(req)
         elif len(actives) == 1 and _is_vague_reference(req.reference):
             # 1件×曖昧・空 reference（「やっぱりいいや」等）＝対象はその1件→即キャンセル（速く確実に）。
             await self._cancel_and_report(req, actives[0].task_id)
@@ -194,6 +284,10 @@ class CancelResolver:
         name = _display_name(t)
         advanced = self._store.set_status(task_id, CANCELLED)
         if not advanced:
+            # LLM 照合の **後** なので初回配達には間に合わない（数秒〜十数秒遅れる）。
+            # ここでの抑止が保証するのは「2回目以降（barge-in 再配達 / 配達確認の forgotten 再送）」だけ。
+            removed = self._queue.suppress(f"task:{task_id}")
+            logger.info("⚰ 報告を抑止(TOCTOU): task=%s 「%.40s」 除去%d件", task_id, name, removed)
             await self._report(req, f"「{name}」はもう終わってたよ。", ok=False)
             return
         logger.info("🚫 タスク取消: %s 「%.40s」(ref=%.40r)", task_id, name, req.reference)
