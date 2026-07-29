@@ -122,7 +122,12 @@ def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resol
         description="やりたいこと・調べ物・状態確認・後回しの予約を、賢いタスク担当(TaskAgent)に任せる。"
                     "goal に自然文で『何を達成/報告したいか』を、**ユーザの言い回しをそのまま**書く"
                     "（例: 30秒後に今の時刻を教えて / PCとイブの状態を調べてまとめて）。どんな簡単な事も"
-                    "自分でやらずここへ。when_seconds 省略=すぐ、指定=その秒後。呼んだら『やっとくね』とだけ言う。",
+                    "自分でやらずここへ。when_seconds 省略=すぐ、指定=その秒後。呼んだら『やっとくね』とだけ言う。"
+                    # D3: 万能感の打ち消し。**available 側を列挙しない**（search は SEARCH_ENABLED ∧ ddgs の
+                    # 内側でしか登録されず、静的な文字列では構成差を表現できないため必ず嘘になる）。
+                    # 逆に「外の世界を操作する行為が無い」ことは構成に依らず安定なので、そちらだけ書く。
+                    "タスク担当にも**外の世界を操作する手段は無い**（メール送信・ファイル操作・アプリ操作・"
+                    "買い物など）。それらを goal にしない。調べ物や、考えて答えるだけの依頼は goal にしてよい。",
         params_schema={
             "goal": {"type": "string", "description": "達成/報告したいこと（自然文・ユーザの言い回しを保つ）"},
             "when_seconds": {"type": "integer", "description": "何秒後に始めるか（省略=すぐ）"},

@@ -184,6 +184,7 @@ class VoiceLoop:
             vision_state=self.vision_state,  # F6: 応答文脈に直近画面を注入
             dispatcher=self.dispatcher,  # J: tool_calls を応答完了後に submit（gate は CALLFUNCTION_ENABLED）
             tasks_provider=tasks_provider,  # J-1/Fix#2: 予約タスク状態の毎ターン注入（TASK_ENABLED 時のみ）
+            capabilities_provider=self.capabilities.outward_actions,  # D3: 外の世界への手段（registry 導出）
             redeliver_fn=self._redeliver_stimulus,  # barge-in で潰れたタスク報告の再配達（WHEN はこちらが所有）
             delivery_checker=self.delivery_checker,  # J-2 P1-1: barge-in なし完了ターンの配達確認
             is_suppressed=self.queue.is_suppressed,  # D2: 取消済み報告は発話前に捨てる（put の第2関門）

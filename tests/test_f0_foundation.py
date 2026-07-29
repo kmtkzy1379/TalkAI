@@ -205,5 +205,81 @@ auto = _ca.assemble(
 check("D1 自発経路には間隔ブロックを出さない", _GAP_HEAD not in auto[0]["content"])
 check("D1 自発経路の指示文は壊れない", "下書き" in auto[-1]["content"])
 
+# ---------------------------------------------------------------------------
+# 6. D3: 能力境界（手段の無い依頼を承諾しない）
+# 実機 2026-07-29: メール送信を「いいよ」と承諾。危険系は断れるので「危険だから断る」は
+# 効いていたが「手段が無いから断る」が無かった。断った側も実在しない手伝いを約束した。
+# ---------------------------------------------------------------------------
+from eve.capability import Capability, CapabilityRegistry  # noqa: E402
+
+_D3_HEAD = "# 実際に実行できる手段"
+
+
+def _caps_registry() -> CapabilityRegistry:
+    r = CapabilityRegistry()
+    r.register(Capability(name="probe_send", description="架空の送信能力を使う（テスト用）。",
+                          params_schema={}, handler=lambda a: "", offered=False, agent_tool=True))
+    return r
+
+
+_reg = _caps_registry()
+d3 = _ca.assemble(user_text="メール送って", tools_active=True,
+                  capabilities=_reg.outward_actions())[0]["content"]
+d3_blk = _D3_HEAD + d3.split(_D3_HEAD)[1]
+
+# ⭐死活: 一覧は registry 導出（散文ハードコードならこの架空能力は現れない＝J-3 で腐らない保険）
+check("D3 一覧は registry 導出（新能力が自動で載る）", "架空の送信能力を使う" in d3_blk)
+# ⭐死活: offered（delegate_task/cancel_task）から導出してはいけない。
+# offered 導出だと実在する検索やPC状態確認が「できない」ことになり、2026-07-28 12:24-12:26 の
+# 実機事故（tool 不在時に5連続で誤拒否）を再現する。
+check("D3 offered 由来の配管名を手段として出さない",
+      "delegate_task" not in d3_blk and "cancel_task" not in d3_blk)
+check("D3 括弧の補足と実装語を落とす", "スニペット" not in d3_blk)
+
+# ⭐死活: 過剰拒否を防ぐ逃がしの一文（`# 画面` の不在マーカと同じ役割・削除禁止）。
+# 実データ: ユーザ188発話中、会話/知識/記憶で答えるべき依頼は49件(26.1%)、
+# 真に手段が無いのは4件(2.1%)＝1:12。この段落を消すと26.1%側が発火する。
+check("D3 逃がし: 制限対象は外の世界の操作だけ", "制限しているのは「外の世界を操作すること」だけ" in d3_blk)
+check("D3 逃がし: 会話・知識・記憶はこれまでどおり", "これまでどおり普通に答える" in d3_blk)
+check("D3 逃がし: 考えて答えるだけの予約は引き受けてよい", "考えて答えるだけの頼まれ事も普通に引き受けてよい" in d3_blk)
+check("D3 「知らない」と「手段が無い」を分ける", "「知らない」と「手段が無い」は別のこと" in d3_blk)
+check("D3 危険理由を残す", "危ないから断るときは危ない理由も言う" in d3_blk)
+# ⭐死活: 包括否定に強化されるのを止める（善意の「分かりやすく強く書こう」で会話が死ぬのを防ぐ）
+check("D3 包括否定を書かない",
+      not any(w in d3_blk for w in ("一覧に無い", "以外は断る", "それ以外は答えない", "できることは以上")))
+# `# 予約タスク` の「一覧」語と衝突させない（あちらは"その場の予約状態"を支配する別ブロック）
+check("D3 予約タスクの支配文言が薄まっていない",
+      "この一覧に無い予約は存在しない" in _ca.assemble(user_text="x", active_tasks=["a"])[0]["content"])
+
+# 出す/出さないの分岐
+check("D3 tools 無効時は出さない（自発・報告ターンの44%を守る）",
+      _D3_HEAD not in _ca.assemble(user_text="x", tools_active=False,
+                                   capabilities=_reg.outward_actions())[0]["content"])
+check("D3 未配線(None)では出さない", _D3_HEAD not in _ca.assemble(user_text="x", tools_active=True)[0]["content"])
+check("D3 手段ゼロでは出さない（手段ゼロ構成は既に過剰拒否側に倒れている）",
+      _D3_HEAD not in _ca.assemble(user_text="x", tools_active=True, capabilities=[])[0]["content"])
+# ロール汚染しない（D1 と同じ守備範囲）
+_d3m = _ca.assemble(user_text="メール送って", tools_active=True, capabilities=_reg.outward_actions())
+check("D3 ユーザ発話は逐語のまま", _d3m[-1]["content"] == "メール送って")
+check("D3 会話メッセージに混入しない", all(_D3_HEAD not in m["content"] for m in _d3m[1:]))
+
+# delegate_task の description 側にも境界を書く（system だけ直しても tool 記述が
+# 「どんな簡単な事もここへ」と万能感を言い続ける非対称を防ぐ）。
+import tempfile as _tf  # noqa: E402
+from eve.task import register_task_capabilities as _rtc  # noqa: E402
+from eve.task.store import TaskStore as _TS  # noqa: E402
+
+_reg_full = CapabilityRegistry()
+_rtc(_reg_full, _TS(task_file=os.path.join(_tf.mkdtemp(prefix="eve_d3_"), "t.jsonl")))
+_dt_desc = next(s["function"]["description"] for s in _reg_full.tool_schemas()
+                if s["function"]["name"] == "delegate_task")
+check("D3 delegate_task に外向き手段の不在が書かれている", "外の世界を操作する手段は無い" in _dt_desc)
+check("D3 delegate_task が調べ物/思考の委譲は許可したまま",
+      "考えて答えるだけの依頼は goal にしてよい" in _dt_desc)
+# available 側を列挙しない（search は SEARCH_ENABLED ∧ ddgs の内側でしか登録されず、
+# 静的文字列で available を書くと構成差で必ず嘘になる）
+check("D3 delegate_task は available を列挙しない",
+      "Web検索 /" not in _dt_desc and "search_web" not in _dt_desc)
+
 print(f"\n合計: PASS {_passed} / FAIL {_failed}")
 sys.exit(1 if _failed else 0)

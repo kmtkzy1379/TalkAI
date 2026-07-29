@@ -86,6 +86,7 @@ class ResponseOrchestrator:
         vision_state=None,  # F6 任意: 直近の画面ナレーション源（latest_vision を文脈へ注入）
         dispatcher=None,  # J 任意: FunctionDispatcher（tool_calls を応答完了後に submit）
         tasks_provider: Optional[Callable[[], list[str]]] = None,  # J-1 任意: 予約タスク一覧（整形済み行）
+        capabilities_provider: Optional[Callable[[], list[str]]] = None,  # D3 任意: 外の世界への手段
         redeliver_fn: Optional[Callable[[Stimulus], None]] = None,  # 任意: 潰れた報告の再投入（同期・非ブロッキング）
         delivery_checker=None,  # J-2 P1-1 任意: barge-in なしで完了した報告ターンの配達確認サイドカー
         is_suppressed: Optional[Callable[[Optional[str]], bool]] = None,  # D2 任意: 取消済み報告の判定（同期）
@@ -111,6 +112,9 @@ class ResponseOrchestrator:
         # （USER=完了済み変更の再実行防止 / CALLFUNCTION_RESULT=結果と矛盾する約束の防止 /
         # AUTONOMOUS=存在しないタスクの再約束防止。2026-07-13 実機事故の根本原因対応）。
         self._tasks_provider = tasks_provider
+        # 任意注入(D3): 「外の世界に手を出せる手段」を registry から取る（散文手書きは腐る）。
+        # tasks_provider と同型のクロージャ注入＝response 層は capability 層を import しない。
+        self._capabilities_provider = capabilities_provider
         # 任意注入: barge-in で発話前に潰れた CALLFUNCTION_RESULT を再投入するコールバック。
         # 「いつ再投入するか」（ユーザ発話が先に並ぶ保証）は提供側（VoiceLoop）が所有する。
         self._redeliver_fn = redeliver_fn
@@ -197,6 +201,20 @@ class ResponseOrchestrator:
                 active_tasks = self._tasks_provider()
             except Exception:
                 logger.exception("予約タスク一覧の取得に失敗（注入なしで継続）")
+        # D3: 外の世界への手段。**tools を渡すターン（USER 発話）でだけ**注入する。
+        # 自発発話/機能報告ターン（応答32件中14件＝44%）には出さない: 承諾すべき依頼が無いのに
+        # 能力の枠だけ渡すと、自発発話が「私にできるのは〜だけ」の自己言及に寄る（②-6 の
+        # 訂正指示を自発経路だけに限定したのと同じ判断）。
+        # また tools 無効時（CALLFUNCTION_ENABLED=0 等）にも出さない: 手段ゼロの構成では
+        # 2026-07-28 12:24-12:26 の実機ログのとおり**既に過剰拒否側へ倒れており**
+        # （5連続で誤拒否・直前に内部知識で答えた話題まで拒否）、そこへ「手段が無い」を
+        # 足すのは逆効果。
+        capabilities = None
+        if self._capabilities_provider is not None and self._tools_enabled_for(stimulus):
+            try:
+                capabilities = self._capabilities_provider()
+            except Exception:
+                logger.exception("能力一覧の取得に失敗（注入なしで継続）")
         # native ロール messages（system + user/assistant ターン列 + 最終 user発話/自発指示）。
         return self._ctx.assemble(
             user_text=user_text,
@@ -211,6 +229,7 @@ class ResponseOrchestrator:
             callfunction_result=callfunction_result,
             tools_active=self._tools_enabled_for(stimulus),
             active_tasks=active_tasks,
+            capabilities=capabilities,
         )
 
     def _notify_complete(self) -> None:

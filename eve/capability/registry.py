@@ -15,11 +15,14 @@ from __future__ import annotations
 import logging
 import os
 import platform
+import re
 import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
 logger = logging.getLogger(__name__)
+
+_PAREN = re.compile(r"[（(][^）)]*[）)]")  # D3: 一覧に出す1行から括弧の補足を落とす
 
 
 @dataclass(frozen=True)
@@ -126,6 +129,22 @@ class CapabilityRegistry:
     def agent_tool_schemas(self) -> list[dict]:
         """**TaskAgent** 向け（実行系＝agent_tool=True）。委譲/管理系は含めない（自己再帰防止）。"""
         return [self._schema(c) for c in self._caps.values() if c.agent_tool]
+
+    def outward_actions(self) -> list[str]:
+        """D3: 応答LLM に伝える「**外の世界に手を出せる手段**」の短い説明（description の1文目）。
+
+        **`offered` からは導出しない**（あちらは delegate_task/cancel_task の2つ＝自分の配管であって
+        手段ではない。それを「できること」として出すと、実在する検索やPC状態確認まで「できない」
+        ことになり、2026-07-28 12:24-12:26 の実機事故（tool 不在時に5連続で誤拒否し、直前に
+        内部知識で答えた話題まで拒否した）を再現する）。
+
+        手書きの散文にしない: `search_web` は SEARCH_ENABLED ∧ ddgs ∧ TASK_ENABLED の内側でしか
+        登録されない（`voice_loop.py`）ため、静的な文言は構成によって最初から嘘になる。
+        J-3 の画面操作能力も agent_tool=True で登録された瞬間にここへ出る（腐らない）。
+        """
+        # 1文目から括弧の補足を落とす（「（スニペット）」等の実装語・冗長な内訳を発話文脈に持ち込まない）。
+        return [_PAREN.sub("", c.description.split("。")[0]).strip()
+                for c in self._caps.values() if c.agent_tool]
 
     def execute(self, name: str, args: Optional[dict] = None) -> str:
         """同期実行（sub-ms の同期 handler のみ対象）。

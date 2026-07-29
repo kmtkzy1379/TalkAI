@@ -136,7 +136,7 @@ class ContextAssembler:
 
     def _build_system(self, *, rag_chunks, last_feedback, vision, speech_decision_reason, now,
                       callfunction_result=None, tools_active=False, active_tasks=None,
-                      last_feedback_iso=None, session_gap_sec=None) -> str:
+                      last_feedback_iso=None, session_gap_sec=None, capabilities=None) -> str:
         parts: list[str] = []
         if self.system_prompt:
             parts.append(self.system_prompt)
@@ -231,6 +231,38 @@ class ContextAssembler:
                 "実行中の『北海道の面積』は含めない）。\n"
                 "取り消しは `cancel_task` に、ユーザの言い回し（例『さっきの時間のやつ』）をそのまま渡す。"
             )
+            if capabilities:
+                # D3（2026-07-29 実機）: 能力の無い依頼（メール送信）を「いいよ」と承諾した。
+                # 危険系（ファイル削除）は断れるので「危険だから断る」は効き「**手段が無いから
+                # 断る**」だけが無かった。しかも断った側も「指定してくれたら手伝う」と実在しない
+                # 手段を約束していた。
+                #
+                # 文面の制約（すべて実測に基づく・緩めると壊れる）:
+                # - 一覧は registry 導出（`outward_actions`）。手書きは構成差と J-3 で必ず腐る。
+                # - 「一覧」という語を使わない。`# 予約タスク` が既に同じ語で別の意味
+                #   （その場の予約状態）を支配しており、混同すると Fix#2 の抑止が緩む。
+                # - **制限対象は「外の世界への操作」だけ**と明示する。ここを「できること全部」に
+                #   広げると会話・知識・記憶まで拒否に倒れる。実データ: ユーザ188発話のうち
+                #   会話/知識/記憶で答えるべき依頼は49件(26.1%)、真に不能なのは4件(2.1%)＝1:12。
+                # - **考えて答えるだけの予約は引き受けてよい**と明示する。実データで
+                #   「30秒後に好きな焼肉の部位を教えて」等3件が、どの手段にも対応しないまま
+                #   TaskAgent の知識で Done している（これを潰すと正当な委譲が死ぬ）。
+                # - 逃がしの1文（最後の段落）は `# 画面` の不在マーカと同じ役割。あちらは
+                #   最後の1文が無いと画面関連の質問を全部潰した実測があり、回帰テストで固定
+                #   されている。ここも同様にテストで固定する（削除禁止）。
+                parts.append(
+                    "# 実際に実行できる手段（行動の話）\n"
+                    "実行できるのは次だけ: " + " / ".join(capabilities) + "。\n"
+                    "これ以外の操作（メール送信、ファイルの作成・移動・削除、アプリの起動や操作、"
+                    "買い物、外部サービスへの書き込み等）は**手段を持っていない**。頼まれたら"
+                    "「その手段は持っていない」と正直に短く言い、できるふりや「あとでやっておく」"
+                    "「条件を教えてくれたらやる」と引き受け直さない。危ないから断るときは危ない理由も言う。\n"
+                    "**制限しているのは「外の世界を操作すること」だけ。** 会話・意見・おすすめ・感想・"
+                    "気持ち・知っていることの説明・昔のやりとりの思い出しは、この制限と関係なく"
+                    "これまでどおり普通に答える。『30秒後におすすめの晩ごはん教えて』のような"
+                    "考えて答えるだけの頼まれ事も普通に引き受けてよい。"
+                    "「知らない」と「手段が無い」は別のこと。"
+                )
         return "\n\n".join(parts)
 
     def _build_conversation(self, recent_turns) -> list[dict]:
@@ -270,6 +302,7 @@ class ContextAssembler:
         tools_active: bool = False,
         active_tasks: list[str] | None = None,
         last_feedback_iso: str | None = None,  # D1: 内省が対象にした会話スパンの末尾(watermark)
+        capabilities: list[str] | None = None,  # D3: 外の世界に手を出せる手段（registry 導出）
         now: Stamp | None = None,
     ) -> list[dict]:
         now = now or Stamp.now()
@@ -286,7 +319,7 @@ class ContextAssembler:
                     speech_decision_reason=speech_decision_reason, now=now,
                     callfunction_result=callfunction_result, tools_active=tools_active,
                     active_tasks=active_tasks, last_feedback_iso=last_feedback_iso,
-                    session_gap_sec=gap,
+                    session_gap_sec=gap, capabilities=capabilities,
                 ),
             }
         ]
