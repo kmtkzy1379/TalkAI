@@ -61,20 +61,20 @@ Get-ChildItem tests\test_*.py | ForEach-Object {
 "PASS $tot / FAIL $fail"
 ```
 
-**実測 2026-07-29: 18ファイル 378件 PASS / FAIL 0**（2回連続一致・flaky なし）
+**実測 2026-07-29: 18ファイル 398件 PASS / FAIL 0**（2回連続一致・flaky なし）
 
 | ファイル | 件数 | ファイル | 件数 |
 |---|---|---|---|
 | test_callfunction_phase1.py | 45 | test_f4_feedback.py | 25 |
-| test_cancel_resolver_phase1.py | 11 | test_f5_speech.py | 61 |
+| test_cancel_resolver_phase1.py | 19 | test_f5_speech.py | 61 |
 | test_delivery_checker.py | 10 | test_f6_vlm.py | 44 |
 | test_f0_foundation.py | 21 | test_search_phase1.py | 23 |
-| test_f1_pipeline.py | 16 | test_stt_filter.py | 10 |
+| test_f1_pipeline.py | 26 | test_stt_filter.py | 10 |
 | test_f2_5_integration.py | 4 | test_task_agent_phase1.py | 13 |
 | test_f2_5_robustness.py | 5 | test_task_phase1.py | 14 |
-| test_f2_response.py | 18 | test_voiceloop_wiring.py | 27 |
+| test_f2_response.py | 18 | test_voiceloop_wiring.py | 29 |
 | test_f3_5_rag.py | 21 | | |
-| test_f3_memory.py | 10 | **合計** | **378** |
+| test_f3_memory.py | 10 | **合計** | **398** |
 
 規律: 機能ごと **2回連続 PASS で合格** / 最終統合マージは **5回連続**。
 `test_f6_vlm.py` は例外注入テストで traceback をログ出力するが FAIL ではない。
@@ -96,6 +96,7 @@ $env:SKIP="SSRC,SVLM,SIDLE,SAUTO,S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,S11"
 
 | キー | シナリオ |
 |---|---|
+| `SD2` | **完了後キャンセル（D2 回帰）**。検索完了が取消要求を追い越す窓を作り、未配達の報告が抑止されること・矛盾2連発が出ないことを確認（約2分・`D2_DELAY_SEC` で発話タイミング調整）。S4 とは別経路 |
 | `SFULL` | 通し総合16項目（通常会話 / 記憶・画面・会話起点の自発発話 / タスク / 検索 / 複数 / 割り込み / キャンセル / タスク中の雑談 / 不可能依頼 / ハルシネーション / 自律検索 / 自律タスク） |
 | `SSRC` | 自発発話の由来切り分け（画面 / 直近会話 / 記憶） |
 | `SVLM` | 画面認識の全場面（静止の据え置き回答・変化中・捏造なし・発話中割り込み） |
@@ -155,7 +156,7 @@ UI（Tkinter・**tkinter 参照は0件**）/ 配線層PORT（vts / run / launche
 | ID | 内容 |
 |---|---|
 | **D1** | **起動直後に前セッションの未応答依頼を勝手に実行する。** 復元履歴の最終ターンが5時間前の「PCの状態を教えて」だったため、挨拶しただけで `pc_status` を実行し「さっきの」と呼んだ。②-6 の時制ゲートは**自発発話の下書きにしか掛かっておらず**、ユーザ発話への応答経路は素通り |
-| **D2** | **タスクキャンセルの競合。** 検索完了が取消要求に先行するとタスクが terminal になり取消対象が消える → 結果が配達された上に「止められる予約はなかった」と矛盾した2連発 |
+| **D2** | （**解決済 2026-07-29** ブランチ `fix/d2-cancel-tombstone`）タスクキャンセルの競合。検索完了が取消要求に先行するとタスクが terminal になり取消対象が消え、結果が配達された上に「止められる予約はなかった」と矛盾2連発。→ `StimulusQueue` の墓標(suppress)で put を関門化＋`orchestrator` に第2関門。**取消対象は「時計で直近の terminal」ではなく「キューに未配達の報告が残っている terminal」で選ぶ**（実機 D2 時点は90秒窓に terminal 3件あり、時計基準だと特定不能に落ちて直らなかった）。E2E `SD2` で3回連続再現・抑止を確認 |
 | **D3** | **能力の無い依頼を承諾する。** メール送信を「いいよ」と受けた。危険系（ファイル削除）は拒否できるので「危険だから断る」は効き「**能力が無いから断る**」が無い |
 | **D4** | 自己観察ループ（画面に自分のログが映るとそれを画面内容として実況する・軽微） |
 | **D5** | レイテンシ 中央値 2.57s / **平均 3.01s / 最大 5.62s / 3秒超 44%**。**2026-07-29 裁定: gpt-5.5 の品質を取り ≤5s 運用を許容**（理想の ≤3s は下ろさない）。より賢く速いモデルが出たら `RESPONSE_MODEL` を差し替えて再計測する |

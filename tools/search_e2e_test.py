@@ -925,7 +925,71 @@ async def s_full(h: Harness):
     await h.wait_idle(40)
 
 
+async def sd2_cancel_after_done(h: Harness):
+    """D2 回帰: **検索完了が取消要求を追い越した**時、結果を配達しないこと。
+
+    S4（実行中の取消）とは別の経路。実機 2026-07-29 の失敗はこちらで、
+    タスクが terminal 化して取消対象が消え、結果が配達された上に
+    「今は止められる予約はなかったよ」と矛盾報告が続いた。
+
+    再現条件は「cancel_task の dispatch がタスク完了より後」。tool_calls は応答ターンの
+    **末尾**で submit される（orchestrator.py:406）ので、検索開始から D2_DELAY_SEC 秒
+    待って取消を言うと、STT + 応答ターンの分だけ dispatch が遅れて完了を追い越す。
+    実機では検索 8.5s に対し取消発話が +7.8s だった。
+    """
+    # 検索開始の直後に言う: STT(約2s)+応答ターン(約6s)の間にタスクが完了し、報告が
+    # **キューで待つ**状態を作る（runner が空いていると即配達されて D2 の窓に入らない）。
+    delay = float(os.getenv("D2_DELAY_SEC") or 0.0)
+    # 話題は「1回の検索で決着する」ものを選ぶ（「世界一長い川」は結果が紛らわしく
+    # TaskAgent が再検索するため完了時刻がぶれ、窓に入らない実測あり）。
+    prep_cancel = await h.prep("あ、ごめん。さっきの富士山の調べもの、やっぱりやめていいよ。")
+    known = {t.task_id for t in h.goal_tasks()}
+    h.arm_search()
+    await h.say("富士山の高さを調べてくれる？", must=("富士山",))
+    tk = await h.wait_new_task(known)
+    # D1（前セッションの依頼を勝手に実行する既知欠陥）が同時に別タスクを作ることがあり、
+    # wait_new_task は「最初の新タスク」を返すため取り違える。話題で選び直す。
+    for cand in h.goal_tasks():
+        if cand.task_id not in known and "富士山" in (cand.goal or ""):
+            if cand.task_id != (tk.task_id if tk else None):
+                ev("📋", f"D2 監視対象を話題で選び直し: {cand.task_id} 「{cand.goal[:30]}」")
+            tk = cand
+            break
+    # タスク生成の直後に言い始める。E2E の発話パイプライン（TTS再生+STT）は約6秒かかるので、
+    # 取消発話がキューに載るのは検索完了の直前になり、**報告がキューで待つ**状態を作れる
+    # （実測: 検索開始起点だと 0.8 秒差で報告ターンが先に走ってしまった）。
+    await asyncio.sleep(delay)
+    t_cancel = time.monotonic()
+    st_at_cancel = h.vl.task_store.get(tk.task_id).status if tk else "?"
+    ev("📋", f"D2 取消発話の直前 status={st_at_cancel}（Done/Failed なら D2 経路）")
+    await h.say_prepared(prep_cancel, must=("やめ",))
+    rep_c = await h.wait_report(dedup_prefix="cancel:", timeout=90, after=t_cancel)
+    ev("✅" if rep_c else "❌", f"D2 取消の返答: {rep_c[2][:110] if rep_c else '届かず'}")
+    if tk is None:
+        return
+    # D2 の窓（報告がキューで未配達のまま取消が来た）を再現できたかの一次判定。
+    # **発話文で判定しない**: resolver の文言は context_assembler 経由で応答LLMが言い換える
+    # （実測: 「このまま流さないでおくね」→「これ以上は触れないね」）。キューの状態で見る。
+    suppressed = h.vl.queue.is_suppressed(f"task:{tk.task_id}")
+    ever = await h.wait_report(dedup=f"task:{tk.task_id}", timeout=0.1)  # 全期間で1度でも配達したか
+    in_window = suppressed and ever is None
+    ev("🎯" if in_window else "⚠",
+       f"D2 窓の再現: {'成功(未配達のまま抑止)' if in_window else '未再現'}"
+       f" [抑止={suppressed} 配達={'無し' if ever is None else 'あり'}]")
+    ghost = await h.wait_report(dedup=f"task:{tk.task_id}", timeout=45, after=t_cancel)
+    st = h.vl.task_store.get(tk.task_id)
+    # 本丸: 取消後に検索結果の報告ターンが走らないこと。
+    ev("✅" if ghost is None else "❌",
+       f"D2 取消後の結果配達: {'無し(正)' if ghost is None else '来た(誤)=' + ghost[2][:80]}")
+    # 矛盾2連発の回帰: 結果を流しておいて「予約は無かった」と言わない。
+    bad = ("止められる予約" in (rep_c[2] if rep_c else "")) or ("入ってないよ" in (rep_c[2] if rep_c else ""))
+    ev("✅" if not bad else "❌", f"D2 矛盾報告: {'無し(正)' if not bad else '再発(誤)'}")
+    ev("📋", f"D2 最終 status={st.status if st else '?'}（Done のまま＝報告だけ抑止が正）")
+    await h.wait_idle()
+
+
 SCENARIOS = [
+    ("SD2_完了後キャンセル", sd2_cancel_after_done),
     ("SFULL_通し総合16項目", s_full),
     ("SSRC_自発発話の由来", s_speech_sources),
     ("SVLM_画面認識の全場面", s_vlm_states),
