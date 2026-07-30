@@ -1,4 +1,8 @@
-# CLAUDE.md — Eve v2
+# CLAUDE.md — TalkAI（内部呼称 Eve v2）
+
+> リポジトリ: https://github.com/kmtkzy1379/TalkAI （MIT）。
+> **プロジェクト名は TalkAI**。「Eve v2」は前作からの通し番号としての内部呼称で、
+> コード内の識別子（`SPEAKER_EVE` 等）とキャラクター名「イブ」はそのまま維持する。
 
 ## これは何か
 
