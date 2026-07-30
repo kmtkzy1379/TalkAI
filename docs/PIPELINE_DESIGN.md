@@ -20,7 +20,7 @@
 > | ModelRegistry は6 role | **10 role**（`task` `summarize` `search_summarize` `delivery_check` を追加。`vlm_merge` と `youtube` は定義のみで未使用） |
 > | 発話判定の入力は「ランダムRAG2」 | `autonomous_memories(k=3)` ＝ **関連1 + 完全ランダム1 + 重要度1**（`eve/memory/long_term.py`） |
 > | RAGチャンク = フィードバック1 + 応答1 | 実際は **FeedbackLLM 出力のみ**（応答本文は含まない・`eve/feedback/feedback_llm.py`） |
-> | T7 = E2E 4シナリオ | E2E ハーネスは **15シナリオ**（`tools/search_e2e_test.py`）。T1-T7 という ID はテストコード側に存在しない |
+> | T7 = E2E 4シナリオ | E2E ハーネスは **20シナリオ**（`tools/search_e2e_test.py` の `SCENARIOS`）。T1-T7 の ID は一部だけテスト側に実在する（T1/T3/T7=`tests/test_f1_pipeline.py` / T2=`tests/test_f5_speech.py` / T6=`tests/test_f0_foundation.py`）。**T4・T5 の ID は存在しない**（barge-in は T3 と `tests/test_callfunction_phase1.py` で検証） |
 >
 > **中核原理の現状**: surprise の消費者は `should_speak` の1本のみ。**(b) 文脈不整合の自己懐疑は未実装**（§0 の「2点をゲートする」は設計意図であって現状ではない）。
 
@@ -165,9 +165,10 @@ litellm 等で provider 差を吸収。`feedback_llm.py` の3段 fallback と ca
 | ID | 目的 | 方法（API不要・決定論を基本） |
 |---|---|---|
 | **T1** レイテンシ配線 | 並列で動く(直列でない)ことを証明 | 各段を固定遅延スタブにし、合計が「直列和」でなく「並列の最大経路」になることを assert。≤3s を数値で検証 |
+> ※実装（`tests/test_f1_pipeline.py`）が assert するのは「サイドカーが応答経路を塞がない」「並列合成が直列和より短い」のみで、**≤3s の数値検証は無い**（レイテンシは E2E 実測が正）。
 | **T2** surprise death detection | surprise が本当に駆動しているか | surprise を反転 → `should_speak`/自己懐疑の出力が反転することを assert。反転しなければ**ビルド失敗**(装飾化の再発防止) |
 | **T3** 順序/世代 | 音声が順番通り・barge-inで旧世代破棄 | seq シャッフル投入→再生は seq 順 / generation+1 後に旧 seq が再生されないこと |
-| **T4** barge-in | 割り込みで現発話が即停止 | 再生中に user_utterance 投入→AudioPlayQueue flush + 新世代開始を assert。自己エコーは弾かれること(AEC) |
+| **T4** barge-in | 割り込みで現発話が即停止 | 再生中に user_utterance 投入→AudioPlayQueue flush + 新世代開始を assert。※AEC は**不採用**（イヤホン前提・冒頭の訂正表参照） |
 | **T5** provider 代用 | Claude 停止でも動く | ModelRegistry の response 役を GPT/Gemini に差替えても全テストが緑 |
 | **T6** ⭐過去参照なし(Msg6) | 「過去のことを話してない」 | タイムスタンプ付きの混在文脈(古い記憶+新会話)を与え、応答が**現在文脈に接地**し古い話に逸れないことを検証。無言時 random RAG は "話題の種" 扱いで「思い出話」にならないこと |
 | **T7** ⭐パイプライン破綻なし(Msg6) | E2E でエラー/明らかな遅延がない | 4シナリオ(§下)を端から端まで流し、例外0・キュー詰まり0・予算内・順序保持を一括検証 |

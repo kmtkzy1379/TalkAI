@@ -1,6 +1,6 @@
 # HANDOFF — Eve v2 引き継ぎ（実装状況・手順・既知問題の単一情報源）
 
-最終更新: **2026-07-29** / ブランチ `feat/j2-search`（HEAD `7f90c71`・main は 27コミット遅れ）
+最終更新: **2026-07-30** / ブランチ **`main`**（D1/D2/D3 修正まで統合済み・`feat/j2-search` は main に含まれる）
 
 > **新セッションはまずこれを読む。食い違いはコードが正。**
 > 恒久的な設計原則 = `CLAUDE.md` / 設計契約 = `docs/PIPELINE_DESIGN.md`・`docs/COMPONENT_LOGIC.md` / 原契約 = `docs/KIKAKUSHO.md`。
@@ -41,7 +41,7 @@ VoiceLoop 稼働。話しかけてください。
 
 ## 2. テスト方法
 
-### Tier-1 決定論テスト（API不要・ネットワーク不要・全18ファイルで約14秒）
+### Tier-1 決定論テスト（API不要・ネットワーク不要・全18ファイルで約11秒）
 
 runner は無い（**pytest 未導入**＝`pytest tests/` は動かない）。各ファイルが独立スクリプト。
 
@@ -88,14 +88,17 @@ Get-ChildItem tests\test_*.py | ForEach-Object {
 # 実起動と同じ設定・本番記憶のコピーで「通し総合16項目」だけ回す（約18分）
 $env:PYTHONIOENCODING="utf-8"; $env:REAL_STATE="1"
 $env:E2E_ART="C:\Users\tester\Desktop\eve-v2\e2e_logs\full_$(Get-Date -Format yyyyMMdd)"
-$env:SKIP="SSRC,SVLM,SIDLE,SAUTO,S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,S11"
+$env:SKIP="SRB,SD1,SD2,SD3,SSRC,SVLM,SIDLE,SAUTO,S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,S11"
 & C:\Users\tester\Desktop\portfolio8-VLM-AI\venv\Scripts\python.exe tools\search_e2e_test.py
 ```
 
 **`REAL_STATE=1` が重要**: `.env` のフラグ/モデルをそのまま使い、本番の `conversation_history.jsonl` / `rag_memory.jsonl` / `tasks.jsonl` を artifacts に**コピーして**使う（本物は汚れない）。付けないとフラグを強制 ON し記憶が空になるので**実起動の挙動は測れない**（この差が D6 の事故を1か月見逃した原因）。
 
+全20シナリオ。`SKIP` は `名前の _ より前` の完全一致で判定する（例 `SD1`）。
+
 | キー | シナリオ |
 |---|---|
+| `SRB` | **再起動時の挙動（会話 / 自律発話 / タスク）**。`D1_SEED=1` で「前セッションが未応答依頼を残して終了」を作る。`REBOOT_TASK=1` で Pending タスクも残す |
 | `SD1` | **前セッション未応答依頼（D1 回帰）**。`D1_SEED=1` で履歴/RAG を N時間前で打ち切り末尾に未応答依頼を仕込む。`D1_NOTE_OFF=1` で修正を無効化した対照実験ができる（約1分） |
 | `SD3` | **能力境界（D3 回帰）**。不能依頼を承諾しないこと＋可能依頼/雑談を過剰に断らないことを実起動経路で確認（配線確認が主目的。効果量は `tools/d3_probe.py`）（約2分） |
 | `SD2` | **完了後キャンセル（D2 回帰）**。検索完了が取消要求を追い越す窓を作り、未配達の報告が抑止されること・矛盾2連発が出ないことを確認（約2分・`D2_DELAY_SEC` で発話タイミング調整）。S4 とは別経路 |
@@ -111,7 +114,7 @@ $env:SKIP="SSRC,SVLM,SIDLE,SAUTO,S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,S11"
 出力（`E2E_ART` 直下）: `timeline.jsonl`（全イベント）/ `terminal.log` / `summary.json`（handles・latencies・decisions・suppressions・seed_calls・cap_calls・search_calls・tasks_final）/ 記憶の隔離コピー3種。
 **`e2e_logs/` は gitignore**（記憶のコピーを含む）＝残したい結論は docs に転記する。
 
-### その他のツール（`tools/` 33本）
+### その他のツール（`tools/` 追跡30本・ディスク35本。`tools/_*.py` `tools/_*.ps1` は gitignore）
 - 軽いスモーク: `search_smoke.py` / `task_smoke.py` / `callfunction_smoke.py` / `autonomous_probe.py`
 - VLM: `f6_realtest.py`（通し）/ `f6_precheck.py`（前提チェック）/ `f6_latency_ab.py`
 - RAG: `rag_diag.py`（**API不要**・実 rag_memory + 実 Ruri）/ `rag_experiment.py`
@@ -161,7 +164,7 @@ UI（Tkinter・**tkinter 参照は0件**）/ 配線層PORT（vts / run / launche
 | **D2** | （**解決済 2026-07-29** ブランチ `fix/d2-cancel-tombstone`）タスクキャンセルの競合。検索完了が取消要求に先行するとタスクが terminal になり取消対象が消え、結果が配達された上に「止められる予約はなかった」と矛盾2連発。→ `StimulusQueue` の墓標(suppress)で put を関門化＋`orchestrator` に第2関門。**取消対象は「時計で直近の terminal」ではなく「キューに未配達の報告が残っている terminal」で選ぶ**（実機 D2 時点は90秒窓に terminal 3件あり、時計基準だと特定不能に落ちて直らなかった）。E2E `SD2` で3回連続再現・抑止を確認 |
 | **D3** | （**解決済 2026-07-30** ブランチ `fix/d3-capability-boundary`）能力の無い依頼（メール送信）を承諾していた。→ `# 実際に実行できる手段` ブロックを **registry 導出**（`CapabilityRegistry.outward_actions()`）で USER ターンの system に注入し、`delegate_task` の description にも境界を追記。**一覧を手書きにしない**（search_web は SEARCH_ENABLED ∧ ddgs ∧ TASK_ENABLED の内側でしか登録されず構成で変わる／J-3 で腐る）。**閉世界宣言にしない**（手段に対応しない goal が3件 Done している実績＝考えて答えるだけの依頼は許可）。効果測定 `tools/d3_probe.py` n=204: 過剰承諾 20/42→0/42（Fisher p=9.6e-08）／過剰拒否は可能依頼 1/24→0/24・会話 0/36→0/36 で悪化なし。残課題: 危険∧不能ケースで危険理由への言及が 6/6→4/6 に減少 |
 | **D4** | 自己観察ループ（画面に自分のログが映るとそれを画面内容として実況する・軽微） |
-| **D5** | レイテンシ 中央値 2.57s / **平均 3.01s / 最大 5.62s / 3秒超 44%**。**2026-07-29 裁定: gpt-5.5 の品質を取り ≤5s 運用を許容**（理想の ≤3s は下ろさない）。より賢く速いモデルが出たら `RESPONSE_MODEL` を差し替えて再計測する |
+| **D5** | レイテンシ **悪化を観測（未対応）**。2026-07-30 の通し3回 pooled（n=92）: 中央値 3.14s / 平均 3.29s / **最大 9.70s / 3秒超 54% / 5秒超 11%**。旧測定（2026-07-29・単一ラン n=32）は 中央値 2.57s / 平均 3.01s / 3秒超 44% で、**≤5s 運用の許容ラインも 10/92 で超過**。心当たりは D1/D3 で増えた system ブロックだが**未検証**。**2026-07-29 裁定: gpt-5.5 の品質を取り ≤5s 運用を許容**（理想の ≤3s は下ろさない）。より賢く速いモデルが出たら `RESPONSE_MODEL` を差し替えて再計測する |
 | **D6** | （**解決済 2026-07-29**）`.env` に機能フラグが無く実起動でタスク/検索/Call-Function が全滅していた。E2E ハーネスだけが強制 ON だったため約1か月気づかなかった。→ `.env` と `.env.example` にフラグを明記 |
 
 ### 設計上の既知（継続・実害小）
@@ -179,14 +182,14 @@ UI（Tkinter・**tkinter 参照は0件**）/ 配線層PORT（vts / run / launche
 ### 未決事項（ユーザ裁定待ち）
 1. **`pending_obligation`**: `should_speak` の唯一の hard ゲートだが本番から渡していない（テスト専用の死んだ引数）。実配線するか
 2. **未使用 role**: `vlm_merge`（廃止された×3案の残骸）と `youtube`（未実装）を残すか
-3. **main マージ計画**: main が27コミット遅れ。どの単位で5回連続テストを回してマージするか
+3. （**解決済 2026-07-30**）main マージ: Tier-1 434件を5回連続 PASS で確認し `main` に fast-forward 統合済み
 
 ---
 
 ## 5. 設定の要点
 
 - **機能フラグは `.env` で明示する**（コード既定は全て off）。将来 UI から ON/OFF する設定項目という位置づけ。`.env.example` に全フラグを明記済み
-- 実運用モデル: response=`gpt-5.5` / decide=`gpt-5.4-mini` / feedback=`gpt-5.4` / vlm_leaf=`gemini-2.5-flash`。`task` `search_summarize` `delivery_check` はコード既定のまま
+- 実運用モデル（role 名は `eve/model_registry.py` の `ROLE_ENV` キー）: `response`=gpt-5.5 / **`speech_decide`**=gpt-5.4-mini（env は `DECIDE_MODEL`・"decide" は role 名ではない） / `feedback`=gpt-5.4 / `summarize`=gpt-4o-mini / `vlm_leaf`=gemini-2.5-flash。`task` `search_summarize` `delivery_check` はコード既定のまま。ROLE_ENV は全10 role で、`vlm_merge` と `youtube` は消費者ゼロ
 - Web検索は `SEARCH_BACKEND=auto`（DNS 遮断回線では `duckduckgo` 固定へ。復旧手順は `docs/DNS_BACKUP_2026-07-17.md`）
 - 主要な閾値の実測校正値は `eve/config.py` のコメントに日付つきで残してある（同内容抑制 0.25/0.87、記憶の自己参照除外 600秒、画面据え置き 600秒 等）
 

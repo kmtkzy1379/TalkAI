@@ -9,6 +9,9 @@ pyaudio
 # F2.5 入力。openai=STT(gpt-4o-transcribe)、torch=Silero VAD（マイク使用時のみ・遅延 import）。
 openai
 torch
+# STT_BACKEND=groq で必要（eve/stt/groq_whisper.py が import）。既定は openai なので
+# 未導入でも既定構成では動くが、groq を選ぶと起動時に落ちる。
+groq
 # F3.5 長期記憶。sentence-transformers=Ruri v3 埋め込み（ローカル・遅延 import）。
 # Tier-1 決定論テストには不要（fake embed_fn 注入）。
 sentence-transformers
