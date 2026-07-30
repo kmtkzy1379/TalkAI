@@ -128,6 +128,17 @@ if os.getenv("D1_SEED") == "1":
             {"ts": _ts, "speaker": "user", "text": "じゃあPCの状態を教えてくれる?"},
             ensure_ascii=False) + "\n")
     print(f"[D1_SEED] {_gap_h}時間前で打ち切り（履歴{_nh}件/RAG{_nr}件）+ 未応答依頼を末尾に追加")
+    if os.getenv("REBOOT_TASK") == "1":
+        # 前セッションが残した Pending タスク（未来の when）＝再起動を跨ぐ予約。
+        _when = (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(seconds=45)).isoformat()
+        with open(Config.TASK_FILE, "a", encoding="utf-8") as _f:
+            _f.write(json.dumps({
+                "task_id": "t_reboot_seed", "what": "", "goal": "好きなおにぎりの具を教えて",
+                "args": {}, "when": _when, "status": "Pending", "attempts": 0,
+                "created_at": _ts, "updated_at": _ts, "depth": 0,
+                "verdict_kind": "deterministic", "depends_on": [],
+            }, ensure_ascii=False) + "\n")
+        print("[REBOOT_TASK] 前セッションの Pending タスクを1件残した（45秒後 due）")
 if os.getenv("D1_NOTE_OFF") == "1":
     # 対照実験（修正を無効化）: 復元会話のカットを外し、前セッション分も注入する
     # ＝修正前（D1 が起きる）状態にする。閾値を無限化する旧フラグでは案2 を無効化できない
@@ -1143,7 +1154,49 @@ async def sd3_capability_boundary(h: Harness):
     await h.wait_idle()
 
 
+async def sreboot(h: Harness):
+    """再起動時の挙動（会話 / 自律発話 / タスク）。
+
+    前提: `D1_SEED=1` で「前セッションが N時間前に未応答依頼を残して終わった」状態を作る。
+    `REBOOT_TASK=1` を足すと前セッションの Pending タスク（未来の when）も残す。
+    """
+    known = {t.task_id for t in h.goal_tasks()}
+    before_caps = len(h.cap_calls)
+
+    # --- 再起動時会話: 前セッションの用件を蒸し返さないか ---
+    await h.say("おはよう。今日はちょっと寒いね。", must=("おはよう",))
+    await h.wait_idle(90)
+    convo = [m["content"] for msgs in h.assembled for m in msgs[1:]]
+    carried = [c for c in convo if "PCの状態を教えて" in c]
+    spoken = " ".join(t for (_m, _k, _d, t, _c) in h.handles)
+    ev("✅" if not carried else "❌", f"RB 復元会話の注入: {'無し(正)' if not carried else 'あり(誤)'}")
+    ev("✅" if not [c for c in h.cap_calls[before_caps:]] else "❌",
+       f"RB 起動直後の勝手な実行: {[c['name'] for c in h.cap_calls[before_caps:]] or '無し(正)'}")
+    ev("✅" if "さっき" not in spoken else "❌",
+       f"RB 時制の誤り: {'無し(正)' if 'さっき' not in spoken else 'あり(誤)'}")
+    ev("💬", f"RB 再起動時会話: {spoken[:120]}")
+
+    # --- 再起動時タスク: 前セッションの Pending が残っていた場合の扱い ---
+    pend = [t for t in h.vl.task_store.list_all() if t.status == "Pending"]
+    ev("📋", f"RB 起動時の Pending タスク: {[(t.goal or t.what)[:26] for t in pend] or '無し'}")
+    if pend:
+        rep = await h.wait_report(dedup_prefix="task:", timeout=120)
+        ev("📋", f"RB 前セッションのタスク報告: {rep[2][:90] if rep else '届かず'}")
+
+    # --- 再起動時自律発話: 黙って待ち、RAG 由来で自然に話し出すか ---
+    n0 = len(h.handles)
+    await asyncio.sleep(float(os.getenv("RB_IDLE_SEC") or 100))
+    autos = [t for (_m, k, _d, t, _c) in h.handles[n0:] if k == "AUTONOMOUS_SPEECH"]
+    selfref = [t for t in autos if any(w in t for w in ("できるのは", "手段は", "私には"))]
+    ev("📋", f"RB 再起動時の自律発話 {len(autos)}件: {[t[:56] for t in autos]}")
+    ev("✅" if not selfref else "❌", f"RB 能力への自己言及: {'無し(正)' if not selfref else 'あり(誤)'}")
+    new_tasks = [t for t in h.goal_tasks() if t.task_id not in known]
+    ev("📋", f"RB 新規タスク: {[(t.goal or '')[:26] for t in new_tasks] or '無し'}")
+    await h.wait_idle()
+
+
 SCENARIOS = [
+    ("SRB_再起動時の挙動", sreboot),
     ("SD1_前セッション未応答依頼", sd1_stale_request),
     ("SD3_能力境界", sd3_capability_boundary),
     ("SD2_完了後キャンセル", sd2_cancel_after_done),
