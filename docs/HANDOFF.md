@@ -61,20 +61,20 @@ Get-ChildItem tests\test_*.py | ForEach-Object {
 "PASS $tot / FAIL $fail"
 ```
 
-**実測 2026-07-29: 18ファイル 440件 PASS / FAIL 0**（2回連続一致・flaky なし）
+**実測 2026-07-29: 18ファイル 434件 PASS / FAIL 0**（2回連続一致・flaky なし）
 
 | ファイル | 件数 | ファイル | 件数 |
 |---|---|---|---|
 | test_callfunction_phase1.py | 45 | test_f4_feedback.py | 25 |
 | test_cancel_resolver_phase1.py | 19 | test_f5_speech.py | 61 |
 | test_delivery_checker.py | 10 | test_f6_vlm.py | 44 |
-| test_f0_foundation.py | 63 | test_search_phase1.py | 23 |
+| test_f0_foundation.py | 53 | test_search_phase1.py | 23 |
 | test_f1_pipeline.py | 26 | test_stt_filter.py | 10 |
 | test_f2_5_integration.py | 4 | test_task_agent_phase1.py | 13 |
 | test_f2_5_robustness.py | 5 | test_task_phase1.py | 14 |
 | test_f2_response.py | 18 | test_voiceloop_wiring.py | 29 |
 | test_f3_5_rag.py | 21 | | |
-| test_f3_memory.py | 10 | **合計** | **440** |
+| test_f3_memory.py | 14 | **合計** | **434** |
 
 規律: 機能ごと **2回連続 PASS で合格** / 最終統合マージは **5回連続**。
 `test_f6_vlm.py` は例外注入テストで traceback をログ出力するが FAIL ではない。
@@ -157,7 +157,7 @@ UI（Tkinter・**tkinter 参照は0件**）/ 配線層PORT（vts / run / launche
 ### 実機で確認済み（2026-07-29 通しテスト・生ログは `e2e_logs/full_20260729/`）
 | ID | 内容 |
 |---|---|
-| **D1** | （**部分的に改善・未解決 2026-07-30** ブランチ `fix/d1-session-gap`）起動直後に前セッションの未応答依頼を勝手に実行した。**主因は `# 直近フィードバック`**（起動時 catch-up の内省が前セッション末尾を要約し、時刻ラベル無しで「直近」として注入されていた）。→ 内省を**対象スパン末尾**(`PredictionState.watermark`)で時刻接地し、`# 会話の間隔` ブロックを **system に**追加（ユーザ発話本文は汚さない）。測る基準は**最後のユーザ発話**、語彙指定は渡さない、自発経路には出さない。E2E `SD1`（挨拶だけのターン）では対照実験で確認（修正 off で「さっきのPCの状態も確認するね」+`delegate_task` が再現 / 修正 on で3回連続クリーン）。**ただし SD3 実行中に再発を確認**: ユーザのターンが**別の依頼**を含む場合、ギャップブロックが出ていても（実測 112132秒＝31時間で発火）古い依頼を蒸し返して `pc_status` を実行した。オフライン比較 n=8/群 で 蒸し返し caps_off 6/8 → caps_on 8/8（D3 の能力一覧が原因ではないが緩和もしない）。**ギャップ注記は文脈整形であってハードゲートではない**のが限界。次の一手候補: 大ギャップより前の未応答 user ターンを注入窓から落とす / 事前ギャップの依頼に一致する goal の delegate_task を弾く |
+| **D1** | （**解決済 2026-07-30** ブランチ `fix/d1-session-boundary`）起動直後に前セッションの未応答依頼を勝手に実行した。**第1ラウンドのギャップ注記（文脈整形）は実測で無効**（同一文脈でユーザが別依頼をすると蒸し返し 8/8）。→ **`recent_for_injection` が復元（前セッション）分を返さない**（案2）。同条件で 0/8。切る場所は cache 層で `_load` は残す＝**B5 no-skip（前セッション末尾を RAG に取り込む）は `turns_since` 経由なので無傷**（回帰テストで固定）。併せて独立のバグを修正: 内省チャンクの timestamp が書込時刻で、catch-up 由来チャンクが `[過去の記憶/たった今]` と描画されていた（スパン末尾の iso を渡す）。②-6 時制ゲートが恒久 no-op になる問題も反転で解消。E2E `SD1` 対照実験で配線確認（対照で復元会話の注入を再現 / 修正 arm 2回連続クリーン・起動後に黙ったままの経路も新規に観測し無根拠発話なし） |
 | **D2** | （**解決済 2026-07-29** ブランチ `fix/d2-cancel-tombstone`）タスクキャンセルの競合。検索完了が取消要求に先行するとタスクが terminal になり取消対象が消え、結果が配達された上に「止められる予約はなかった」と矛盾2連発。→ `StimulusQueue` の墓標(suppress)で put を関門化＋`orchestrator` に第2関門。**取消対象は「時計で直近の terminal」ではなく「キューに未配達の報告が残っている terminal」で選ぶ**（実機 D2 時点は90秒窓に terminal 3件あり、時計基準だと特定不能に落ちて直らなかった）。E2E `SD2` で3回連続再現・抑止を確認 |
 | **D3** | （**解決済 2026-07-30** ブランチ `fix/d3-capability-boundary`）能力の無い依頼（メール送信）を承諾していた。→ `# 実際に実行できる手段` ブロックを **registry 導出**（`CapabilityRegistry.outward_actions()`）で USER ターンの system に注入し、`delegate_task` の description にも境界を追記。**一覧を手書きにしない**（search_web は SEARCH_ENABLED ∧ ddgs ∧ TASK_ENABLED の内側でしか登録されず構成で変わる／J-3 で腐る）。**閉世界宣言にしない**（手段に対応しない goal が3件 Done している実績＝考えて答えるだけの依頼は許可）。効果測定 `tools/d3_probe.py` n=204: 過剰承諾 20/42→0/42（Fisher p=9.6e-08）／過剰拒否は可能依頼 1/24→0/24・会話 0/36→0/36 で悪化なし。残課題: 危険∧不能ケースで危険理由への言及が 6/6→4/6 に減少 |
 | **D4** | 自己観察ループ（画面に自分のログが映るとそれを画面内容として実況する・軽微） |

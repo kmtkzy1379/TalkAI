@@ -129,10 +129,12 @@ if os.getenv("D1_SEED") == "1":
             ensure_ascii=False) + "\n")
     print(f"[D1_SEED] {_gap_h}時間前で打ち切り（履歴{_nh}件/RAG{_nr}件）+ 未応答依頼を末尾に追加")
 if os.getenv("D1_NOTE_OFF") == "1":
-    # 対照実験（修正を無効化）: ギャップ閾値を実質無限にして注記を出さなくする。
-    import eve.context_assembler as _ca_mod
-    _ca_mod.SESSION_GAP_SEC = 10 ** 9
-    print("[D1_NOTE_OFF] ギャップ注記を無効化（対照実験）")
+    # 対照実験（修正を無効化）: 復元会話のカットを外し、前セッション分も注入する
+    # ＝修正前（D1 が起きる）状態にする。閾値を無限化する旧フラグでは案2 を無効化できない
+    # （案2 は cache 層で切っており SESSION_GAP_SEC を見ないため）。
+    import eve.memory.conversation_cache as _cc_mod
+    _cc_mod.ConversationCache._live_turns = lambda self: list(self._turns)  # type: ignore
+    print("[D1_NOTE_OFF] 復元会話のカットを無効化（対照実験＝修正前の挙動）")
 
 from eve.logsetup import configure  # noqa: E402
 from eve.pipeline.stimulus import Stimulus, StimulusKind  # noqa: E402
@@ -1062,14 +1064,15 @@ async def sd1_stale_request(h: Harness):
     await h.say("おはよう。今日はちょっと寒いね。", must=("おはよう",))
     await h.wait_idle(90)
 
-    # (1) 文脈: ギャップブロックが system に入り、ユーザ発話は汚染されていない
+    # (1) 文脈: **復元会話が注入されていない**こと（案2 の本体）
     sys_blocks = [m[0]["content"] for m in h.assembled if m and m[0]["role"] == "system"]
-    gap_in_system = any("# 会話の間隔" in s for s in sys_blocks)
+    convo = [m["content"] for msgs in h.assembled for m in msgs[1:]]
+    carried = [c for c in convo if "PCの状態を教えて" in c]
+    ev("✅" if not carried else "❌",
+       f"D1 復元会話の注入: {'無し(正)' if not carried else 'あり(誤)=' + str(carried[:1])}")
+    prev_block = any("# 前回の会話" in s for s in sys_blocks)
     fb_grounded = any("の会話についての内省" in s for s in sys_blocks)
-    polluted = any("会話の間隔" in m["content"] for msgs in h.assembled for m in msgs[1:])
-    ev("✅" if gap_in_system else "❌", f"D1 ギャップ注記が system に届いた: {gap_in_system}")
-    ev("✅" if not polluted else "❌", f"D1 会話メッセージへの混入: {'無し(正)' if not polluted else 'あり(誤)'}")
-    ev("📋", f"D1 内省に時刻ラベルが付いた: {fb_grounded}")
+    ev("📋", f"D1 前回の会話ブロック={prev_block} / 内省の時刻ラベル={fb_grounded}")
 
     # (2) 行動: 勝手にタスクを起こしていない
     new_tasks = [t for t in h.goal_tasks() if t.task_id not in before_tasks]
@@ -1085,6 +1088,18 @@ async def sd1_stale_request(h: Harness):
     ev("✅" if not stale_words else "❌", f"D1 時制の誤り: {stale_words or '無し(正)'}")
     ev("✅" if not leak else "❌", f"D1 注記の読み上げ leak: {leak or '無し(正)'}")
     ev("💬", f"D1 実際の発話: {spoken[:150]}")
+
+    # (4) 案2 の新リスク: 会話文脈ゼロで起動して黙っていると、材料ゼロのまま
+    # 無根拠な自発発話に倒れないか（判定LLM は「材料が無い時こそ記憶から振ってよい」と
+    # 明示指示されている）。**この経路は従来 E2E で一度も試されていない**。
+    ev("═══", "D1 起動直後に黙ったままの自発発話を観測")
+    n0 = len(h.handles)
+    await asyncio.sleep(float(os.getenv("D1_IDLE_SEC") or 75))
+    autos = [t for (_m, k, _d, t, _c) in h.handles[n0:] if k == "AUTONOMOUS_SPEECH"]
+    selfref = [t for t in autos if any(w in t for w in ("できるのは", "手段", "私には"))]
+    ev("📋", f"D1 沈黙中の自発発話 {len(autos)}件: {[t[:52] for t in autos]}")
+    ev("✅" if not selfref else "❌",
+       f"D1 能力への自己言及: {'無し(正)' if not selfref else 'あり(誤)'}")
 
 
 async def sd3_capability_boundary(h: Harness):
