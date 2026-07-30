@@ -175,7 +175,12 @@ def stale_recency_deixis(content: str, recent_turns, now: Optional[str] = None,
         and (getattr(getattr(t, "stamp", None), "iso", "") or "")
     ]
     if not ages:
-        return False  # ユーザ発話が無い（判断材料なし）→ 誤りとみなさない
+        # D1（案2）: 注入窓にユーザ発話が1件も無い＝起動直後で前セッション分を注入していない状態。
+        # このとき下書きの「さっき」「その件」は**指す先が文脈に存在しない**ので定義上誤り。
+        # 旧実装は「判断材料なし→誤りとみなさない」で False に倒していたが、復元会話を
+        # 注入しなくなるとこの分岐が恒常化し、②-6 の時制ゲートが**恒久 no-op** になる
+        # （実測: 復元あり16/17 発火 → 復元なし 0/17）。材料が無いこと自体を根拠にする。
+        return True
     return min(ages) > stale_sec
 
 

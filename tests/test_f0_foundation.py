@@ -107,103 +107,46 @@ notool_sys = ContextAssembler(system_prompt="SYS").assemble(user_text="x", tools
 check("J-2 ①: tools 無効時は機能ブロックを出さない", "Call-Function" not in notool_sys)
 
 # ---------------------------------------------------------------------------
-# 5. D1: セッション間ギャップ（前セッションの未応答依頼を勝手に実行しない）
+# 5. D1: セッション境界（前セッションの短期記憶を持ち越さない）
 # 実機 2026-07-29: 起動直後の挨拶だけで、5時間前の「PCの状態を教えてくれる?」を
 # 「さっきの」と呼んで delegate_task した。
+# 第1ラウンドはギャップ注記（文脈整形）で対処したが**実測 8/8 で無効**だったため、
+# 第2ラウンドで「復元会話を注入しない」（案2）に切り替えた（同条件で 0/8）。
 # ---------------------------------------------------------------------------
-from eve.context_assembler import (  # noqa: E402
-    OMITTED_SPEAKER, SESSION_GAP_SEC, session_gap_seconds,
-)
+from eve.context_assembler import SESSION_GAP_SEC  # noqa: E402
 
 D1_NOW = Stamp(iso="2026-07-28T17:21:11.146034+00:00", mono=0.0)
-
-
-def _iso(seconds_ago: float) -> str:
-    return (datetime.fromisoformat(D1_NOW.iso) - timedelta(seconds=seconds_ago)).isoformat()
-
-
-def _turn(speaker: str, text: str, seconds_ago: float) -> Turn:
-    return Turn(speaker, text, Stamp(iso=_iso(seconds_ago), mono=0.0))
-
-
 _ca = ContextAssembler(system_prompt="SYS")
-_GAP_HEAD = "# 会話の間隔"
-_D1_FB = "ユーザは…その後PCの状態を教えてくれるかと発言した。（予測差45）"
+_PREV_HEAD = "# 前回の会話"
 
-# ⭐死活: 実機 D1 の入力（末尾=5時間前の未応答 user 依頼 / 現発話=挨拶）
-d1 = _ca.assemble(
-    user_text="おはよう。今日はちょっと寒いね。",
-    recent_turns=[_turn("eve", "ごめん、ネット検索はできないんだ。", 17690),
-                  _turn("user", "じゃあPCの状態を教えてくれる?", 17676)],
-    last_feedback=_D1_FB, last_feedback_iso=_iso(17676), now=D1_NOW,
-)
-d1_sys = d1[0]["content"]
-check("D1 ギャップブロックが system に出る", _GAP_HEAD in d1_sys)
-check("D1 経過時間が載る（固定文でない）", "4時間" in d1_sys)
-check("D1 依頼の失効を伝える", "まだ生きているとは限らない" in d1_sys)
-check("D1 予約タスクに道を譲る", "「# 予約タスク」が正" in d1_sys)
-check("D1 読み上げ抑止がある", "そのまま読み上げない" in d1_sys)
-# ⭐死活: 逐語トークンを応答LLM に渡さない（J-2 ①-b の逐語見本禁止と同じ規律）
-check("D1 語彙指定を渡さない(さっき/前に/今の)",
-      not any(w in d1_sys.split(_GAP_HEAD)[1] for w in ("「さっき」", "「前に」", "「今の」")))
-# ⭐死活: ロール汚染しない（注記が会話/ユーザ発話の本文に混ざらない）
-check("D1 ユーザ発話は逐語のまま", d1[-1]["content"] == "おはよう。今日はちょっと寒いね。")
-check("D1 会話ターンは無改変", d1[-2]["content"] == "じゃあPCの状態を教えてくれる?")
-check("D1 注記は会話メッセージに入らない",
-      all(_GAP_HEAD not in m["content"] and "間隔" not in m["content"] for m in d1[1:]))
-# ⭐死活: # 直近フィードバック は「内省が対象にした会話スパン」で接地する
-check("D1 古い内省に時刻ラベルが付く", "の会話についての内省" in d1_sys)
-check("D1 古い内省は現在の依頼でないと明示", "今この場で出ている依頼ではない" in d1_sys)
-
-# ⭐陽性対照: ギャップ無しでは何も出さない（「常に出す」実装を落とす）
-fresh = _ca.assemble(
-    user_text="おはよう。", recent_turns=[_turn("user", "ねえ", 30)],
-    last_feedback=_D1_FB, last_feedback_iso=_iso(30), now=D1_NOW,
-)
-check("D1 陽性対照: ギャップ無しなら間隔ブロック無し", _GAP_HEAD not in fresh[0]["content"])
-check("D1 陽性対照: 新しい内省にラベルを付けない", "内省" not in fresh[0]["content"])
-check("D1 陽性対照: ユーザ発話は逐語", fresh[-1]["content"] == "おはよう。")
-
-# 閾値の境界（`>` を pin）
-check("D1 閾値ちょうどでは出さない",
-      session_gap_seconds([_turn("user", "x", SESSION_GAP_SEC)], D1_NOW) is None)
-check("D1 閾値超で出す",
-      session_gap_seconds([_turn("user", "x", SESSION_GAP_SEC + 1)], D1_NOW) is not None)
-
-# 測る基準は「最後の**ユーザ**発話」（直前ターンだとイブの自発発話で新しくなり取り逃す）
-check("D1 直前がイブの自発発話でも取り逃さない",
-      session_gap_seconds([_turn("user", "PCの状態教えて", 17676),
-                           _turn("eve", "ひとりごと", 5)], D1_NOW) is not None)
-
-# 注入窓の**内部**にある空白も拾う（セッション2ターン目以降は境界が窓の中に来る。
-# 本番履歴には11日ギャップが実在し、計画が「ターン間ギャップ注記」で狙っていた形）
-check("D1 窓の内部の空白も拾う（末尾は新しくても）",
-      session_gap_seconds([_turn("user", "PCの状態教えて", 950400),  # 11日前
-                           _turn("eve", "うん", 950390),
-                           _turn("user", "おはよう", 20)], D1_NOW) is not None)
-
-# 省略マーカが挟まる窓は「空白」ではない（実ターンを省略しただけ）
-check("D1 省略マーカ入りでは出さない",
-      session_gap_seconds([_turn("user", "a", 17676),
-                           Turn(OMITTED_SPEAKER, "3", Stamp.now()),
-                           _turn("eve", "b", 5)], D1_NOW) is None)
-
-# 履歴なし / 時刻破損は「無言で 0 扱い」にしない（ガードが自分で自分を切らない）
-check("D1 履歴なしは出さない", session_gap_seconds([], D1_NOW) is None
-      and session_gap_seconds(None, D1_NOW) is None)
-check("D1 時刻破損では判定を降りる",
-      session_gap_seconds([Turn("user", "x", Stamp(iso="not-a-date", mono=0.0))], D1_NOW) is None
-      and session_gap_seconds([Turn("user", "x", Stamp(iso="", mono=0.0))], D1_NOW) is None)
-check("D1 未来ターンでは出さない",
-      session_gap_seconds([_turn("user", "x", -3600)], D1_NOW) is None)
-
-# 自発発話経路には出さない（判定LLM は「古い話題を振ってよい」と逆を明示指示されている）
-auto = _ca.assemble(
-    autonomous_content="空が青い理由の話をする",
-    recent_turns=[_turn("user", "じゃあPCの状態を教えてくれる?", 17676)], now=D1_NOW,
-)
-check("D1 自発経路には間隔ブロックを出さない", _GAP_HEAD not in auto[0]["content"])
-check("D1 自発経路の指示文は壊れない", "下書き" in auto[-1]["content"])
+# 前セッション境界の提示（呼び手が経過秒を渡した時だけ出る・事実の提示に徹する）
+prev = _ca.assemble(user_text="おはよう。", prev_session_gap_sec=17676.0, now=D1_NOW)
+prev_sys = prev[0]["content"]
+check("D1 前回の会話ブロックが出る", _PREV_HEAD in prev_sys)
+check("D1 経過が載る", "4時間" in prev_sys)
+check("D1 逐語が残っていないと明示", "逐語は残っていない" in prev_sys)
+check("D1 続きではないと明示", "その続きではない" in prev_sys)
+check("D1 読み上げ抑止がある", "そのまま読み上げない" in prev_sys)
+# 命令を積まない（第1ラウンドの注記は命令4つで 8/8 無効だった。事実提示に徹する）
+check("D1 蒸し返し禁止の命令文を積まない",
+      "蒸し返" not in prev_sys and "実行し直したり" not in prev_sys)
+check("D1 ユーザ発話は逐語のまま", prev[-1]["content"] == "おはよう。")
+check("D1 会話メッセージに混入しない", all(_PREV_HEAD not in m["content"] for m in prev[1:]))
+# 未指定なら出さない（陽性対照）
+check("D1 経過未指定では出さない", _PREV_HEAD not in _ca.assemble(user_text="x")[0]["content"])
+# 自発経路には出さない（判定LLM は古い話題を振ってよいと明示指示されている＝T2 を壊さない）
+check("D1 自発経路には出さない",
+      _PREV_HEAD not in _ca.assemble(autonomous_content="天気の話",
+                                     prev_session_gap_sec=17676.0, now=D1_NOW)[0]["content"])
+# 内省の時刻接地（案2 では last_feedback が前セッションを語る唯一の経路＝load-bearing）
+_fb = _ca.assemble(user_text="x", last_feedback="ユーザはPCの状態を…と発言した。",
+                   last_feedback_iso="2026-07-28T12:26:35+00:00", now=D1_NOW)[0]["content"]
+check("D1 古い内省に時刻ラベルが付く", "の会話についての内省" in _fb)
+check("D1 古い内省は現在の依頼でないと明示", "今この場で出ている依頼ではない" in _fb)
+_fb2 = _ca.assemble(user_text="x", last_feedback="いま話した内容",
+                    last_feedback_iso=D1_NOW.iso, now=D1_NOW)[0]["content"]
+check("D1 新しい内省にはラベルを付けない", "内省" not in _fb2)
+check("D1 閾値定数が残っている", SESSION_GAP_SEC == 900.0)
 
 # ---------------------------------------------------------------------------
 # 6. D3: 能力境界（手段の無い依頼を承諾しない）

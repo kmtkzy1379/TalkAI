@@ -9,6 +9,7 @@ kind 別の記録（USER のみ user ターン）。実 LLM/TTS/音声は使わ�
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import sys
@@ -286,6 +287,69 @@ async def t_kind_user_only() -> bool:
     return len(users) == 1 and users[0].text == "こん" and len(eves) == 2
 
 
+# --- D1 案2: 復元（前セッション）分は注入しない ------------------------------
+# 実機 2026-07-29: 起動直後の挨拶だけで5時間前の未応答依頼を実行した。
+# 第1ラウンドのギャップ注記は実測 8/8 で無効。復元会話を注入しなければ 0/8。
+# **B5 no-skip（前セッション末尾を RAG に取り込む）は turns_since 経由なので無傷**でなければならない。
+
+def _prev_session_file() -> str:
+    """前セッションの履歴を持つ jsonl を作る（末尾は未応答のユーザ依頼）。"""
+    d = tempfile.mkdtemp(prefix="eve_d1b_")
+    p = os.path.join(d, "h.jsonl")
+    old = "2026-07-28T12:26:35.209300+00:00"
+    with open(p, "w", encoding="utf-8") as f:
+        for sp, tx, ts in (("user", "ネット検索して。", "2026-07-28T12:26:19+00:00"),
+                           ("eve", "ごめん、できないんだ。", "2026-07-28T12:26:30+00:00"),
+                           ("user", "じゃあPCの状態を教えてくれる?", old)):
+            f.write(json.dumps({"ts": ts, "speaker": sp, "text": tx}, ensure_ascii=False) + "\n")
+    return p
+
+
+async def t_d1_restored_not_injected() -> bool:
+    c = ConversationCache(history_file=_prev_session_file(), recent_count=6)
+    await c.initialize()
+    injected = c.recent_for_injection()
+    await c.shutdown()
+    # 復元は3件されているが、注入は0件（前セッションは「今の会話」ではない）
+    return len(c.recent(10)) == 3 and injected == []
+
+
+async def t_d1_live_injected() -> bool:
+    c = ConversationCache(history_file=_prev_session_file(), recent_count=6)
+    await c.initialize()
+    c.add_turn("user", "おはよう。")
+    c.add_turn("eve", "おはよう。")
+    injected = c.recent_for_injection()
+    await c.shutdown()
+    texts = [t.text for t in injected]
+    return texts == ["おはよう。", "おはよう。"] and "じゃあPCの状態を教えてくれる?" not in texts
+
+
+async def t_d1_b5_catchup_intact() -> bool:
+    """B5: 復元 tail は turns_since(watermark) から見える＝起動時 catch-up が動く。
+
+    ここが壊れると前セッション末尾が永久に RAG に入らない（記憶喪失）。
+    `_load` を止める実装だとこのテストが落ちる。
+    """
+    c = ConversationCache(history_file=_prev_session_file(), recent_count=6)
+    await c.initialize()
+    span = c.turns_since("2026-07-28T12:26:00+00:00")  # RAG 最新 ts 相当
+    await c.shutdown()
+    return len(span) == 3 and span[-1].text == "じゃあPCの状態を教えてくれる?"
+
+
+async def t_d1_restored_last_iso() -> bool:
+    c = ConversationCache(history_file=_prev_session_file(), recent_count=6)
+    await c.initialize()
+    iso = c.restored_last_iso()
+    empty = ConversationCache(history_file=os.path.join(tempfile.mkdtemp(), "none.jsonl"))
+    await empty.initialize()
+    none_iso = empty.restored_last_iso()
+    await c.shutdown()
+    await empty.shutdown()
+    return iso == "2026-07-28T12:26:35.209300+00:00" and none_iso is None
+
+
 async def main() -> None:
     # 純ロジック
     check("ロケット鉛筆: 105→100・最古ドロップ", t_rocket_pencil())
@@ -299,6 +363,12 @@ async def main() -> None:
     check("C5 正常: eve=実発話全文", await t_c5_normal_full())
     check("C5 barge-in: 喋ってない文は記憶に残さない", await t_c5_bargein_only_spoken())
     check("kind別: USERのみuserターン", await t_kind_user_only())
+    # D1 案2: セッション境界
+    check("⭐D1 復元分は注入しない", await t_d1_restored_not_injected())
+    check("⭐D1 当セッション分は注入する", await t_d1_live_injected())
+    check("⭐D1 B5: 復元分は turns_since で見える（catch-up 無傷）",
+          await t_d1_b5_catchup_intact())
+    check("D1 前セッション最終発話の iso を出せる", await t_d1_restored_last_iso())
 
 
 asyncio.run(main())

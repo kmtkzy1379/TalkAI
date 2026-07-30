@@ -16,7 +16,14 @@ import logging
 from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable, Optional
 
 from ..config import Config
-from ..context_assembler import OMITTED_SPEAKER, ContextAssembler, RagChunk, Turn
+from ..clock import elapsed_wall
+from ..context_assembler import (
+    OMITTED_SPEAKER,
+    SESSION_GAP_SEC,
+    ContextAssembler,
+    RagChunk,
+    Turn,
+)
 from ..pipeline.audio_play_queue import AudioPlayQueue
 from ..pipeline.stimulus import CallFunctionResult, Stimulus, StimulusKind
 from ..speech.decider import AutonomousSpeech
@@ -162,6 +169,13 @@ class ResponseOrchestrator:
         # 起動時 catch-up では前セッション末尾を要約するので、これが無いと
         # 「# 直近フィードバック」が5時間前の依頼を現在の依頼として提示する。
         last_feedback_iso = self._state.watermark if self._state is not None else None
+        # D1（案2）: 前セッション最終発話からの経過。会話は注入しないので、境界の事実だけ渡す。
+        prev_gap = None
+        if self._cache is not None:
+            prev_iso = getattr(self._cache, "restored_last_iso", lambda: None)()
+            if prev_iso:
+                age = elapsed_wall(prev_iso)
+                prev_gap = age if age > SESSION_GAP_SEC else None
         # 画面の注入は**刺激種別で鮮度の意味を変える**（層分離）:
         # - USER 発話: 変化していない間は据え置き可（静止画面でも「今何が見える?」に答えられる。
         #   注入文言に「N秒前・以降変化なし」が付くので捏造にならない）。
@@ -230,6 +244,7 @@ class ResponseOrchestrator:
             tools_active=self._tools_enabled_for(stimulus),
             active_tasks=active_tasks,
             capabilities=capabilities,
+            prev_session_gap_sec=prev_gap,
         )
 
     def _notify_complete(self) -> None:

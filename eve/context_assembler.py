@@ -23,12 +23,8 @@ logger = logging.getLogger(__name__)
 OMITTED_SPEAKER = "__omitted__"
 SPEAKER_EVE = "eve"
 
-# D1: 「会話の間隔」ブロックを出す閾値。
-# **`decider.py` の STALE_RECENCY_SEC(900) と値は同じだが根拠は別タスク**なので import しない
-# （あちらは「イブの下書きの指示語が誤りか」の校正値・母数はイブ発話266件中の指示語12件）。
-# こちらは「前の依頼がまだ生きているとみなすか」で、本番履歴426ターンでの実測は:
-#   閾値 300s→15回 / 900s→14回 / 1800s→14回 / 3600s→12回 発火（user ターン187件が母数）
-# ＝300〜3600秒の広い平坦域にあり、値の微調整に敏感でない。最小の実発火は 38.9分。
+# D1: 「前回の会話は古い」とみなす閾値。`# 直近フィードバック` の時刻ラベルと
+# `# 前回の会話` ブロックの発火に使う。実測で 300〜3600秒の広い平坦域にあり値に敏感でない。
 SESSION_GAP_SEC = 900.0
 
 # system に置く役割アンカー（assistant=イブ自身を明示し、自分の発話への自答を防ぐ）。
@@ -68,61 +64,6 @@ class RagChunk:
             return s
         lines = (self.text or "").splitlines()
         return lines[0].strip() if lines else ""
-
-
-def _parse_iso(raw: str | None) -> datetime | None:
-    """Turn.stamp.iso を datetime に。空/破損は None（`elapsed_wall` は 0.0＝「たった今」に
-    倒す設計だが、ここでその既定を継ぐと**壊れた時刻が「間隔なし」を意味してしまい
-    ガードが自分で自分を切る**ため、明示的に分ける（D1 R6）。"""
-    if not raw:
-        return None
-    try:
-        dt = datetime.fromisoformat(raw)
-    except (ValueError, TypeError):
-        return None
-    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-
-def session_gap_seconds(recent_turns, now: Stamp, threshold: float | None = None) -> float | None:
-    """会話のタイムラインに閾値超の空白があればその秒数を返す（無ければ None）。
-
-    D1（2026-07-29 実機）: 起動直後、5時間前の未応答依頼「PCの状態を教えてくれる?」を
-    「さっきの」と呼んで勝手に実行した。会話ターンだけが時刻接地を持たないことが土台。
-
-    測り方の根拠:
-    - **最後の"ユーザ"発話**からの経過で測る。直前ターン（話者不問）で測ると、イブ自身の
-      自発発話でタイムラインが新しくなり取り逃す（`decider.py:154-155` が同じ判断を
-      「実データで1/3を取り逃す」と実測済み）。
-    - 注入窓の**内部**にある空白も見る（セッション2ターン目以降は境界が窓の中に来る）。
-    - **省略マーカ(OMITTED_SPEAKER)が挟まる窓では出さない**。マーカは「間に実在するターンを
-      省略した」印であって「会話が途切れた」印ではない。ここで空白を主張すると、連続稼働中の
-      セッションでユーザの直前の依頼を失効と宣言してしまう。
-    """
-    # 既定は呼び出し時にモジュール変数を引く（def 時に束縛しない＝対照実験や設定変更で
-    # 差し替えられる）。
-    threshold = SESSION_GAP_SEC if threshold is None else threshold
-    turns = list(recent_turns or [])
-    if not turns:
-        return None
-    if any(getattr(t, "speaker", "") == OMITTED_SPEAKER for t in turns):
-        return None  # 省略された実ターンがある＝空白ではない
-    now_dt = _parse_iso(now.iso)
-    if now_dt is None:
-        return None
-    stamps = [(t, _parse_iso(getattr(getattr(t, "stamp", None), "iso", None))) for t in turns]
-    if any(dt is None for _, dt in stamps):
-        # 壊れた/欠損した時刻が混ざる窓は判定を諦める。**黙って 0 にしない**（無言で
-        # ガードが外れるのを防ぐ＝観測できる形で降りる）。
-        logger.info("⏳ 会話ギャップ判定を見送り（時刻が欠損/破損したターンを含む）")
-        return None
-    gaps: list[float] = []
-    last_user = next((dt for t, dt in reversed(stamps) if getattr(t, "speaker", "") != SPEAKER_EVE), None)
-    if last_user is not None:
-        gaps.append((now_dt - last_user).total_seconds())
-    for (_, a), (_, b) in zip(stamps, stamps[1:]):
-        gaps.append((b - a).total_seconds())
-    widest = max(gaps, default=0.0)
-    return widest if widest > threshold else None
 
 
 def messages_to_text(messages: list[dict]) -> str:
@@ -186,18 +127,18 @@ class ContextAssembler:
                 head = "# 直近フィードバック"
             parts.append(f"{head}\n{last_feedback}")
         if session_gap_sec is not None:
-            # D1: 会話ターンだけが時刻接地を持たないので、空白の存在を system で1度だけ述べる。
-            # **語彙は指定しない**（「さっき」「前に」等の逐語トークンを渡すと、それが採用されて
-            # 発話の入り方が単調になる＝J-2 ①-b の実測: 見本があると先頭69%が「そういえば」系。
-            # 逐語見本の再導入を止めるコードゲートが tests/test_f5_speech.py:650 にある）。
-            # 実際に生きている予約は `# 予約タスク` が正なので、そちらへ明示的に道を譲る。
+            # D1（案2）: 前セッションの会話は**注入していない**（`recent_for_injection` が
+            # 復元分を落とす）。旧実装は復元会話を注入したまま「間が空いた」と注記していたが、
+            # 実測（オフライン n=8）で 8/8 蒸し返して**無効**だった。注入しなければ 0/8。
+            # よってここは「駆動源を止める装置」ではなく、**前回いつまで話したかを1度述べる
+            # 事実の提示**に徹する（命令を減らす＝過剰適用と読み上げ leak を避ける）。
+            # 語彙は指定しない（「さっき」「前に」等の逐語トークンを渡すと採用されて入り方が
+            # 単調になる実測＝J-2 ①-b・コードゲートは tests/test_f5_speech.py:650）。
             parts.append(
-                f"# 会話の間隔（状況把握用・そのまま読み上げない）\n"
-                f"直前のやりとりから約{humanize(session_gap_sec).replace('前', '')}空いている。"
-                "ここから先はその続きではなく、新しく始まった会話。\n"
-                "空白より前に出ていた依頼・質問・約束は、まだ生きているとは限らない。"
-                "ユーザーが自分から触れたときだけその話として扱い、こちらから実行し直したり"
-                "続きを始めたりしない。実際に残っている予約は「# 予約タスク」が正。"
+                f"# 前回の会話（状況把握用・そのまま読み上げない）\n"
+                f"前回このユーザと話したのは約{humanize(session_gap_sec).replace('前', '')}前。"
+                "その会話の逐語は残っていない（覚えているのは「# 参照」の記憶だけ）。"
+                "今は新しく始まった会話で、その続きではない。"
             )
         if speech_decision_reason:
             parts.append(f"# 発話判定理由\n{speech_decision_reason}")
@@ -303,6 +244,7 @@ class ContextAssembler:
         active_tasks: list[str] | None = None,
         last_feedback_iso: str | None = None,  # D1: 内省が対象にした会話スパンの末尾(watermark)
         capabilities: list[str] | None = None,  # D3: 外の世界に手を出せる手段（registry 導出）
+        prev_session_gap_sec: float | None = None,  # D1: 前セッション最終発話からの経過秒
         now: Stamp | None = None,
     ) -> list[dict]:
         now = now or Stamp.now()
@@ -310,7 +252,10 @@ class ContextAssembler:
         # そこで止まっている話題を振るのはむしろ自然」と**逆を明示的に許可**されており
         # (`decider.py:218-220`)、しかも「間隔ブロックが出る条件」＝「古い話題を振ってよい条件」
         # なので衝突は常態になる。ここで蒸し返しを禁じると T2（古い記憶の自律発話）を壊す。
-        gap = None if autonomous_content is not None else session_gap_seconds(recent_turns, now)
+        # D1: 前セッション境界からの経過（呼び手＝orchestrator が cache から渡す）。
+        # 自発経路には出さない（判定LLM は decider.py:218-220 で「古い話題を振ってよい」と
+        # 逆を明示指示されており、発火条件が重なるので衝突が常態になる＝T2 を壊す）。
+        gap = None if autonomous_content is not None else prev_session_gap_sec
         messages: list[dict] = [
             {
                 "role": "system",

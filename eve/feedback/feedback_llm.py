@@ -117,12 +117,16 @@ class FeedbackLLM:
         if result.is_empty():
             logger.warning("FeedbackLLM 出力から何も抽出できず（no-op で継続）")
             return None
-        if not await self._apply(result):
+        # D1: スパン末尾の iso を渡す（チャンクの時刻は書込時刻ではなく対象会話の時刻）。
+        if not await self._apply(result, turns[-1].stamp.iso):
             return None  # RAG 未保存 → state 据え置き・同スパンを次 run で再試行
         return result
 
-    async def _apply(self, result: FeedbackResult) -> bool:
-        """効果適用。RAG 保存に成功（or RAG 無し）なら True を返し state を更新。"""
+    async def _apply(self, result: FeedbackResult, span_end_iso: str) -> bool:
+        """効果適用。RAG 保存に成功（or RAG 無し）なら True を返し state を更新。
+
+        span_end_iso: 内省した会話スパンの末尾 iso（チャンクの timestamp に使う）。
+        """
         cold = self._state.last_prediction is None
         # (a) RAG: 圧縮埋め込み（summary+tags）/ 展開注入（完全版 text）。保存成否を len 差で判定。
         if self._rag is not None:
@@ -136,6 +140,12 @@ class FeedbackLLM:
                     prediction_diff=result.prediction_diff,
                     reason=result.reason or None,
                     topic_tags=result.topic_tags or None,
+                    # D1: チャンクの時刻は**内省した会話スパンの末尾**（書込時刻ではない）。
+                    # 未指定だと long_term が now_iso() を入れるため、起動時 catch-up が
+                    # 前セッションを要約したチャンクが `[過去の記憶/たった今]` と描画され、
+                    # 5時間前の依頼が「たった今の記憶」として応答LLM に渡っていた
+                    # （実データ: ts=17:21:05 / スパン末尾=12:26:35＝4時間55分のズレ）。
+                    timestamp=span_end_iso,
                 )
             except Exception:
                 logger.exception("FeedbackLLM の RAG 書込で例外（state 据え置き）")

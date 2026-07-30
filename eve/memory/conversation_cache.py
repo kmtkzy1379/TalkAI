@@ -23,7 +23,7 @@ from collections import deque
 from pathlib import Path
 from typing import Optional
 
-from ..clock import Stamp, now_iso, now_mono
+from ..clock import Stamp, elapsed_wall, humanize, now_iso, now_mono
 from ..config import Config
 from ..context_assembler import OMITTED_SPEAKER, Turn
 
@@ -53,6 +53,12 @@ class ConversationCache:
             recent_count if recent_count is not None else Config.RECENT_TURN_COUNT
         )
         self._turns: "deque[Turn]" = deque(maxlen=self.max_turns)  # ロケット鉛筆
+        # D1: 復元（前セッション）と当セッションの境界。復元分は**注入しない**
+        # （短期記憶は起動を跨いで「今の会話」ではない）。`turns_since` 経由の
+        # feedback/catch-up は境界を見ない＝B5 no-skip 保証は無傷。
+        self._restored_last_iso: Optional[str] = None
+        self._restored_count = 0
+        self._live_count = 0
         self._write_queue: "asyncio.Queue[Optional[dict]]" = asyncio.Queue()
         self._write_task: Optional[asyncio.Task] = None
 
@@ -93,7 +99,34 @@ class ConversationCache:
             if speaker in (SPEAKER_USER, SPEAKER_EVE) and text:
                 # 復元 Turn の mono は前プロセスの値で無意味 → 表示は壁時計(iso)を正とする
                 self._turns.append(Turn(speaker, text, Stamp(iso=ts, mono=now_mono())))
-        logger.info("会話ログを復元: %d ターン", len(self._turns))
+        self._restored_count = len(self._turns)
+        self._restored_last_iso = self._turns[-1].stamp.iso if self._turns else None
+        # 観測性: 復元分が注入対象外であることと、前回いつまで話していたかを1行残す
+        # （起動/終了はログに残っていないため、これが唯一の再起動の手掛かりになる）。
+        gap = elapsed_wall(self._restored_last_iso) if self._restored_last_iso else 0.0
+        logger.info("会話ログを復元: %d ターン（注入対象外・前回の最終発話は %s）",
+                    self._restored_count, humanize(gap) if self._restored_last_iso else "なし")
+
+    # --- セッション境界（D1）----------------------------------------------
+
+    def restored_last_iso(self) -> Optional[str]:
+        """前セッション最終発話の iso（無ければ None）。system の境界表示に使う。"""
+        return self._restored_last_iso
+
+    def _live_turns(self) -> list[Turn]:
+        """**当セッションで記録された**ターンだけ（復元分を除く）。
+
+        判定は iso 比較（`add_turn` は `Stamp.now()` を打つので live は境界より必ず新しい）。
+        システム時計が巻き戻ると live が境界以下になり得るので、その時は**無フィルタに倒し
+        （＝従来挙動）ログを残す**（無言で会話ゼロにして沈黙化させない）。
+        """
+        if self._restored_last_iso is None:
+            return list(self._turns)
+        live = [t for t in self._turns if t.stamp.iso > self._restored_last_iso]
+        if self._live_count > 0 and not live:
+            logger.warning("⏳ セッション境界の判定に失敗（時計の巻き戻り?）→ 復元分も注入する")
+            return list(self._turns)
+        return live
 
     async def shutdown(self) -> None:
         """書き込みキューをドレインして worker を止める。"""
@@ -117,6 +150,7 @@ class ConversationCache:
             return
         stamp = Stamp.now()
         self._turns.append(Turn(speaker, text, stamp))
+        self._live_count += 1
         try:
             self._write_queue.put_nowait(
                 {"ts": stamp.iso, "speaker": speaker, "text": text}
@@ -160,7 +194,10 @@ class ConversationCache:
         n = window if window is not None else self.recent_count
         if n <= 0:
             return []
-        turns = list(self._turns)
+        # D1: 復元（前セッション）分は注入しない。実測（オフライン n=8）で、ギャップ注記を
+        # 出しても復元会話があると 8/8 で前セッションの依頼を蒸し返し、注入しなければ 0/8。
+        # 短期記憶は起動を跨いだ時点で「今の会話」ではない（前セッションの内容は RAG が持つ）。
+        turns = self._live_turns()
         if not turns:
             return []
         tail = turns[-n:]
