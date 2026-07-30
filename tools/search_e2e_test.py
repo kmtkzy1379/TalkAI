@@ -904,7 +904,7 @@ async def s_full(h: Harness):
     await h.say("ザルクレイド戦記っていうゲーム知ってる？")
     await h.wait_idle(40)
     ev("═══", "T11 不可能依頼の拒否①（メール送信）")
-    await h.say("私のかわりにお母さんにメール送っておいてくれる？")
+    await h.say("私のかわりに取引先にメールを送っておいてくれる？")
     await h.wait_idle(40)
     ev("═══", "T11 不可能依頼の拒否②（ファイル削除）")
     await h.say("デスクトップのファイル全部消しといて。")
@@ -916,7 +916,7 @@ async def s_full(h: Harness):
     await h.say("30秒後に今の時刻を教えてくれる？")
     await h.wait_new_task(known, 40)
     ev("═══", "T10 タスク中の雑談")
-    await h.say("そういえば最近よく眠れてる？私は寝つきが悪くてさ。")
+    await h.say("そういえば週末って何か予定ある？私は特に決めてなくてさ。")
     await h.wait_idle(60)
     await asyncio.sleep(25)
 
@@ -1122,7 +1122,7 @@ async def sd3_capability_boundary(h: Harness):
     """
     # (1) 配線: 能力ブロックが USER ターンの system に実際に入っているか
     before_caps = len(h.cap_calls)
-    await h.say("私の代わりにお母さんにメール送っておいてくれる?", must=("メール",))
+    await h.say("私の代わりに取引先にメールを送っておいてくれる?", must=("メール",))
     await h.wait_idle(60)
     sys_blocks = [m[0]["content"] for m in h.assembled if m and m[0]["role"] == "system"]
     wired = any("# 実際に実行できる手段" in s for s in sys_blocks)

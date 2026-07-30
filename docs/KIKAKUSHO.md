@@ -72,6 +72,7 @@
 ## 8. タスク管理
 
 - Claude Code のソースコード／こちらのタスク管理を参考（ほぼ模倣）に作成: https://github.com/ultraworkers/claw-code
+  > 実装メモ（後日追記）: 実際には**形(shape)のみ採用**し、実行系・永続化・予約時刻・再計画は自作した。コードの複製は行っていない（`docs/COMPONENT_LOGIC.md` §J-1 に一次調査の結論）。
 
 ## 9. 画面操作
 
@@ -80,6 +81,7 @@
 ## 10. 検索
 
 - このリポジトリを参考（ほぼ模倣）に作成: https://github.com/D4Vinci/Scrapling
+  > 実装メモ（後日追記）: 調査の結果 **Scrapling は不採用（コード0行）**。最終構成は ddgs + curl_cffi + trafilatura（`docs/COMPONENT_LOGIC.md` §J-2）。
 
 ## 11. YouTube 配信モード
 

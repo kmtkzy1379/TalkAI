@@ -170,7 +170,7 @@ class SearchClient:
         from ddgs import DDGS  # 遅延 import（Tier-1/起動を重くしない・litellm と同流儀）
 
         # backend 明示: auto は死んだバックエンドで例外化する（実機スモーク 2026-07-16:
-        # この回線では duckduckgo 以外が DNS 遮断）。region=jp-jp は日本語品質のため。
+        # 回線によっては duckduckgo 以外が DNS レベルで遮断される）。region=jp-jp は日本語品質のため。
         # timeout はソケット側の保証（cancel は thread を殺せないため thread の自然死に必須）。
         return DDGS(timeout=self._socket_timeout).text(
             q, region="jp-jp", max_results=self._max_results, backend=self._backend)

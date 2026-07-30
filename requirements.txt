@@ -17,7 +17,7 @@ groq
 sentence-transformers
 ddgs  # J-2 Web検索（キー不要メタ検索・遅延 import）
 curl_cffi  # J-2 inc2 取得（TLS偽装・403回避・遅延 import）
-trafilatura  # J-2 inc2 本文抽出（遅延 import）
+trafilatura>=1.8.0  # J-2 inc2 本文抽出（遅延 import）。**1.8.0 未満は GPLv3+** なので下限を固定
 # F6 画面認識（すべて遅延 import。Tier-1 決定論テストには不要だが VLM_ENABLED=1 で必須）。
 # 2026-07-29: 実際に import しているのに未記載だったものを追加（新環境で VLM が起動時に死ぬ）。
 mss  # スクリーンキャプチャ（Windows）

@@ -13,14 +13,15 @@
 UI もランチャも無い。**実起動パスは `tools/voice_chat.py` の1本のみ**。
 
 ```powershell
-cd C:\Users\tester\Desktop\eve-v2
+cd <リポジトリのルート>
 $env:PYTHONIOENCODING="utf-8"
-& C:\Users\tester\Desktop\portfolio8-VLM-AI\venv\Scripts\python.exe tools\voice_chat.py
+& .\.venv\Scripts\python.exe tools\voice_chat.py
 # Ctrl+C で終了（全サイドカーを drain して停止）
 ```
 
 ### 前提
-- **venv は v1 のものを流用**: `C:\Users\tester\Desktop\portfolio8-VLM-AI\venv`（v2 に venv は無い）
+- **セットアップ**: `python -m venv .venv` → `.\.venv\Scripts\pip install -r requirements.txt`
+  （開発時は前作の venv を流用していたが、`requirements.txt` は実 import を反映済みで単体構築できる）
 - **VOICEVOX 起動必須**（`http://127.0.0.1:50021`）。未起動でも落ちないが声が出ない。確認 `curl -s http://127.0.0.1:50021/version`
 - **マイク + イヤホン**（AEC は不採用＝スピーカーだと自分の声を拾う）
 - **`.env` が必要**（`.env.example` をコピーして API キーを入れる）
@@ -47,14 +48,14 @@ runner は無い（**pytest 未導入**＝`pytest tests/` は動かない）。�
 
 ```powershell
 $env:PYTHONIOENCODING="utf-8"
-& C:\Users\tester\Desktop\portfolio8-VLM-AI\venv\Scripts\python.exe tests\test_f5_speech.py
+& .\.venv\Scripts\python.exe tests\test_f5_speech.py
 ```
 
 全件一括（合計を出す）:
 ```powershell
 $env:PYTHONIOENCODING="utf-8"; $tot=0; $fail=0
 Get-ChildItem tests\test_*.py | ForEach-Object {
-  $o = & C:\Users\tester\Desktop\portfolio8-VLM-AI\venv\Scripts\python.exe $_.FullName 2>&1 |
+  $o = & .\.venv\Scripts\python.exe $_.FullName 2>&1 |
        Select-String -Pattern "合計" | Select-Object -Last 1
   if ($o -match "PASS (\d+) / FAIL (\d+)") { $tot+=[int]$Matches[1]; $fail+=[int]$Matches[2] }
 }
@@ -87,9 +88,9 @@ Get-ChildItem tests\test_*.py | ForEach-Object {
 ```powershell
 # 実起動と同じ設定・本番記憶のコピーで「通し総合16項目」だけ回す（約18分）
 $env:PYTHONIOENCODING="utf-8"; $env:REAL_STATE="1"
-$env:E2E_ART="C:\Users\tester\Desktop\eve-v2\e2e_logs\full_$(Get-Date -Format yyyyMMdd)"
+$env:E2E_ART=".\e2e_logs\full_$(Get-Date -Format yyyyMMdd)"
 $env:SKIP="SRB,SD1,SD2,SD3,SSRC,SVLM,SIDLE,SAUTO,S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,S11"
-& C:\Users\tester\Desktop\portfolio8-VLM-AI\venv\Scripts\python.exe tools\search_e2e_test.py
+& .\.venv\Scripts\python.exe tools\search_e2e_test.py
 ```
 
 **`REAL_STATE=1` が重要**: `.env` のフラグ/モデルをそのまま使い、本番の `conversation_history.jsonl` / `rag_memory.jsonl` / `tasks.jsonl` を artifacts に**コピーして**使う（本物は汚れない）。付けないとフラグを強制 ON し記憶が空になるので**実起動の挙動は測れない**（この差が D6 の事故を1か月見逃した原因）。
@@ -190,7 +191,7 @@ UI（Tkinter・**tkinter 参照は0件**）/ 配線層PORT（vts / run / launche
 
 - **機能フラグは `.env` で明示する**（コード既定は全て off）。将来 UI から ON/OFF する設定項目という位置づけ。`.env.example` に全フラグを明記済み
 - 実運用モデル（role 名は `eve/model_registry.py` の `ROLE_ENV` キー）: `response`=gpt-5.5 / **`speech_decide`**=gpt-5.4-mini（env は `DECIDE_MODEL`・"decide" は role 名ではない） / `feedback`=gpt-5.4 / `summarize`=gpt-4o-mini / `vlm_leaf`=gemini-2.5-flash。`task` `search_summarize` `delivery_check` はコード既定のまま。ROLE_ENV は全10 role で、`vlm_merge` と `youtube` は消費者ゼロ
-- Web検索は `SEARCH_BACKEND=auto`（DNS 遮断回線では `duckduckgo` 固定へ。復旧手順は `docs/DNS_BACKUP_2026-07-17.md`）
+- Web検索は `SEARCH_BACKEND=auto`（DNS が遮断される回線では `SEARCH_BACKEND=duckduckgo` に固定する）
 - 主要な閾値の実測校正値は `eve/config.py` のコメントに日付つきで残してある（同内容抑制 0.25/0.87、記憶の自己参照除外 600秒、画面据え置き 600秒 等）
 
 ## 6. 落とし穴

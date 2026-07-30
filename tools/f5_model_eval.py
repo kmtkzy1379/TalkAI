@@ -8,7 +8,7 @@ speech_decide の3役にモデルを割当）で会話の流れを時系列で�
   事前: VOICEVOX 起動 + .env に OPENAI_API_KEY / GEMINI_API_KEY。
   PowerShell:
     $env:PYTHONIOENCODING="utf-8"
-    & C:\Users\tester\Desktop\portfolio8-VLM-AI\venv\Scripts\python.exe tools\f5_model_eval.py            # 既定セット
+    & .\.venv\Scripts\python.exe tools\f5_model_eval.py            # 既定セット
     ...python tools\f5_model_eval.py gpt5.5                # 1プリセットだけ
     ...python tools\f5_model_eval.py gpt4o,gemini          # 複数指定（カンマ区切り）
     ...python tools\f5_model_eval.py all                   # 全プリセット

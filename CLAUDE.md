@@ -2,7 +2,7 @@
 
 ## これは何か
 
-Eve v2 = AI VTuber + 画面認識(VLM) 統合のデスクトップアプリ。v1（`../portfolio8-VLM-AI`）を**パッチ継続せず、新企画書に従って作り直す**プロジェクト。v1 は1年半の地層化で頭脳部ほぼ全域に破綻が広がったため、配線層のみ移植し中身は白紙から再構築する（判断根拠と範囲は `docs/SALVAGE_MANIFEST.md`＝完了・歴史資料、統合パイプライン契約は `docs/PIPELINE_DESIGN.md`）。
+Eve v2 = AI VTuber + 画面認識(VLM) 統合の**常駐音声対話システム（CLI・GUI は未実装）**。v1（`../portfolio8-VLM-AI`）を**パッチ継続せず、新企画書に従って作り直す**プロジェクト。v1 は1年半の地層化で頭脳部ほぼ全域に破綻が広がったため、配線層のみ移植し中身は白紙から再構築する（判断根拠と範囲は `docs/SALVAGE_MANIFEST.md`＝完了・歴史資料、統合パイプライン契約は `docs/PIPELINE_DESIGN.md`）。
 
 - 言語: Python（コメント日本語・識別子英語）/ Python 3.13
 - 実行形態: asyncio 単一ループ本体 + 専用 OS スレッド（VLM capture のみ）。**UI は未実装**（Tkinter は企画上の予定）
@@ -19,10 +19,10 @@ Eve v2 = AI VTuber + 画面認識(VLM) 統合のデスクトップアプリ。v1
 ```powershell
 # 実起動（唯一の本番経路。UI/ランチャは無い）
 $env:PYTHONIOENCODING="utf-8"
-& C:\Users\tester\Desktop\portfolio8-VLM-AI\venv\Scripts\python.exe tools\voice_chat.py
+& .\.venv\Scripts\python.exe tools\voice_chat.py
 
 # Tier-1 決定論テスト（runner 無し・1ファイルずつ実行）
-& C:\Users\tester\Desktop\portfolio8-VLM-AI\venv\Scripts\python.exe tests\test_f5_speech.py
+& .\.venv\Scripts\python.exe tests\test_f5_speech.py
 ```
 
 - **`$env:PYTHONIOENCODING="utf-8"` は必須**（日本語＋絵文字を出すので付けないと cp932 で落ちる）

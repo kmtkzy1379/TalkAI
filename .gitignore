@@ -14,3 +14,29 @@ conversation_history.jsonl
 *.jsonl
 # E2E 実測ログ（実記憶のコピーを含むためコミットしない）
 e2e_logs/
+
+# --- 公開リポジトリ向けの追加ガード（2026-07-30）---
+# .claude/ は .git/info/exclude だけでは配布先に伝わらない（ローカル専用のため）
+.claude/
+.env.*
+!.env.example
+# 本プロジェクトが生成する最も機密性の高い成果物＝デスクトップのスクリーンショット
+*.png
+*.jpg
+*.jpeg
+*.bmp
+screens/
+*.wav
+*.mp3
+*.ogg
+# E2E 成果物（E2E_ART を e2e_logs/ 以外へ向けた場合の保険）
+artifacts/
+*.log
+terminal.log
+summary.json
+# エディタ / OS メタファイル
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+desktop.ini
