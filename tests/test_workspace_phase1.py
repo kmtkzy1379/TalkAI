@@ -270,6 +270,44 @@ def t_exec_not_registered_without_flag(tmp: Path):
     return "run_program" not in {s["function"]["name"] for s in reg.agent_tool_schemas()}
 
 
+def t_viewer_registration(tmp: Path):
+    """show_on_screen の登録契約と、種類判定（GUI は起動しない範囲）。"""
+    from eve.workspace import register_viewer_capability
+    from eve.workspace.viewer import sniff
+    reg = CapabilityRegistry()
+    ws = _ws(tmp)
+    register_workspace_capabilities(reg, ws)
+    before = "show_on_screen" not in {s["function"]["name"] for s in reg.agent_tool_schemas()}
+    register_viewer_capability(reg, ws, max_windows=2)
+    agent = {s["function"]["name"] for s in reg.agent_tool_schemas()}
+    offered = {s["function"]["name"] for s in reg.tool_schemas()}
+    # 同期 handler（fire-and-forget）＝重い能力の枠を食わない
+    not_blocking = not reg.is_blocking("show_on_screen")
+    # 封じ込め: 作業フォルダ外は spawn する前にマーカで拒否
+    denied = reg.execute("show_on_screen", {"path": "../../secret.txt"})
+    missing = reg.execute("show_on_screen", {"path": "nope.png"})
+    # 種類判定は**拡張子ではなく先頭バイト**
+    (tmp / "fake.png").write_text("これはテキスト", encoding="utf-8")
+    (tmp / "real.png").write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * 32)
+    (tmp / "bin.dat").write_bytes(bytes(range(256)))
+    return (before and "show_on_screen" in agent and "show_on_screen" not in offered
+            and not_blocking and denied.startswith("（")
+            and not missing.startswith("（") and "見つからなかった" in missing
+            and sniff(tmp / "fake.png") == "TEXT"      # 拡張子が嘘でも中身で判定
+            and sniff(tmp / "real.png") == "PNG"
+            and sniff(tmp / "bin.dat") == "BINARY")
+
+
+def t_exec_compatible_gate():
+    """プロファイル配下は実行不可と判定される（E2E で踏んだ「実行環境エラー」を起動時に潰す）。"""
+    import os as _os
+    from eve.workspace.paths import exec_compatible
+    profile = Path(_os.environ.get("USERPROFILE", "C:/Users/x"))
+    bad, why = exec_compatible(profile / "AppData" / "Local" / "Temp" / "ws")
+    good, _ = exec_compatible(Path("C:/eve_ws/workspace"))
+    return (not bad) and "プロファイル" in why and good
+
+
 def t_location_gate():
     repo = Path(__file__).resolve().parent.parent
     inside, why1 = resolve_workspace_root(str(repo / "ws"))
@@ -348,6 +386,8 @@ async def main():
         check("登録: outward_actions の1文目が発話可能な形", t_outward_actions_shape(fresh()))
         check("実行: agent専用・is_blocking True・allowlist外は拒否", await t_exec_registration(fresh()))
         check("実行: フラグ未登録なら run_program は存在しない", t_exec_not_registered_without_flag(fresh()))
+        check("表示: 登録契約・同期handler・封じ込め・マジックバイト判定", t_viewer_registration(fresh()))
+        check("実行: プロファイル配下は実行不可と判定される", t_exec_compatible_gate())
         check("場所ゲート: リポジトリ配下とドライブ直下を拒否", t_location_gate())
         check("読み書き: 作成/読取/一覧/追記/再帰削除", t_roundtrip(fresh()))
         check("読取: LLM に返す文字数を切る", t_read_cap(fresh()))

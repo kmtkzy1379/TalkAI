@@ -163,6 +163,7 @@ class VoiceLoop:
             # J-3 作業フォルダ（既定 off・search と同じ理由で TASK_ENABLED ブロック内に置く）。
             if Config.WS_ENABLED:
                 from .workspace import Workspace, register_workspace_capabilities, resolve_workspace_root
+                from .workspace.paths import exec_compatible
                 ws_root, why = resolve_workspace_root(Config.WS_ROOT)
                 if ws_root is None:
                     # 起動時 fail-soft（ddgs 未導入時と同流儀）: 作業フォルダだけ無効化して続行。
@@ -178,7 +179,12 @@ class VoiceLoop:
                     # プログラム実行（別フラグ）。setup_sandbox.py apply 済みが前提だが、
                     # 未セットアップでも起動は続ける（実行時に SandboxUnavailable で
                     # 「サンドボックスが使えない」と正直に返る＝fail-soft）。
-                    if Config.WS_EXEC_ENABLED:
+                    exec_ok, exec_why = exec_compatible(ws_root)
+                    if Config.WS_EXEC_ENABLED and not exec_ok:
+                        # ファイル能力は親プロセスで動くので生かしたまま、実行だけ無効化する
+                        # （E2E で「作成はできたけど実行環境エラー」が出た経路を起動時に潰す）。
+                        logger.warning("WS_EXEC_ENABLED=1 だが実行を無効化: %s", exec_why)
+                    elif Config.WS_EXEC_ENABLED:
                         from .workspace import register_exec_capability
                         register_exec_capability(
                             self.capabilities, self.workspace,
@@ -189,6 +195,11 @@ class VoiceLoop:
                             max_procs=Config.WS_RUN_MAX_PROCS,
                             max_output_chars=Config.WS_MAX_OUTPUT_CHARS,
                         )
+                    if Config.WS_VIEWER_ENABLED:
+                        from .workspace import register_viewer_capability
+                        register_viewer_capability(
+                            self.capabilities, self.workspace,
+                            max_windows=Config.WS_VIEWER_MAX_WINDOWS)
         elif Config.SEARCH_ENABLED or Config.WS_ENABLED:
             if Config.SEARCH_ENABLED:
                 logger.warning("SEARCH_ENABLED=1 だが TASK_ENABLED=0 のため検索は無効（TaskAgent 専用能力）")
@@ -354,6 +365,8 @@ class VoiceLoop:
                             self.workspace.paths.root, self.workspace.usage())
                 if Config.WS_EXEC_ENABLED:
                     logger.info("プログラム実行 稼働（run_program・%s）", Config.WS_EXEC_ALLOW)
+                if Config.WS_VIEWER_ENABLED:
+                    logger.info("画面表示 稼働（show_on_screen・別ウィンドウ）")
         # F6: 画面認識を起動（既定 off）。capture スレッドは loop 確定後に生成し on_frame を橋渡し。
         if Config.VLM_ENABLED:
             self.vlm_worker.start()

@@ -212,6 +212,9 @@ class Config:
     WS_RUN_MEM_MB = int(os.getenv("WS_RUN_MEM_MB", "2048"))  # Job のメモリ上限
     WS_RUN_MAX_PROCS = int(os.getenv("WS_RUN_MAX_PROCS", "32"))  # fork bomb 対策
     WS_MAX_OUTPUT_CHARS = int(os.getenv("WS_MAX_OUTPUT_CHARS", "8000"))  # LLM に返す出力上限
+    # 画面表示（J-3 inc3）。**WS_ENABLED 前提**。別プロセスの Tk ビューアで開く（管理者操作は不要）。
+    WS_VIEWER_ENABLED = os.getenv("WS_VIEWER_ENABLED", "0") == "1"  # 既定 off
+    WS_VIEWER_MAX_WINDOWS = int(os.getenv("WS_VIEWER_MAX_WINDOWS", "5"))  # 同時に開ける窓の上限
 
     @classmethod
     def validate(cls) -> list[str]:

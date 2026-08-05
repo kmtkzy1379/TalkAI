@@ -67,6 +67,27 @@ def resolve_workspace_root(configured: str = "") -> tuple[Path | None, str]:
     return root, ""
 
 
+def exec_compatible(root: Path) -> tuple[bool, str]:
+    """サンドボックス実行が成立する場所か（`WS_EXEC_ENABLED` 時のみ意味を持つ）。
+
+    実測: `C:\\Users\\<user>` には `BUILTIN\\Users` の ACE が無く、配下は全て継承。つまり
+    **ユーザプロファイル配下に作業フォルダを置くと `eve_sandbox` から一切アクセスできず、
+    `run_program` が必ず「実行環境エラー」になる**（E2E で実際に踏んだ: 一時ディレクトリを
+    作業フォルダにしたら書込・実行が全滅した）。
+
+    ファイル能力は親プロセスで動くので影響を受けない＝**実行だけを無効化すれば足りる**。
+    """
+    try:
+        profile = Path(os.environ.get("USERPROFILE", "")).resolve()
+    except (OSError, ValueError):
+        return True, ""
+    if profile and (root == profile or root.is_relative_to(profile)):
+        return False, (f"作業フォルダがユーザプロファイル配下（{root}）にあるため、"
+                       "サンドボックス用アカウントからアクセスできません。"
+                       "WS_ROOT を C:\\eve_ws\\workspace などプロファイル外にしてください")
+    return True, ""
+
+
 def _has_reparse_point(p: Path) -> bool:
     """ジャンクション/シンボリックリンク/AppExecLink を属性で検出（`islink()` では不十分）。"""
     try:

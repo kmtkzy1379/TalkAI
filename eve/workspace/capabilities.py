@@ -56,6 +56,55 @@ def _guard(fn):
     return wrapped
 
 
+def register_viewer_capability(registry: CapabilityRegistry, ws: Workspace, *,
+                               max_windows: int = 5) -> None:
+    """`show_on_screen` を登録（**別プロセス**の Tk ビューアで表示）。
+
+    **同期 handler** にする: 起動は fire-and-forget（`Popen` するだけ・実測 6.2ms）で
+    終了を待たないため、`is_blocking()` を True にして `agent.py:150` の「1 step 1件」
+    予算を食う理由が無い。
+
+    親アカウント（tester）で動かす。サンドボックスの子は Job の UI 制限下にあり GUI を
+    出せない（意図的）ので、ここだけ例外にすると shatter/shutdown 対策を同時に失う。
+    表示は読んで描くだけで状態を変えないため、親で動かしても昇格経路にならない。
+    """
+    import subprocess
+    import sys
+
+    windows: list = []  # 起動中のビューア（死んだものは都度掃除する）
+
+    def _show(args: dict) -> str:
+        target = ws.paths.resolve((args or {}).get("path", ""))  # 違反は _guard がマーカ化
+        if not target.is_file():
+            return f"{ws.paths.relative(target)} は見つからなかった。list_files で確認してみて。"
+        windows[:] = [p for p in windows if p.poll() is None]
+        if len(windows) >= max_windows:
+            # 古い窓を勝手に閉じない（ユーザが見ているものを消す方が迷惑）
+            return (f"表示中のウィンドウが{len(windows)}個あるから、これ以上は開けなかった。"
+                    "いらない窓を閉じてから、もう一度言ってね。")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "eve.workspace.viewer", str(target), str(ws.paths.root)],
+                cwd=str(Path(__file__).resolve().parent.parent.parent),
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=0x00000008 | 0x08000000,  # DETACHED_PROCESS | CREATE_NO_WINDOW
+            )
+        except Exception as e:
+            logger.exception("ビューアの起動に失敗")
+            return f"（画面に出せなかった: {type(e).__name__}）"
+        windows.append(proc)
+        return f"{ws.paths.relative(target)} を別ウィンドウで画面に出したよ。"
+
+    registry.register(Capability(
+        name="show_on_screen",
+        description="作業フォルダに保存した画像やテキストを、PCの画面に別ウィンドウで表示する。"
+                    "path に作業フォルダからの相対パスを渡す（画像はそのまま、"
+                    "テキストは読める形で出る）。",
+        params_schema={"path": {"type": "string", "description": "表示したいファイルの相対パス"}},
+        handler=_guard(_show), offered=False, agent_tool=True, mutates_state=True,
+    ))
+
+
 def register_exec_capability(registry: CapabilityRegistry, ws: Workspace, *,
                              allow: list[str], timeout_sec: float, grace_sec: float,
                              mem_mb: int, max_procs: int, max_output_chars: int) -> None:
