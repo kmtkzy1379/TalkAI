@@ -243,6 +243,33 @@ def t_outward_actions_shape(tmp: Path):
 
 # --- F. 場所ゲート ----------------------------------------------------------
 
+async def t_exec_registration(tmp: Path):
+    """run_program の登録契約（サンドボックス未セットアップでも検証できる範囲）。"""
+    from eve.workspace import register_exec_capability
+    reg = CapabilityRegistry()
+    ws = _ws(tmp)
+    register_workspace_capabilities(reg, ws)
+    register_exec_capability(reg, ws, allow=["python", "pip"], timeout_sec=5, grace_sec=2,
+                             mem_mb=256, max_procs=4, max_output_chars=1000)
+    agent = {s["function"]["name"] for s in reg.agent_tool_schemas()}
+    offered = {s["function"]["name"] for s in reg.tool_schemas()}
+    # ファイル能力と違い**重い能力**＝is_blocking True（agent.py:150 の 1step1件に乗る）
+    blocking = reg.is_blocking("run_program")
+    # allowlist 外は spawn する前に拒否される（サンドボックス不要でここまで確認できる）
+    denied = await reg.execute_async("run_program", {"program": "cmd", "args": ["/c", "dir"]})
+    empty = await reg.execute_async("run_program", {"program": "", "args": []})
+    return ("run_program" in agent and "run_program" not in offered and blocking
+            and denied.startswith("（") and "許可されていない" in denied
+            and empty.startswith("（"))
+
+
+def t_exec_not_registered_without_flag(tmp: Path):
+    """WS_EXEC を登録しなければ run_program は存在しない（フラグ分離の構造的保証）。"""
+    reg = CapabilityRegistry()
+    register_workspace_capabilities(reg, _ws(tmp))
+    return "run_program" not in {s["function"]["name"] for s in reg.agent_tool_schemas()}
+
+
 def t_location_gate():
     repo = Path(__file__).resolve().parent.parent
     inside, why1 = resolve_workspace_root(str(repo / "ws"))
@@ -319,6 +346,8 @@ async def main():
         check("マーカ規約: 不在は非マーカ/封じ込め違反はマーカ", t_marker_semantics(fresh()))
         check("登録: agent専用・応答LLMに出ない・is_blocking False", t_registration_scope(fresh()))
         check("登録: outward_actions の1文目が発話可能な形", t_outward_actions_shape(fresh()))
+        check("実行: agent専用・is_blocking True・allowlist外は拒否", await t_exec_registration(fresh()))
+        check("実行: フラグ未登録なら run_program は存在しない", t_exec_not_registered_without_flag(fresh()))
         check("場所ゲート: リポジトリ配下とドライブ直下を拒否", t_location_gate())
         check("読み書き: 作成/読取/一覧/追記/再帰削除", t_roundtrip(fresh()))
         check("読取: LLM に返す文字数を切る", t_read_cap(fresh()))

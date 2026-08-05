@@ -175,6 +175,20 @@ class VoiceLoop:
                         max_files=Config.WS_MAX_FILES, rescan_sec=Config.WS_RESCAN_SEC,
                     )
                     register_workspace_capabilities(self.capabilities, self.workspace)
+                    # プログラム実行（別フラグ）。setup_sandbox.py apply 済みが前提だが、
+                    # 未セットアップでも起動は続ける（実行時に SandboxUnavailable で
+                    # 「サンドボックスが使えない」と正直に返る＝fail-soft）。
+                    if Config.WS_EXEC_ENABLED:
+                        from .workspace import register_exec_capability
+                        register_exec_capability(
+                            self.capabilities, self.workspace,
+                            allow=Config.WS_EXEC_ALLOW.split(","),
+                            timeout_sec=Config.WS_RUN_TIMEOUT_SEC,
+                            grace_sec=Config.WS_RUN_GRACE_SEC,
+                            mem_mb=Config.WS_RUN_MEM_MB,
+                            max_procs=Config.WS_RUN_MAX_PROCS,
+                            max_output_chars=Config.WS_MAX_OUTPUT_CHARS,
+                        )
         elif Config.SEARCH_ENABLED or Config.WS_ENABLED:
             if Config.SEARCH_ENABLED:
                 logger.warning("SEARCH_ENABLED=1 だが TASK_ENABLED=0 のため検索は無効（TaskAgent 専用能力）")
@@ -338,6 +352,8 @@ class VoiceLoop:
                 await self.workspace.ensure_ready()
                 logger.info("作業フォルダ 稼働（%s・%s）",
                             self.workspace.paths.root, self.workspace.usage())
+                if Config.WS_EXEC_ENABLED:
+                    logger.info("プログラム実行 稼働（run_program・%s）", Config.WS_EXEC_ALLOW)
         # F6: 画面認識を起動（既定 off）。capture スレッドは loop 確定後に生成し on_frame を橋渡し。
         if Config.VLM_ENABLED:
             self.vlm_worker.start()

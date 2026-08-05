@@ -168,8 +168,12 @@ class Config:
     TASK_RECONCILE_TICK_SEC = float(os.getenv("TASK_RECONCILE_TICK_SEC", "1.0"))  # スケジューラ周期
     TASK_ORPHAN_TIMEOUT_SEC = float(os.getenv("TASK_ORPHAN_TIMEOUT_SEC", "3600"))  # 起動時 Running 孤児の age-out
     # TaskAgent（J-1 inc2 = 賢いタスクLLMの境界つきループ）。コードが境界を所有。
-    TASK_AGENT_MAX_STEPS = int(os.getenv("TASK_AGENT_MAX_STEPS", "5"))  # ループ最大手数
-    TASK_AGENT_TIMEOUT_SEC = float(os.getenv("TASK_AGENT_TIMEOUT_SEC", "180.0"))  # 1ゴールの壁(monotonic)時間上限=3分で強制終了
+    # J-3: 5 → 12。**要件を満たすための必須変更であって調整ではない**。
+    # 「エラーが出たら自分で検索して直す」は最短でも 検索→書く→走らせる→失敗→検索→直す→
+    # 走らせる＝7手かかり、5手では構造的に完遂できない（_summarize_failure に落ちる）。
+    TASK_AGENT_MAX_STEPS = int(os.getenv("TASK_AGENT_MAX_STEPS", "12"))  # ループ最大手数
+    # 同上: 実行(最大70s)を複数回含むので 3分では足りない。10分に広げる。
+    TASK_AGENT_TIMEOUT_SEC = float(os.getenv("TASK_AGENT_TIMEOUT_SEC", "600.0"))  # 1ゴールの壁(monotonic)時間上限
 
     # Web検索（J-2 inc1 = ddgs スニペットのみ）。TASK_ENABLED 前提（TaskAgent 専用能力）。
     SEARCH_ENABLED = os.getenv("SEARCH_ENABLED", "0") == "1"  # 既定 off（実機で明示 on）
@@ -195,6 +199,19 @@ class Config:
     WS_READ_MAX_CHARS = int(os.getenv("WS_READ_MAX_CHARS", "4000"))  # LLM に返す上限（ファイル上限とは別物）
     WS_MAX_FILES = int(os.getenv("WS_MAX_FILES", "20000"))  # 走査の bound（実測: scandir で 77k件/993ms）
     WS_RESCAN_SEC = float(os.getenv("WS_RESCAN_SEC", "600"))  # 台帳ドリフトの定期補正
+    # プログラム実行（J-3 inc2）。**WS_ENABLED 前提**かつ setup_sandbox.py apply 済みが前提。
+    # ファイル操作とは別フラグにする: 「作業フォルダを与える」と「任意コード実行を許す」は
+    # リスクが桁で違い、ユーザが別々に ON/OFF したくなる設定項目だから（CLAUDE.md の規律）。
+    WS_EXEC_ENABLED = os.getenv("WS_EXEC_ENABLED", "0") == "1"  # 既定 off
+    # 実行を許すファイル名。**セキュリティ境界ではない**（python を許した時点で任意コード実行を
+    # 許しており ctypes で Win32 API も呼べる）。本当の境界は専用アカウント + ACL + Job Object。
+    # ここが守るのは「うっかり」と予測可能性だけ。
+    WS_EXEC_ALLOW = os.getenv("WS_EXEC_ALLOW", "python,pip,git,ffmpeg,curl,tar,7z,node,npm")
+    WS_RUN_TIMEOUT_SEC = float(os.getenv("WS_RUN_TIMEOUT_SEC", "60"))  # 内側（runner の subprocess）
+    WS_RUN_GRACE_SEC = float(os.getenv("WS_RUN_GRACE_SEC", "10"))  # 外側の猶予（Job 強制終了まで）
+    WS_RUN_MEM_MB = int(os.getenv("WS_RUN_MEM_MB", "2048"))  # Job のメモリ上限
+    WS_RUN_MAX_PROCS = int(os.getenv("WS_RUN_MAX_PROCS", "32"))  # fork bomb 対策
+    WS_MAX_OUTPUT_CHARS = int(os.getenv("WS_MAX_OUTPUT_CHARS", "8000"))  # LLM に返す出力上限
 
     @classmethod
     def validate(cls) -> list[str]:
