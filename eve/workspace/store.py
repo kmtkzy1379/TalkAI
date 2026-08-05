@@ -26,7 +26,7 @@ import shutil
 import time
 from pathlib import Path
 
-from .paths import WorkspacePaths, iter_files
+from .paths import WorkspacePathError, WorkspacePaths, iter_files
 
 logger = logging.getLogger(__name__)
 
@@ -155,7 +155,8 @@ class Workspace:
     def delete(self, rel: str, recursive: bool = False) -> str:
         target = self.paths.resolve(rel)
         if target == self.paths.root:
-            raise ValueError("作業フォルダそのものは消せません")  # registry がマーカ化
+            # WorkspacePathError にする（capabilities._guard がマーカ化する対象＝トレースを出さない）
+            raise WorkspacePathError("作業フォルダそのものは消せません")
         if not target.exists():
             return f"{self.paths.relative(target)} は元々無かったよ。"
         name = self.paths.relative(target)

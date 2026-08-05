@@ -78,6 +78,9 @@ try:
     _prev_ws_root = _Cfg.WS_ROOT
     _Cfg.TASK_ENABLED = True
     _Cfg.SEARCH_ENABLED = True
+    # フラグは**明示的に落とす**。既定値を .env から読むと、ユーザが WS_ENABLED=1 を書いた
+    # 瞬間にこのテストが落ちる（実際に落ちた）。テストは環境ではなく自分で条件を作る。
+    _Cfg.WS_ENABLED = False
     try:
         vl2 = VoiceLoop()
         check("TASK_ENABLED=True で tasks_provider 配線(空 store→[])",
@@ -88,7 +91,7 @@ try:
         check("SEARCH_ENABLED で search_web 配線(agent専用・応答LLM不可視)",
               vl2.search_client is not None and "search_web" in _agent_names
               and "search_web" not in _offered_names)
-        check("WS 既定 off では作業フォルダ未配線", vl2.workspace is None
+        check("WS_ENABLED=0 では作業フォルダ未配線", vl2.workspace is None
               and "write_file" not in _agent_names)
 
         # J-3: 作業フォルダ（agent 専用・**構築時にディレクトリを作らない**＝テストが開発機を汚さない）

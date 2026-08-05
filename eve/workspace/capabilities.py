@@ -17,8 +17,13 @@
 """
 from __future__ import annotations
 
+import logging
+
 from ..capability.registry import Capability, CapabilityRegistry
+from .paths import WorkspacePathError
 from .store import Workspace
+
+logger = logging.getLogger(__name__)
 
 
 def _as_bool(v) -> bool:
@@ -28,6 +33,25 @@ def _as_bool(v) -> bool:
     if isinstance(v, str):
         return v.strip().lower() in ("true", "1", "yes")
     return False
+
+
+def _guard(fn):
+    """封じ込め違反を**マーカ文字列に変換**する（例外のまま registry へ投げない）。
+
+    実機検証(2026-08-05)で判明: `registry.execute()` は例外を `logger.exception` で拾うため、
+    LLM が悪いパスを1回試すたびにスタックトレースが1本ログに出る。封じ込め違反は
+    **想定内の拒否**であって異常ではないので、トレースは出さず1行の warning に留める。
+    マーカ（先頭「（」）は維持＝`executor.py:110` の verdict 判定は従来どおり Failed 側。
+    返す文言も registry の定型（「機能「x」の実行に失敗しました: WorkspacePathError: …」）より
+    短く具体的になり、LLM が次の手を選びやすい。
+    """
+    def wrapped(args: dict) -> str:
+        try:
+            return fn(args or {})
+        except WorkspacePathError as e:
+            logger.warning("🗂 作業フォルダの封じ込めで拒否: %.80s", e)
+            return f"（{e}）"
+    return wrapped
 
 
 def register_workspace_capabilities(registry: CapabilityRegistry, ws: Workspace) -> None:
@@ -54,7 +78,7 @@ def register_workspace_capabilities(registry: CapabilityRegistry, ws: Workspace)
             "content": {"type": "string", "description": "書き込む内容"},
             "append": {"type": "boolean", "description": "末尾に追記する（省略=上書き）"},
         },
-        handler=_write, offered=False, agent_tool=True, mutates_state=True,
+        handler=_guard(_write), offered=False, agent_tool=True, mutates_state=True,
     ))
     registry.register(Capability(
         name="read_file",
@@ -64,14 +88,14 @@ def register_workspace_capabilities(registry: CapabilityRegistry, ws: Workspace)
             "path": {"type": "string", "description": "作業フォルダからの相対パス"},
             "max_chars": {"type": "integer", "description": "最大何文字読むか（省略=既定値）"},
         },
-        handler=_read, offered=False, agent_tool=True,
+        handler=_guard(_read), offered=False, agent_tool=True,
     ))
     registry.register(Capability(
         name="list_files",
         description="自分の作業フォルダの中身を見る。"
                     "path を省略すると一番上の階層。使用容量も一緒に返る。",
         params_schema={"path": {"type": "string", "description": "見たいフォルダの相対パス（省略可）"}},
-        handler=_list, offered=False, agent_tool=True,
+        handler=_guard(_list), offered=False, agent_tool=True,
     ))
     registry.register(Capability(
         name="delete_file",
@@ -81,5 +105,5 @@ def register_workspace_capabilities(registry: CapabilityRegistry, ws: Workspace)
             "path": {"type": "string", "description": "作業フォルダからの相対パス"},
             "recursive": {"type": "boolean", "description": "フォルダを中身ごと消す（省略=false）"},
         },
-        handler=_delete, offered=False, agent_tool=True, mutates_state=True,
+        handler=_guard(_delete), offered=False, agent_tool=True, mutates_state=True,
     ))
