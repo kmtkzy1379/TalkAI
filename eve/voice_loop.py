@@ -120,6 +120,7 @@ class VoiceLoop:
         self.reconcile_timer = None
         self.cancel_resolver = None
         self.search_client = None  # J-2（SEARCH_ENABLED かつ TASK_ENABLED 時のみ生成）
+        self.workspace = None  # J-3（WS_ENABLED かつ TASK_ENABLED 時のみ生成）
         tasks_provider = None  # Fix#2: TASK_ENABLED 時のみ配線（None ならブロック自体を注入しない）
         if Config.TASK_ENABLED:
             self.task_store = TaskStore(
@@ -159,8 +160,26 @@ class VoiceLoop:
                     self.search_client = SearchClient(
                         deep_researcher=DeepResearcher(self.registry))  # inc2: 隔離要約はツールなしロール
                     register_search_capability(self.capabilities, self.search_client)
-        elif Config.SEARCH_ENABLED:
-            logger.warning("SEARCH_ENABLED=1 だが TASK_ENABLED=0 のため検索は無効（TaskAgent 専用能力）")
+            # J-3 作業フォルダ（既定 off・search と同じ理由で TASK_ENABLED ブロック内に置く）。
+            if Config.WS_ENABLED:
+                from .workspace import Workspace, register_workspace_capabilities, resolve_workspace_root
+                ws_root, why = resolve_workspace_root(Config.WS_ROOT)
+                if ws_root is None:
+                    # 起動時 fail-soft（ddgs 未導入時と同流儀）: 作業フォルダだけ無効化して続行。
+                    logger.warning("WS_ENABLED=1 だが作業フォルダの場所が不適切なため無効化（%s）", why)
+                else:
+                    self.workspace = Workspace(
+                        ws_root, quota_bytes=int(Config.WS_QUOTA_GB * 1024 ** 3),
+                        max_write_chars=Config.WS_WRITE_MAX_CHARS,
+                        max_read_chars=Config.WS_READ_MAX_CHARS,
+                        max_files=Config.WS_MAX_FILES, rescan_sec=Config.WS_RESCAN_SEC,
+                    )
+                    register_workspace_capabilities(self.capabilities, self.workspace)
+        elif Config.SEARCH_ENABLED or Config.WS_ENABLED:
+            if Config.SEARCH_ENABLED:
+                logger.warning("SEARCH_ENABLED=1 だが TASK_ENABLED=0 のため検索は無効（TaskAgent 専用能力）")
+            if Config.WS_ENABLED:
+                logger.warning("WS_ENABLED=1 だが TASK_ENABLED=0 のため作業フォルダは無効（TaskAgent 専用能力）")
 
         async def stream_fn(messages, *, tools=None, tool_sink=None):
             if tools:
@@ -314,6 +333,11 @@ class VoiceLoop:
             logger.info("タスク管理 稼働（予約タスク）")
             if self.search_client is not None:
                 logger.info("Web検索 稼働（search_web・TaskAgent 専用）")
+            if self.workspace is not None:
+                # mkdir + 起動時フルスキャン（スキャンは to_thread＝loop を塞がない）。
+                await self.workspace.ensure_ready()
+                logger.info("作業フォルダ 稼働（%s・%s）",
+                            self.workspace.paths.root, self.workspace.usage())
         # F6: 画面認識を起動（既定 off）。capture スレッドは loop 確定後に生成し on_frame を橋渡し。
         if Config.VLM_ENABLED:
             self.vlm_worker.start()

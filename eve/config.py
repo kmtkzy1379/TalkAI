@@ -182,6 +182,20 @@ class Config:
     SEARCH_RETRY_EMPTY_DELAY_SEC = float(os.getenv("SEARCH_RETRY_EMPTY_DELAY_SEC", "8.0"))  # 0件時の1回だけ再検索の待ち（0=無効）
     SEARCH_BACKEND = os.getenv("SEARCH_BACKEND", "auto")  # ddgs バックエンド（auto=マルチエンジン自動フォールバック。DNS 修正後 5 エンジン生存・3s連打8/8の実測 2026-07-18。DNS遮断回線では "duckduckgo" 固定に戻す）
 
+    # 作業フォルダ（J-3 inc1 = AI 専用ワークスペース）。TASK_ENABLED 前提（TaskAgent 専用能力）。
+    WS_ENABLED = os.getenv("WS_ENABLED", "0") == "1"  # 既定 off（実機で明示 on）
+    # **リポジトリ外・ユーザプロファイル外**に置く（既定 C:\eve_ws\workspace）。理由:
+    # (1) リポジトリ直下には .env（APIキー）と *.jsonl（会話履歴/RAG/タスク）があり、封じ込めの
+    #     穴1個で鍵と全記憶に届く。(2) 128GB を git worktree 内に置くと git status が実用速度を
+    #     失い誤 commit の被害が最大化する。(3) inc2 で専用アカウントに切り替える際、プロファイル
+    #     配下だと ACL が届かない（C:\Users\tester に BUILTIN\Users の ACE が無い実測）。
+    WS_ROOT = os.getenv("WS_ROOT", "")  # 空=既定を計算
+    WS_QUOTA_GB = float(os.getenv("WS_QUOTA_GB", "128"))  # 書込ゲートの閾値（超過しても削除はしない）
+    WS_WRITE_MAX_CHARS = int(os.getenv("WS_WRITE_MAX_CHARS", "200000"))  # 1回の書込上限（同期実行の妥当性を担保）
+    WS_READ_MAX_CHARS = int(os.getenv("WS_READ_MAX_CHARS", "4000"))  # LLM に返す上限（ファイル上限とは別物）
+    WS_MAX_FILES = int(os.getenv("WS_MAX_FILES", "20000"))  # 走査の bound（実測: scandir で 77k件/993ms）
+    WS_RESCAN_SEC = float(os.getenv("WS_RESCAN_SEC", "600"))  # 台帳ドリフトの定期補正
+
     @classmethod
     def validate(cls) -> list[str]:
         """不足している必須設定を列挙。空リストなら起動可（Start ゲートで使う）。"""

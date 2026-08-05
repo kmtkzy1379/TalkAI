@@ -74,6 +74,8 @@ try:
           (vl.orchestrator._tasks_provider is not None) == bool(_Cfg.TASK_ENABLED))
     _prev_task_enabled = _Cfg.TASK_ENABLED
     _prev_search_enabled = _Cfg.SEARCH_ENABLED
+    _prev_ws_enabled = _Cfg.WS_ENABLED
+    _prev_ws_root = _Cfg.WS_ROOT
     _Cfg.TASK_ENABLED = True
     _Cfg.SEARCH_ENABLED = True
     try:
@@ -86,9 +88,41 @@ try:
         check("SEARCH_ENABLED で search_web 配線(agent専用・応答LLM不可視)",
               vl2.search_client is not None and "search_web" in _agent_names
               and "search_web" not in _offered_names)
+        check("WS 既定 off では作業フォルダ未配線", vl2.workspace is None
+              and "write_file" not in _agent_names)
+
+        # J-3: 作業フォルダ（agent 専用・**構築時にディレクトリを作らない**＝テストが開発機を汚さない）
+        import tempfile as _tf
+        _Cfg.WS_ENABLED = True
+        _Cfg.WS_ROOT = os.path.join(_tf.mkdtemp(prefix="eve_wsw_"), "workspace")
+        vl3 = VoiceLoop()
+        _a3 = {s["function"]["name"] for s in vl3.capabilities.agent_tool_schemas()}
+        _o3 = {s["function"]["name"] for s in vl3.capabilities.tool_schemas()}
+        _ws_names = {"write_file", "read_file", "list_files", "delete_file"}
+        check("WS_ENABLED で作業フォルダ配線(agent専用・応答LLM不可視)",
+              vl3.workspace is not None and _ws_names <= _a3 and not (_ws_names & _o3))
+        check("WS は構築時にディレクトリを作らない（起動時 ensure_ready で作る）",
+              not os.path.exists(_Cfg.WS_ROOT))
+
+        # 場所ゲート: リポジトリ配下は fail-soft で無効化（起動は続行する）
+        _Cfg.WS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        vl4 = VoiceLoop()
+        check("WS: リポジトリ配下は無効化して起動継続（fail-soft）",
+              vl4.workspace is None
+              and "write_file" not in {s["function"]["name"] for s in vl4.capabilities.agent_tool_schemas()})
+
+        # TASK_ENABLED=0 では構造的に登録されない（誰も呼べない状態を作らない＝search と同じ規律）
+        _Cfg.TASK_ENABLED = False
+        _Cfg.WS_ROOT = os.path.join(_tf.mkdtemp(prefix="eve_wsw_"), "workspace")
+        vl5 = VoiceLoop()
+        check("WS_ENABLED=1 でも TASK_ENABLED=0 なら未登録",
+              vl5.workspace is None
+              and "write_file" not in {s["function"]["name"] for s in vl5.capabilities.agent_tool_schemas()})
     finally:
         _Cfg.TASK_ENABLED = _prev_task_enabled
         _Cfg.SEARCH_ENABLED = _prev_search_enabled
+        _Cfg.WS_ENABLED = _prev_ws_enabled
+        _Cfg.WS_ROOT = _prev_ws_root
     # 再配達（barge-in で潰れた機能報告の救済）の配線と WHEN ポリシー実挙動
     check("orchestrator に再配達 fn を配線", vl.orchestrator._redeliver_fn == vl._redeliver_stimulus)
     # D2: 抑止判定は同一 queue の is_suppressed でなければならない。resolver 側に hasattr
