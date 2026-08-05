@@ -48,8 +48,22 @@ def head(m): print(f"\n=== {m} " + "=" * max(0, 60 - len(m)))
 
 
 def run(args, **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(args, capture_output=True, text=True,
-                          encoding="utf-8", errors="replace", **kw)
+    """外部コマンド実行。**実行ファイルが無くても落とさない**。
+
+    Windows 11 24H2 以降では `wmic` が削除されているなど、環境によって存在しないツールがある。
+    1つ欠けただけでセットアップ全体が例外で止まると、他の PC へ持っていったときに原因が
+    分かりにくい形で失敗する（実際に wmic で踏んだ）。fail-soft にして呼び出し側が判断する。
+    """
+    try:
+        return subprocess.run(args, capture_output=True, text=True,
+                              encoding="utf-8", errors="replace", **kw)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(args, 9009, "", f"not found: {args[0]}")
+
+
+def ps(script: str) -> subprocess.CompletedProcess:
+    """PowerShell 経由（`wmic` 等の削除されたツールに依存しないため）。"""
+    return run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script])
 
 
 def is_admin() -> bool:
@@ -247,8 +261,8 @@ def apply() -> int:
             ng(f"作成に失敗: {r.stderr.strip()[:160]}")
     if _NG:
         return 1
-    run(["wmic", "useraccount", "where", f"name='{SANDBOX_USER}'", "set",
-         "PasswordExpires=FALSE"])
+    # wmic は Windows 11 24H2 以降で削除されているので PowerShell を使う
+    ps(f"Set-LocalUser -Name '{SANDBOX_USER}' -PasswordNeverExpires $true")
     # 管理者グループから外す（万一入っていた場合の自己修復）
     if run(["net", "localgroup", "Administrators", SANDBOX_USER, "/delete"]).returncode == 0:
         warn("Administrators から削除した")
@@ -333,17 +347,15 @@ def apply() -> int:
     head("8. ファイアウォール（LAN 向けのみ遮断）")
     # アウトバウンド全遮断は採らない: pip / git が全部死んで要件2を壊す。
     # LAN 向けだけ塞げばデメリットはほぼゼロで NAS・ルータ管理画面への到達を断てる。
-    sid = run(["powershell", "-NoProfile", "-Command",
-               f"(Get-LocalUser {SANDBOX_USER}).SID.Value"]).stdout.strip()
+    sid = ps(f"(Get-LocalUser '{SANDBOX_USER}').SID.Value").stdout.strip()
     if sid.startswith("S-1-"):
-        run(["powershell", "-NoProfile", "-Command",
-             f"Remove-NetFirewallRule -DisplayName 'TalkAI sandbox LAN block' "
-             f"-ErrorAction SilentlyContinue"])
-        r = run(["powershell", "-NoProfile", "-Command",
-                 "New-NetFirewallRule -DisplayName 'TalkAI sandbox LAN block' "
-                 "-Direction Outbound -Action Block -Enabled True -Profile Any "
-                 "-RemoteAddress 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16 "
-                 f"-LocalUser 'D:(D;;CC;;;{sid})'"])
+        # 冪等: 同名ルールがあれば消してから作り直す
+        ps("Remove-NetFirewallRule -DisplayName 'TalkAI sandbox LAN block' "
+           "-ErrorAction SilentlyContinue")
+        r = ps("New-NetFirewallRule -DisplayName 'TalkAI sandbox LAN block' "
+               "-Direction Outbound -Action Block -Enabled True -Profile Any "
+               "-RemoteAddress 10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16 "
+               f"-LocalUser 'D:(D;;CC;;;{sid})'")
         ok("LAN 向けアウトバウンドを遮断") if r.returncode == 0 else \
             warn(f"ルール作成に失敗（続行可）: {r.stderr.strip()[:120]}")
     else:
