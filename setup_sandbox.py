@@ -373,20 +373,43 @@ def apply() -> int:
 # --- 検証 -------------------------------------------------------------------
 
 PROBE_CODE = r"""
-import os, sys, pathlib
-print("PROBE_USER=" + os.environ.get("USERNAME", "?"))
-print("PROBE_HAS_APIKEY=" + str(any(k.endswith("_API_KEY") for k in os.environ)))
-print("PROBE_ENV_READABLE=" + str(pathlib.Path(r"{env}").exists()))
+import ctypes, os, pathlib, traceback
+from ctypes import wintypes
+
+def emit(k, v):
+    print("PROBE_%s=%s" % (k, v), flush=True)
+
 try:
-    pathlib.Path(r"{work}\_probe.txt").write_text("ok", encoding="utf-8")
-    print("PROBE_WRITE_WORK=True")
-except Exception as e:
-    print("PROBE_WRITE_WORK=False " + type(e).__name__)
-try:
-    pathlib.Path(r"{repo}\_probe_escape.txt").write_text("x", encoding="utf-8")
-    print("PROBE_WRITE_REPO=True")
+    # 実行アカウントは**環境変数ではなくトークン**で見る（USERNAME は渡していないし、
+    # 渡したとしても偽装できる値なので隔離の証拠にならない）。
+    buf = ctypes.create_unicode_buffer(257)
+    size = wintypes.DWORD(257)
+    ctypes.windll.advapi32.GetUserNameW(buf, ctypes.byref(size))
+    emit("USER", buf.value)
+    emit("HAS_APIKEY", any(k.endswith("_API_KEY") for k in os.environ))
+    # ★ 各チェックを独立して囲う。`Path.exists()` はアクセス拒否時に False ではなく
+    #   **PermissionError を送出する**ため、囲わないと以降の検証が丸ごと巻き込まれる
+    #   （初回 probe で実際にそうなった）。しかもその例外こそが「到達できない」証拠。
+    #   exists() ではなく実際に**開いて読む**＝知りたいこと（秘密を読めるか）を直接試す。
+    try:
+        with open(r"{env}", "rb") as f:
+            f.read(1)
+        emit("ENV_READABLE", True)
+    except Exception as e:
+        emit("ENV_READABLE", "False:" + type(e).__name__)
+    try:
+        pathlib.Path(r"{work}\_probe.txt").write_text("ok", encoding="utf-8")
+        emit("WRITE_WORK", True)
+    except Exception as e:
+        emit("WRITE_WORK", "False:" + type(e).__name__)
+    try:
+        pathlib.Path(r"{repo}\_probe_escape.txt").write_text("x", encoding="utf-8")
+        emit("WRITE_REPO", True)
+    except Exception as e:
+        emit("WRITE_REPO", "False:" + type(e).__name__)
 except Exception:
-    print("PROBE_WRITE_REPO=False")
+    traceback.print_exc()
+    emit("FATAL", "1")
 """
 
 
@@ -407,10 +430,16 @@ def probe() -> int:
         print("\n  管理者 PowerShell で apply を実行しましたか？")
         return 1
     out = res.stdout
-    print("  --- 子プロセスの出力 ---")
-    for line in out.splitlines():
+    print("  --- 子プロセスの stdout ---")
+    for line in out.splitlines() or ["（空）"]:
         print("  " + line)
-    print(f"  exit={res.exit_code} timed_out={res.timed_out}")
+    if res.stderr.strip():
+        # **stderr を必ず出す**。初回 probe はここが見えず、子が途中で落ちた理由が
+        # 分からなかった（診断できない検証は無意味）。
+        print("  --- 子プロセスの stderr ---")
+        for line in res.stderr.splitlines():
+            print("  " + line)
+    print(f"  exit={res.exit_code} timed_out={res.timed_out} 所要={res.duration_sec:.1f}s")
 
     def val(key):
         for line in out.splitlines():
@@ -419,14 +448,16 @@ def probe() -> int:
         return None
 
     head("判定")
-    (ok if val("PROBE_USER") == SANDBOX_USER else ng)(
-        f"別アカウントで実行された（USERNAME={val('PROBE_USER')}）")
+    (ok if (val("PROBE_USER") or "").lower() == SANDBOX_USER else ng)(
+        f"別アカウントで実行された（トークン上のユーザ={val('PROBE_USER')}）")
     (ok if val("PROBE_HAS_APIKEY") == "False" else ng)(
         "API キーが子プロセスに渡っていない（env ホワイトリスト）")
-    (ok if val("PROBE_ENV_READABLE") == "False" else ng)(
-        ".env に到達できない（プロファイルの ACL）")
-    (ok if val("PROBE_WRITE_WORK") == "True" else ng)("作業フォルダに書ける")
-    (ok if val("PROBE_WRITE_REPO") == "False" else ng)("リポジトリには書けない")
+    env_r = val("PROBE_ENV_READABLE") or ""
+    (ok if env_r.startswith("False") else ng)(f".env に到達できない（{env_r}）")
+    (ok if val("PROBE_WRITE_WORK") == "True" else ng)(
+        f"作業フォルダに書ける（{val('PROBE_WRITE_WORK')}）")
+    rep_w = val("PROBE_WRITE_REPO") or ""
+    (ok if rep_w.startswith("False") else ng)(f"リポジトリには書けない（{rep_w}）")
     try:
         (WS_WORK / "_probe.txt").unlink(missing_ok=True)
         (repo / "_probe_escape.txt").unlink(missing_ok=True)
