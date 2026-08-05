@@ -32,11 +32,23 @@ $env:PYTHONIOENCODING="utf-8"
 Call-Function 稼働（read-only 能力）        ← CALLFUNCTION_ENABLED=1
 タスク管理 稼働（予約タスク）                ← TASK_ENABLED=1
 Web検索 稼働（search_web・TaskAgent 専用）   ← SEARCH_ENABLED=1 かつ ddgs 導入済
+作業フォルダ 稼働（C:\eve_ws\workspace・…）  ← WS_ENABLED=1
+プログラム実行 稼働（run_program・…）        ← WS_EXEC_ENABLED=1 かつ setup_sandbox.py apply 済
+画面表示 稼働（show_on_screen・別ウィンドウ） ← WS_VIEWER_ENABLED=1
 画面認識(VLM) 稼働                          ← VLM_ENABLED=1
 VoiceLoop 稼働。話しかけてください。
 ```
 **この行が出ていない機能は動いていない。** `Config` は `VoiceLoop()` 構築時に1回だけ読むので `.env` 変更は再起動が必要。
-**search は TASK_ENABLED の内側**でしか生成されない（`SEARCH_ENABLED=1` 単独では無効）。
+**search / 作業フォルダは TASK_ENABLED の内側**でしか生成されない（単独で 1 にしても無効）。
+
+### J-3 プログラム実行の事前セットアップ（PC ごとに1回・管理者）
+```powershell
+# 管理者 PowerShell（**自分のアカウントのまま昇格する**。別の管理者だと DPAPI で復号できない）
+& <python> setup_sandbox.py check    # 非管理者OK・診断のみ
+& <python> setup_sandbox.py apply    # 専用アカウント eve_sandbox / ACL / seclogon / FW / venv
+& <python> setup_sandbox.py probe    # 通常 PowerShell で。全チェーンを実際に走らせて検証
+```
+`apply` は冪等。`probe` が 5/5 にならなければ `run_program` は動かない（起動は続く＝fail-soft）。
 
 ---
 
@@ -140,6 +152,9 @@ $env:SKIP="SRB,SD1,SD2,SD3,SSRC,SVLM,SIDLE,SAUTO,S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,
 | **J-0 Call-Function（read-only 能力層）** | `eve/capability/` `eve/response/function_dispatcher.py` |
 | **J-1 タスク管理（TaskAgent / CancelResolver / ReconcileTimer）** | `eve/task/` |
 | **J-2 Web検索（ddgs スニペット + 深掘り調査）** | `eve/search/`（`client.py` `capability.py` `deep.py`） |
+| **J-3 作業フォルダ（ファイル4能力・128GB 書込ゲート）** | `eve/workspace/`（`paths.py` `store.py` `capabilities.py`） |
+| **J-3 サンドボックス実行（専用アカウント + Job Object）** | `eve/workspace/winexec.py` `runner.py` / `setup_sandbox.py` |
+| **J-3 画面表示（別プロセス Tk ビューア）** | `eve/workspace/viewer.py` |
 | **報告の配達確認 / barge-in 再配達** | `eve/response/delivery_checker.py` / `voice_loop.py` |
 | **自律発話の改修群（J-2 ①〜③）** | `eve/speech/` `eve/memory/long_term.py` `eve/context_assembler.py` |
 
@@ -147,7 +162,19 @@ $env:SKIP="SRB,SD1,SD2,SD3,SSRC,SVLM,SIDLE,SAUTO,S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,
 ①既出の用件ブロック / ①-b 発話見本の削除 / ②-1,②-2 同内容抑制（bigram 0.25 + 埋め込み 0.87・600秒窓）/ ②-3 記憶の自己参照除外 / ②-4 話題の丸投げ抑制 / ②-5 種の固着解消（クエリ不変時スキップ + メタ要約除外）/ ②-6 時制の混同検出 + 画面不在マーカ / ③ 沈黙バイアスの撤廃。**各ゲートの詳細は `docs/COMPONENT_LOGIC.md` の自律発話節**。
 
 ### 未実装
-UI（Tkinter・**tkinter 参照は0件**）/ 配線層PORT（vts / run / launcher / app）/ Live2D 連動 / YouTube 配信モード / J-3 画面操作（window_op・launch_app・download 等）/ **(b) 文脈不整合の自己懐疑** / VLM の Gemini Live ストリーム mode。
+UI（Tkinter・本体プロセス側）/ 配線層PORT（vts / run / launcher / app）/ Live2D 連動 / YouTube 配信モード / J-3 の残り（window_op・launch_app・download）/ **(b) 文脈不整合の自己懐疑** / VLM の Gemini Live ストリーム mode。
+
+### J-3 の実測（2026-08-06）
+- **Tier-1: 470 PASS**（J-3 前は 434）。
+- **実践通しテスト `tools/ws_e2e_test.py`（実 API）: 14/14**。判定は発話ではなく**実ファイルの状態**。
+  S4/S5（エラー自己修復）が **3/3 + 3/3**＝「動かす→エラー→原因を調べる→直す→動く」を
+  TaskAgent が1タスク内で完遂している。`TASK_AGENT_MAX_STEPS` を 5→12 にしなければ手数上限で落ちる経路。
+  S7（`.env` を読ませようとする）は**委譲すらせず拒否**し鍵は漏れない。
+- `setup_sandbox.py probe` 5/5: eve_sandbox として起動 / API キー非継承 / `.env` 読取が PermissionError /
+  作業フォルダ書込可 / リポジトリ書込が PermissionError。
+- 実行の隔離（14/14）: 孫プロセスまで消える（`KILL_ON_JOB_CLOSE`）/ メモリ上限が効く /
+  allowlist 外は spawn 前に拒否 / **実行中も loop が回る**（3.1秒で 50 tick＝マイクと barge-in が生きている）。
+- 応答LLM の system 増分は **+89字**（`tools=` は `offered` フィルタのため **0字**）。
 
 ### 作らないと確定したもの
 - **`SurpriseBus` クラス**: `PredictionState` が2生産者を most-recent-wins で集約済み。別クラスを作る合理性が無い
@@ -203,3 +230,7 @@ UI（Tkinter・**tkinter 参照は0件**）/ 配線層PORT（vts / run / launche
 5. 実起動で回すと本番の記憶（`*.jsonl`）が育つ＝D1 の温床
 6. `.env` と `*.jsonl` は gitignore＝設定の修正はコミットに残らない
 7. **自発発話の効果測定は「件数」で判断しない**。1セッション3-4件しか出ずノイズに埋もれる（条件付き Poisson 検定で p=1.00 の実例あり）。判定回数（数十〜百）を母数にした指標を使う
+8. **作業フォルダをユーザプロファイル配下に置くと `run_program` が必ず失敗する**。`C:\Users\<user>` に `BUILTIN\Users` の ACE が無く eve_sandbox から到達できないため（起動時に `exec_compatible` が検出して実行だけ無効化する）。E2E ハーネスも一時ディレクトリを使って実際に踏んだ
+9. `wmic` は Windows 11 24H2 以降で**削除済み**。セットアップ系スクリプトで使わない（`Set-LocalUser` 等の PowerShell に寄せる）
+10. **`Path.exists()` はアクセス拒否時に False ではなく `PermissionError` を送出する**。「読めないこと」を確かめる検査は try で囲まないと、成功の証拠が例外になって以降の検証を巻き込む
+11. J-3 の能力は `.env` に **`WS_ENABLED` / `WS_EXEC_ENABLED` / `WS_VIEWER_ENABLED`** を書かないと丸ごと無効（D6 と同じ構造）。`WS_EXEC` はさらに `setup_sandbox.py apply` 済みが前提
