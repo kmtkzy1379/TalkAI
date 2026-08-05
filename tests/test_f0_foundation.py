@@ -153,7 +153,7 @@ check("D1 閾値定数が残っている", SESSION_GAP_SEC == 900.0)
 # 実機 2026-07-29: メール送信を「いいよ」と承諾。危険系は断れるので「危険だから断る」は
 # 効いていたが「手段が無いから断る」が無かった。断った側も実在しない手伝いを約束した。
 # ---------------------------------------------------------------------------
-from eve.capability import Capability, CapabilityRegistry  # noqa: E402
+from eve.capability import MEANS_BOUNDARY, NEVER_MEANS, Capability, CapabilityRegistry  # noqa: E402
 
 _D3_HEAD = "# 実際に実行できる手段"
 
@@ -216,13 +216,31 @@ _reg_full = CapabilityRegistry()
 _rtc(_reg_full, _TS(task_file=os.path.join(_tf.mkdtemp(prefix="eve_d3_"), "t.jsonl")))
 _dt_desc = next(s["function"]["description"] for s in _reg_full.tool_schemas()
                 if s["function"]["name"] == "delegate_task")
-check("D3 delegate_task に外向き手段の不在が書かれている", "外の世界を操作する手段は無い" in _dt_desc)
+# J-3: 旧文言「外の世界を操作する手段は無い」は作業フォルダ/プログラム実行の追加で**それ自体が
+# 嘘**になるため、構成に依らず恒真な MEANS_BOUNDARY に置換した（プロンプトと同じ定数を参照する
+# ので、片方だけ書き換わって静かに境界が消えることが起きない）。
+check("D3 delegate_task に能力境界が書かれている", MEANS_BOUNDARY in _dt_desc)
 check("D3 delegate_task が調べ物/思考の委譲は許可したまま",
       "考えて答えるだけの依頼は goal にしてよい" in _dt_desc)
 # available 側を列挙しない（search は SEARCH_ENABLED ∧ ddgs の内側でしか登録されず、
 # 静的文字列で available を書くと構成差で必ず嘘になる）
 check("D3 delegate_task は available を列挙しない",
       "Web検索 /" not in _dt_desc and "search_web" not in _dt_desc)
+
+# ⭐腐り検知(J-3): NEVER_MEANS は「構成に依らず永久に持たない物」の唯一の真実源で、
+# プロンプト2箇所（delegate_task の description / `# 実際に実行できる手段` ブロック）の
+# 否定例はここから生成される。**将来この能力を実装した瞬間にここが落ちる**＝散文が黙って
+# 嘘になるのを防ぐ。落ちたら NEVER_MEANS から外し、否定側の文言を見直すこと。
+# 走査対象は **実行系(agent_tool=True) だけ**。`outward_actions()` の導出元と同じ集合で、
+# 「実際に外の世界へ手を出せる手段」はここにしか現れない。delegate_task(offered) は
+# 否定例そのものを description に持つ配管なので、含めると自分の否定文で落ちる。
+_all_desc = " ".join(s["function"]["description"] for s in _reg_full.agent_tool_schemas())
+for _w in NEVER_MEANS:
+    check(f"D3 腐り検知: 「{_w}」を持つ能力は登録されていない", _w not in _all_desc)
+# 否定側に構成依存語を手書きしない（J-3 でファイル操作能力が入ると嘘になる位置だった）
+check("D3 否定の例示に構成依存語を書かない（assembler）",
+      "ファイルの作成" not in d3_blk and "アプリの起動" not in d3_blk)
+check("D3 否定の例示に構成依存語を書かない（delegate_task）", "ファイル操作" not in _dt_desc)
 
 print(f"\n合計: PASS {_passed} / FAIL {_failed}")
 sys.exit(1 if _failed else 0)

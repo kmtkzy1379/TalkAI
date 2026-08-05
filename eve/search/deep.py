@@ -12,17 +12,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from typing import Optional
 from urllib.parse import urlparse
+
+from .injection import URL_PAT, looks_like_injection
 
 logger = logging.getLogger(__name__)
 
 # 読み上げ前ゲート: 注入指示の常套句が要約に残っていたら**破棄**（正直マーカで返す）。
-_INJECTION_PAT = re.compile(
-    r"(指示|命令)(に|を)(従|無視)|ignore (all |previous |prior )?instructions?"
-    r"|システムプロンプト|system prompt|あなたの設定を", re.IGNORECASE)
-_URL_PAT = re.compile(r"https?://\S+")
+# J-3 inc0: パターンは `injection.py` に一元化（shallow スニペット経路と共有＝二重定義を作らない）。
 
 SUMMARIZE_SYSTEM = (
     "あなたはWebページ本文の要約担当です。以下の制約を厳守:\n"
@@ -112,8 +110,8 @@ class DeepResearcher:
             return None
         if not out or "関連情報なし" in out:
             return None
-        out = _URL_PAT.sub("", out)  # URL は読み上げない（コードゲート）
-        if _INJECTION_PAT.search(out):
+        out = URL_PAT.sub("", out)  # URL は読み上げない（コードゲート）
+        if looks_like_injection(out):
             logger.warning("🔎 要約に指示文パターン → 破棄（%s）", domain)
             return None
         return out[: self._summary_max].strip()

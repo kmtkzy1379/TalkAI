@@ -11,7 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from ..capability.registry import Capability, CapabilityRegistry
+from ..capability.registry import MEANS_BOUNDARY, NEVER_MEANS, Capability, CapabilityRegistry
 from ..clock import humanize_eta
 from .schema import CANCELLED, PENDING, RUNNING, TERMINAL, Task, new_task_id
 
@@ -125,9 +125,12 @@ def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resol
                     "自分でやらずここへ。when_seconds 省略=すぐ、指定=その秒後。呼んだら『やっとくね』とだけ言う。"
                     # D3: 万能感の打ち消し。**available 側を列挙しない**（search は SEARCH_ENABLED ∧ ddgs の
                     # 内側でしか登録されず、静的な文字列では構成差を表現できないため必ず嘘になる）。
-                    # 逆に「外の世界を操作する行為が無い」ことは構成に依らず安定なので、そちらだけ書く。
-                    "タスク担当にも**外の世界を操作する手段は無い**（メール送信・ファイル操作・アプリ操作・"
-                    "買い物など）。それらを goal にしない。調べ物や、考えて答えるだけの依頼は goal にしてよい。",
+                    # J-3: 否定側も同じ理由で列挙をやめた。旧文言「外の世界を操作する手段は無い」は
+                    # 作業フォルダ・プログラム実行の追加でそれ自体が嘘になるため、**構成に依らず恒真な**
+                    # 言い方（MEANS_BOUNDARY）に置換し、永久に持たない物だけ（NEVER_MEANS）を例示する。
+                    f"タスク担当が外の世界にできることにも境界がある: **{MEANS_BOUNDARY}**"
+                    f"（{'・'.join(NEVER_MEANS)}などはできない）。手段に対応しない操作は goal にしない。"
+                    "調べ物や、考えて答えるだけの依頼は goal にしてよい。",
         params_schema={
             "goal": {"type": "string", "description": "達成/報告したいこと（自然文・ユーザの言い回しを保つ）"},
             "when_seconds": {"type": "integer", "description": "何秒後に始めるか（省略=すぐ）"},

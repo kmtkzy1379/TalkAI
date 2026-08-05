@@ -15,6 +15,7 @@ import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from .capability.registry import NEVER_MEANS
 from .clock import Stamp, elapsed_wall, humanize
 
 logger = logging.getLogger(__name__)
@@ -194,8 +195,11 @@ class ContextAssembler:
                 parts.append(
                     "# 実際に実行できる手段（行動の話）\n"
                     "実行できるのは次だけ: " + " / ".join(capabilities) + "。\n"
-                    "これ以外の操作（メール送信、ファイルの作成・移動・削除、アプリの起動や操作、"
-                    "買い物、外部サービスへの書き込み等）は**手段を持っていない**。頼まれたら"
+                    # J-3: 否定の例示は NEVER_MEANS 由来（**構成に依らず永久に持たない物だけ**）。
+                    # 旧文言はここに「ファイルの作成・移動・削除」「アプリの起動や操作」を手書きして
+                    # おり、作業フォルダ能力の追加で嘘になる位置にあった。可能側は上行の
+                    # `outward_actions()` 導出が語るので、否定側で列挙し直す必要は無い。
+                    f"これ以外の操作（{'、'.join(NEVER_MEANS)}等）は**手段を持っていない**。頼まれたら"
                     "「その手段は持っていない」と正直に短く言い、できるふりや「あとでやっておく」"
                     "「条件を教えてくれたらやる」と引き受け直さない。危ないから断るときは危ない理由も言う。\n"
                     "**制限しているのは「外の世界を操作すること」だけ。** 会話・意見・おすすめ・感想・"
