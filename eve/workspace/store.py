@@ -135,6 +135,8 @@ class Workspace:
         rows: list[str] = []
         try:
             for entry in sorted(os.scandir(target), key=lambda e: (not e.is_dir(), e.name)):
+                if entry.name.startswith("."):
+                    continue  # `.eve_run`（実行の作業ディレクトリ）等の内部物を AI に見せない
                 if len(rows) >= _LIST_MAX:
                     rows.append("・…（多いので省略）")
                     break
@@ -176,7 +178,12 @@ class Workspace:
 
     # --- 定期の再同期（外部要因のドリフト補正）----------------------------
 
-    async def maybe_rescan(self) -> None:
-        """一定時間が経っていたら再スキャン（inc2 の子プロセスや人手の変更を吸収）。"""
-        if time.monotonic() - self._scanned_at >= self._rescan_sec:
+    async def maybe_rescan(self, force: bool = False) -> None:
+        """再スキャン（子プロセスや人手による台帳外の変更を吸収）。
+
+        `force=True` は `run_program` の直後に使う。**子プロセスの書込は台帳を一切通らない**
+        ので、周期待ち（既定600秒）では実行直後の実体とズレたままになる。走査は `to_thread`
+        かつ件数 bound つきなので、秒単位の run_program に対しては十分安い。
+        """
+        if force or time.monotonic() - self._scanned_at >= self._rescan_sec:
             await self._rescan()

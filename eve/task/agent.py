@@ -106,7 +106,11 @@ class TaskAgent:
                 return None
             if self._now() > deadline:
                 logger.info("🗒 TaskAgent: timeout task=%s step=%d", task_id, step)
-                return await self._summarize_failure(goal, notes, "時間切れ(3分)")
+                # 文言は実際の設定値から作る（固定文字列だと config を変えた時に嘘になる。
+                # 実際 J-3 で 180→600 に変えた後も「3分」と表示し続けていた）。
+                limit = (f"{self._timeout / 60:.0f}分" if self._timeout >= 60
+                         else f"{self._timeout:.0f}秒")
+                return await self._summarize_failure(goal, notes, f"時間切れ({limit})")
             try:
                 resp = await self._model.complete(
                     "task", messages, tools=self._registry.agent_tool_schemas(),

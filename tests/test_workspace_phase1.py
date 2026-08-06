@@ -308,6 +308,38 @@ def t_exec_compatible_gate():
     return (not bad) and "プロファイル" in why and good
 
 
+async def t_e10_leftovers(tmp: Path):
+    """E10: J-3 実装の積み残し3件（実測 2026-08-06）。
+
+    (1) `maybe_rescan()` の呼び出し元がゼロで、定期クォータ補正が一度も走っていなかった。
+        子プロセスの書込は台帳を通らないので、これが無いと台帳は永久にズレる（実測: curl で
+        DL した 44.1KB が「使用 0B」のままだった）。
+    (2) `.eve_run`（実行の作業ディレクトリ）が list_files に見えて AI のノイズになっていた。
+    (3) `agent.py` の時間切れ文言が「3分」固定で、600秒に変えた後も嘘をついていた。
+    """
+    ws = _ws(tmp)
+    await ws.ensure_ready()
+    # (1) 台帳を通さずに書いたものが force 再スキャンで拾われる
+    before = ws.usage()
+    (tmp / "outside_ledger.bin").write_bytes(b"x" * 5000)   # 子プロセスの書込を模す
+    mid = ws.usage()                                        # 台帳を通らないのでまだ気づかない
+    await ws.maybe_rescan(force=True)
+    after = ws.usage()
+    # 表示は _human() で丸まる（5000B→"4.9KB"）ので、件数の変化で判定する
+    ok1 = ("0ファイル" in before and "0ファイル" in mid
+           and "1ファイル" in after and "4.9KB" in after)
+    # (2) `.` 始まりは一覧に出さない（実体は残す）
+    (tmp / ".eve_run").mkdir(exist_ok=True)
+    listing = ws.list()
+    ok2 = ".eve_run" not in listing and (tmp / ".eve_run").exists()
+    # (3) 文言が設定値から作られる
+    from eve.task.agent import TaskAgent
+    a600 = TaskAgent(registry=None, model_registry=None, store=None, timeout_sec=600.0)
+    a45 = TaskAgent(registry=None, model_registry=None, store=None, timeout_sec=45.0)
+    ok3 = (f"{a600._timeout / 60:.0f}分" == "10分" and f"{a45._timeout:.0f}秒" == "45秒")
+    return ok1 and ok2 and ok3
+
+
 def t_location_gate():
     repo = Path(__file__).resolve().parent.parent
     inside, why1 = resolve_workspace_root(str(repo / "ws"))
@@ -388,6 +420,7 @@ async def main():
         check("実行: フラグ未登録なら run_program は存在しない", t_exec_not_registered_without_flag(fresh()))
         check("表示: 登録契約・同期handler・封じ込め・マジックバイト判定", t_viewer_registration(fresh()))
         check("実行: プロファイル配下は実行不可と判定される", t_exec_compatible_gate())
+        check("E10 積み残し3件（台帳再同期/.eve_run隠蔽/時間切れ文言）", await t_e10_leftovers(fresh()))
         check("場所ゲート: リポジトリ配下とドライブ直下を拒否", t_location_gate())
         check("読み書き: 作成/読取/一覧/追記/再帰削除", t_roundtrip(fresh()))
         check("読取: LLM に返す文字数を切る", t_read_cap(fresh()))

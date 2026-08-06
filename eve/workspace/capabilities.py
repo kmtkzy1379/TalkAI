@@ -164,6 +164,14 @@ def register_exec_capability(registry: CapabilityRegistry, ws: Workspace, *,
             logger.exception("run_program で例外")
             return f"（実行に失敗した: {type(e).__name__}）"
 
+        # ★ 子プロセスの書込は台帳に入らない（親の write_file 経路を通らないため）。実行のたびに
+        #   ここで再同期の機会を作る（`maybe_rescan` は前回スキャンから一定時間経った時だけ走る）。
+        #   これが無いと台帳は永久にズレたまま＝クォータが効かない（E10: 配線し忘れていた）。
+        try:
+            await ws.maybe_rescan(force=True)
+        except Exception:
+            logger.exception("実行後の作業フォルダ再スキャンに失敗（続行）")
+
         # ★ プログラムのエラー（exit≠0 / Traceback）は**失敗マーカにしない**。
         #   executor.py:110 が「先頭が『（』なら Failed」で verdict を決めるため、ここを
         #   マーカにするとタスクが即 Failed になり「調べて直す」が1回で終わる。
