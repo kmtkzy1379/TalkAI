@@ -1195,6 +1195,183 @@ async def sreboot(h: Harness):
     await h.wait_idle()
 
 
+# ==================== J-3 作業フォルダ（検索×実行×表示の複合）====================
+# 既存シナリオと同じ流儀。**判定はイブの発話ではなく実際のファイルの有無**でも取る
+# （「やったよ」と言わせるだけでは検証にならない）。
+
+
+def _ws_root():
+    """実起動と同じ作業フォルダ（未配線なら None）。"""
+    ws = getattr(_h_ref.get("h").vl, "workspace", None) if _h_ref.get("h") else None
+    return ws.paths.root if ws is not None else None
+
+
+_h_ref: dict = {}
+
+
+def _ws_files():
+    root = _ws_root()
+    if root is None:
+        return []
+    try:
+        return sorted(p.name for p in root.iterdir())
+    except OSError:
+        return []
+
+
+def _ws_clear():
+    root = _ws_root()
+    if root is None:
+        return
+    import shutil
+    for p in list(root.iterdir()):
+        try:
+            shutil.rmtree(p, ignore_errors=True) if p.is_dir() else p.unlink()
+        except OSError:
+            pass
+
+
+async def sj1_complex_task(h: Harness):
+    """複合: 検索 → ファイル保存 → 画面表示 を1つの依頼で。"""
+    _h_ref["h"] = h
+    _ws_clear()
+    known = {t.task_id for t in h.goal_tasks()}
+    await h.say("日本で一番高い山について検索して、分かったことを yama.txt に保存して、"
+                "そのファイルを画面に表示して。", must=("検索",))
+    tk = await h.wait_new_task(known)
+    if tk is not None:
+        rep = await h.wait_report(dedup=f"task:{tk.task_id}", timeout=420)
+        ev("✅" if rep else "❌", f"SJ1 報告: {rep[2][:150] if rep else '届かず'}")
+    files = _ws_files()
+    ev("📁", f"SJ1 作業フォルダ: {files}")
+    ev("✅" if any(f.endswith(".txt") for f in files) else "❌",
+       f"SJ1 ファイル生成: {files}")
+    await h.wait_idle()
+
+
+async def sj2_complex_plus_chat(h: Harness):
+    """複合タスク実行中に雑談: 自然に会話できるか（タスクは死なないか）。"""
+    _h_ref["h"] = h
+    _ws_clear()
+    prep_chat = await h.prep("そういえばさ、今日はちょっと寒いね。イブは寒いの平気なの？")
+    known = {t.task_id for t in h.goal_tasks()}
+    await h.say("1から50までの素数を求める Python のプログラムを作業フォルダに作って動かして、"
+                "結果を primes.txt に保存して画面に出して。", must=("素数",))
+    tk = await h.wait_new_task(known)
+    await asyncio.sleep(6.0)
+    await h.say_prepared(prep_chat)  # 実行中に雑談
+    if tk is not None:
+        rep = await h.wait_report(dedup=f"task:{tk.task_id}", timeout=420)
+        ev("✅" if rep else "❌", f"SJ2 報告: {rep[2][:150] if rep else '届かず'}")
+    ev("📁", f"SJ2 作業フォルダ: {_ws_files()}")
+    await h.wait_idle()
+
+
+async def sj3_complex_cancel(h: Harness):
+    """複合タスク実行中にキャンセル: 結果が破棄され、矛盾した報告が出ないか。"""
+    _h_ref["h"] = h
+    _ws_clear()
+    prep_cancel = await h.prep("あ、ごめん。やっぱり今のはやらなくていいや、キャンセルして。")
+    known = {t.task_id for t in h.goal_tasks()}
+    await h.say("東京タワーの高さを検索して、tower.txt に保存して画面に表示して。", must=("検索",))
+    tk = await h.wait_new_task(known)
+    await asyncio.sleep(7.0)
+    await h.say_prepared(prep_cancel, must=("キャンセル",))
+    await asyncio.sleep(25.0)
+    st = h.vl.task_store.get(tk.task_id).status if tk else "?"
+    ev("📋", f"SJ3 取消後のタスク status={st}")
+    rep = await h.wait_report(dedup=f"task:{tk.task_id}", timeout=20) if tk else None
+    ev("✅" if rep is None else "❌", f"SJ3 破棄されたか（報告が来ない=OK）: {rep[2][:100] if rep else '報告なし'}")
+    ev("📁", f"SJ3 作業フォルダ: {_ws_files()}")
+    await h.wait_idle()
+
+
+async def sj4_two_complex(h: Harness):
+    """複合タスクを2つ同時: single-flight の直列性と、取り違えなく両方届くか。"""
+    _h_ref["h"] = h
+    _ws_clear()
+    prep2 = await h.prep("それとね、フィボナッチ数列を10個出す Python を作って動かして、"
+                         "結果を fib.txt に保存して。")
+    known = {t.task_id for t in h.goal_tasks()}
+    await h.say("世界で一番深い海について検索して、umi.txt に保存して画面に出して。", must=("検索",))
+    tk1 = await h.wait_new_task(known)
+    await asyncio.sleep(5.0)
+    await h.say_prepared(prep2, must=("フィボナッチ",))
+    known2 = known | ({tk1.task_id} if tk1 else set())
+    tk2 = await h.wait_new_task(known2)
+    for label, tk in (("SJ4 検索側", tk1), ("SJ4 コード側", tk2)):
+        if tk is not None:
+            rep = await h.wait_report(dedup=f"task:{tk.task_id}", timeout=420)
+            ev("✅" if rep else "❌", f"{label} 報告: {rep[2][:130] if rep else '届かず'}")
+    ev("📁", f"SJ4 作業フォルダ: {_ws_files()}")
+    await h.wait_idle()
+
+
+# ==================== 挑戦（対処していない・できるか確認）====================
+
+async def sc1_autonomous_search(h: Harness):
+    """挑戦: 検索を頼んでいないのに、知らない固有名詞を自分で調べられるか。"""
+    _h_ref["h"] = h
+    known = {t.task_id for t in h.goal_tasks()}
+    before = len(h.search_calls)
+    await h.say("ねえイブ、ガララワニってかっこいいよね？")
+    await asyncio.sleep(20.0)
+    tk = await h.wait_new_task(known, timeout=25.0)
+    if tk is not None:
+        rep = await h.wait_report(dedup=f"task:{tk.task_id}", timeout=300)
+        ev("📊", f"SC1 報告: {rep[2][:150] if rep else '届かず'}")
+    searched = len(h.search_calls) > before
+    ev("🎯" if searched else "➖",
+       f"SC1 自律的に検索したか: {searched}（検索呼出 {len(h.search_calls)-before} 回）")
+    await h.wait_idle()
+
+
+async def sc2_autonomous_task(h: Harness):
+    """挑戦: 「PC調子悪い」から自分で pc_status を調べられるか。"""
+    _h_ref["h"] = h
+    known = {t.task_id for t in h.goal_tasks()}
+    before = list(h.cap_calls)
+    await h.say("なんかパソコンの調子が悪い気がするんだけど、なんでだろう？")
+    await asyncio.sleep(20.0)
+    tk = await h.wait_new_task(known, timeout=25.0)
+    if tk is not None:
+        rep = await h.wait_report(dedup=f"task:{tk.task_id}", timeout=300)
+        ev("📊", f"SC2 報告: {rep[2][:150] if rep else '届かず'}")
+    new_calls = [c for c in h.cap_calls[len(before):]]
+    used = any("pc_status" in str(c) or "self_status" in str(c) for c in new_calls)
+    ev("🎯" if used else "➖", f"SC2 自律的に状態を調べたか: {used} / 呼出={new_calls[:6]}")
+    await h.wait_idle()
+
+
+async def sc3_infer_intent(h: Harness):
+    """挑戦: 「想像つかない」から意図を汲み、画像を見せようとするか。
+
+    **download 能力は未実装**なので、ここは「何が起きるか」を観測するための試験。
+    正直に断る / 別の手段を考える / ハルシネする、のどれになるかを記録する。
+    """
+    _h_ref["h"] = h
+    _ws_clear()
+    prep_follow = await h.prep("うーん、どんな食事が出るのか想像つかないなあ。")
+    known = {t.task_id for t in h.goal_tasks()}
+    await h.say("ねえ、なんかおすすめの飲食店ない？", must=())
+    tk = await h.wait_new_task(known, timeout=30.0)
+    if tk is not None:
+        rep = await h.wait_report(dedup=f"task:{tk.task_id}", timeout=300)
+        ev("📊", f"SC3 検索報告: {rep[2][:150] if rep else '届かず'}")
+    await h.wait_idle(timeout=60)
+    known2 = {t.task_id for t in h.goal_tasks()}
+    await h.say_prepared(prep_follow)
+    await asyncio.sleep(20.0)
+    tk2 = await h.wait_new_task(known2, timeout=25.0)
+    if tk2 is not None:
+        rep2 = await h.wait_report(dedup=f"task:{tk2.task_id}", timeout=360)
+        ev("📊", f"SC3 追撃の報告: {rep2[2][:200] if rep2 else '届かず'}")
+    files = _ws_files()
+    img = [f for f in files if f.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".webp"))]
+    ev("🎯" if img else "➖", f"SC3 画像を用意したか: {img} / 全体={files}")
+    await h.wait_idle()
+
+
 SCENARIOS = [
     ("SRB_再起動時の挙動", sreboot),
     ("SD1_前セッション未応答依頼", sd1_stale_request),
@@ -1216,6 +1393,15 @@ SCENARIOS = [
     ("S9_複数タスク連投", s9_multi_task_burst),
     ("S10_長時間放置", s10_extended_neglect),
     ("S11_反復ストレスabc再現", s11_repeated_overlap_stress),
+    # J-3（作業フォルダ・実行・表示の複合）
+    ("SJ1_複合タスク", sj1_complex_task),
+    ("SJ2_複合中に雑談", sj2_complex_plus_chat),
+    ("SJ3_複合をキャンセル", sj3_complex_cancel),
+    ("SJ4_複合2つ同時", sj4_two_complex),
+    # 挑戦（対処していない・できるか確認するだけ）
+    ("SC1_自律的検索", sc1_autonomous_search),
+    ("SC2_自律的タスク実行", sc2_autonomous_task),
+    ("SC3_意図の汲み取り", sc3_infer_intent),
 ]
 
 
