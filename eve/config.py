@@ -155,7 +155,14 @@ class Config:
     # 実測(2026-07-27): 無実況区間の分布は二峰性（≤52秒 か 数分以上の放置）で、180 はちょうど谷＝
     # どちらにも効いていなかった。328秒前の実況がまだ正しかったのに 180 で捨てて捏造した事故が
     # 出たため 600 へ。上限を残すのは、pHash 閾値未満の局所変化が積もる可能性に対する保険。
-    VLM_STATIC_VISION_MAX_SEC = float(os.getenv("VLM_STATIC_VISION_MAX_SEC", "600.0"))
+    # 実測(2026-08-06 J-3通し3ラン・E6): **同じ事故が 600 でも再発**（3/3ラン）。ユーザに
+    # 「このまま画面で作業するね、見てて」と言われた時、直近実況が約1430秒前・内容も
+    # 「画面に変化はなく」だったのに 600 で捨てられ、「今は画面が見えていない」と能力ごと否認した。
+    # 据え置きの他の関門（実況であること・capture 生存・実況後に変化フレームが無いこと）は
+    # すべて通っているので、捨てているのはこの上限だけ。→ 1800 へ。
+    # 上限を残す理由は不変（pHash 閾値未満の微小変化の蓄積）。据え置き時は
+    # `vision_for_user` が「N秒前の画面。以降ずっと変化なし」を自動付与するので誤解は生じない。
+    VLM_STATIC_VISION_MAX_SEC = float(os.getenv("VLM_STATIC_VISION_MAX_SEC", "1800.0"))
     VLM_BLANK_STD_THRESHOLD = float(os.getenv("VLM_BLANK_STD_THRESHOLD", "6.0"))  # 黒/空白検出（std 未満=取得不可・A11）
 
     # Call-Function（J-0 即時 Call-Function・increment 1 は read-only 能力のみ）。

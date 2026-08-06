@@ -220,6 +220,34 @@ def t_vision_for_user_invalidated() -> bool:
     return after_change is None and capture_dead is None and too_old is None
 
 
+def t_vision_for_user_e6_holdover() -> bool:
+    """E6（実測 2026-08-06・3/3ラン再現）: 据え置き上限が短すぎて能力ごと否認した回帰。
+
+    ユーザに「このまま画面で作業するね、見てて」と言われた時、直近実況が **1430秒前**・
+    内容も「画面に変化はなく」で、据え置きの他の関門（実況/capture 生存/実況後に変化なし）は
+    全て通っていたのに、上限 600 だけが理由で捨てられ「今は画面が見えていない」と答えた。
+    上限は 1800 へ。**上限そのものは残す**（pHash 閾値未満の微小変化の蓄積に対する保険）。
+    """
+    from eve.config import Config
+
+    def _held(age: float, static_max: float):
+        vs = VisionState()
+        vs.add_frame(_frame(0), True, now=100.0)
+        vs.set_latest("画面に変化はなく、引き続きVS Codeが表示されています", mono=101.0)
+        vs.add_frame(_frame(1), False, now=101.0 + age - 0.5)  # 静止のまま capture は生存
+        return vs.vision_for_user(7.0, static_max, now=101.0 + age)
+
+    old = _held(1430.0, 600.0)                                  # 修正前の条件
+    new = _held(1430.0, Config.VLM_STATIC_VISION_MAX_SEC)       # 現行既定
+    over = _held(2000.0, Config.VLM_STATIC_VISION_MAX_SEC)      # 上限超過は従来どおり捨てる
+    return (old is None                       # 旧上限では捨てていた（回帰の再現）
+            and new is not None               # 現行では渡る
+            and "以降ずっと変化なし" in new    # 正直な注記が付く（古い画面を今と偽らない）
+            and "1430秒前" in new
+            and over is None                  # 保険は生きている
+            and Config.VLM_STATIC_VISION_MAX_SEC >= 1430.0)
+
+
 def t_vision_for_user_marker_not_held() -> bool:
     # A11 の正直マーカ（視認不可）は据え置かない（「30秒前は取得できなかった」は無意味/紛らわしい）
     vs = VisionState()
@@ -625,6 +653,7 @@ async def main() -> None:
     check("⭐層分離: 静止中はユーザ応答のみ据え置き(自発は渡さない)", t_vision_for_user_static_hold())
     check("据え置き無効: 変化後/capture停止/上限超", t_vision_for_user_invalidated())
     check("正直マーカは据え置かない", t_vision_for_user_marker_not_held())
+    check("E6 据え置き上限1800（1430秒前の実況を捨てて否認しない）", t_vision_for_user_e6_holdover())
     check("surprise cold→NEUTRAL", t_surprise_cold_neutral())
     check("surprise vlm 単独", t_surprise_vlm_only())
     check("A4 surprise most-recent-wins(maxでない)", t_surprise_most_recent_wins())
