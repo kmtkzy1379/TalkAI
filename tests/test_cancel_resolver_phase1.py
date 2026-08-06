@@ -351,6 +351,42 @@ async def t_d2_suppress_before_first_await():
     return removed_before_await
 
 
+def t_e4_reference_match_table() -> bool:
+    """E4(実測 2026-08-06): 未配達候補が1件でも、reference が別物を指すなら破棄しない。
+
+    実機事故: 「さっきの**川**の調べ物やめて」に対し、未配達で残っていた唯一の候補が
+    「**琵琶湖の面積**を調べて教えて」だったため、reference を一切見ずに琵琶湖の報告を
+    破棄した。候補が「一意に決まる」ことと「正しい」ことは別。
+    照合は `_handle_terminal_race` の await 禁止区間で走るので**同期**でなければならない。
+
+    表は実測の発話文字列そのもの（STT 誤認識込み）。**曖昧な取消を塞がないこと**が
+    同時に重要（塞ぐと正当な取消が効かなくなる＝この変更で作りうる最悪の退行）。
+    """
+    from eve.task.cancel_resolver import _reference_may_match
+
+    class _T:
+        def __init__(self, goal):
+            self.goal, self.what = goal, ""
+
+    table = [
+        # (reference, タスク名, 指している可能性があるか)
+        ("さっきの川の調べ物、やっぱりやめていいよ", "琵琶湖の面積を調べて教えて", False),   # ★実機事故
+        ("さっきの川の調べ物、やっぱりやめていいよ", "世界で一番長い川を調べて教えて", True),
+        ("さっきの富士山の調べもの、やっぱりやめていいよ", "富士山の高さを調べて教えて", True),
+        # ★レッドチーム指摘の危険窓: 「検索やめて」なのに残っているのが時刻タスクだけ
+        ("あ、ごめん。やっぱりさっきの検索はやめて", "30秒後に今の時刻を教えて", False),
+        ("あ、ごめん。やっぱりさっきの検索はやめて", "VOICEVOXについて検索して教えて", True),
+        # ★曖昧な取消は従来どおり通す（塞いだら正当な取消が効かなくなる）
+        ("あ、ごめん。やっぱり今のやらなくていいや。キャンセルして", "東京タワーの高さを検索", True),
+        ("あ、ごめん、やっぱり今の流行らなくていいや。キャンセルして", "東京タワーの高さを検索", True),
+        ("", "なんでもいいタスク", True),
+        ("さっきの川のやつ", "", True),                                    # 無題は比較材料なし
+        ("さっきのボイスボックスのやつやめて", "富士山の高さを調べて教えて", False),  # カタカナも識別
+        ("さっきのボイスボックスのやつやめて", "ボイスボックスについて検索して", True),
+    ]
+    return all(_reference_may_match(ref, _T(goal)) is want for ref, goal, want in table)
+
+
 async def main():
     check("0件→止めるタスク無い(LLM 呼ばない)", await t_zero())
     check("1件×曖昧ref→コード即時キャンセル(LLM 呼ばない)", await t_one_vague_code())
@@ -372,6 +408,7 @@ async def main():
     check("D2 Cancelled は候補外", await t_d2_cancelled_not_candidate())
     check("D2 Failed は候補に含む", await t_d2_failed_is_candidate())
     check("D2 death: suppress は最初の await より前", await t_d2_suppress_before_first_await())
+    check("E4 未配達1件でも reference 不一致なら破棄しない", t_e4_reference_match_table())
 
 
 asyncio.run(main())

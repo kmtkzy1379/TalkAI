@@ -84,6 +84,57 @@ def _is_vague_reference(ref: str) -> bool:
     return not _VAGUE_TOKENS.sub("", s)  # 実質語（数字・内容語）が残れば False
 
 
+# E4: 照合の前に落とす語。**`_VAGUE_TOKENS` には足さない**（あちらは fast path の可否を
+# 決めるので、触ると取消の即断挙動が変わる。ここは「どのタスクを指しているか」の照合専用）。
+_MATCH_STRIP = re.compile(
+    "|".join((
+        # (a) どのタスクにも共通で出る動作語＝識別力ゼロ。落とさないと「川の調べ物」と
+        #     「琵琶湖の面積を**調べ**て教えて」が『調べ』で一致してしまう
+        "調べ物", "調べもの", "調べて", "調べ", "教えて", "教え", "確認して", "確認",
+        "やって", "ください", "ほしい", "頼んだ", "頼んでた", "件",
+        # (b) 取消の言い回しの語尾。`_VAGUE_TOKENS` が拾いきれず残渣になり、**正当な取消まで
+        #     ブロックしてしまう**ため（検算で2件発覚）。「流行らなくて」は実測3/3ランで出た
+        #     「やらなくて」の STT 誤認識で、同種の誤認識までは原理的に潰せない。
+        "やらなくて", "やらないで", "やらない", "しなくて", "しないで", "なくていい",
+        "ていいや", "ていい", "流行らなくて", "はやらなく",
+    )))
+
+
+def _norm(s: str) -> str:
+    return _PUNCT.sub("", unicodedata.normalize("NFKC", s or "").strip().lower())
+
+
+def _reference_may_match(ref: str, task) -> bool:
+    """reference がこのタスクを指している可能性があるか（**同期**・LLM を使わない）。
+
+    E4(実測 2026-08-06): 「さっきの**川**の調べ物やめて」に対し、キューに未配達で残っていた
+    唯一の候補が「**琵琶湖の面積**を調べて教えて」だったため、reference を一切見ずに
+    琵琶湖の報告を破棄した。候補が「一意に決まる」ことと「正しい」ことは別。
+
+    `_handle_terminal_race` は**最初の await までに suppress を終える**契約なので、
+    ここは同期でなければならない（LLM 照合は使えない）。
+
+    - reference に実質語が無い（曖昧）→ True（対象を絞っていないので1件なら任せてよい）
+    - 実質語がある → 動作語を落とした残りがタスク名に掛かるかを見る。掛からなければ False
+    """
+    res = _MATCH_STRIP.sub("", _VAGUE_TOKENS.sub("", _norm(ref)))
+    if not res:
+        return True  # 曖昧な指定＝従来どおり
+    # ひらがなだけの残渣は「あ」等の間投詞や語尾の取りこぼし＝対象を指していない。
+    # 漢字・カタカナ・英数を1文字も含まないなら曖昧扱いにする（語尾のバリエーションを
+    # 列挙で追い続けるのは不可能なので、識別力のある文字種の有無で判定する）。
+    if all("ぁ" <= ch <= "ゟ" for ch in res):
+        return True
+    name = _MATCH_STRIP.sub("", _norm(_display_name(task)))
+    if not name or name == "無題":
+        return True  # 比較材料が無い（無題タスク）→ 従来どおり抑止側に倒す
+    if len(res) == 1:
+        return res in name
+    # 2文字の連続片がどれか1つでも掛かれば「指している可能性あり」とみなす（緩め＝迷ったら
+    # 従来どおり抑止する側。誤破棄を減らすのが目的で、抑止を増やす変更ではない）
+    return any(res[i:i + 2] in name for i in range(len(res) - 1))
+
+
 def _g(o, k):
     return o.get(k) if isinstance(o, dict) else getattr(o, k, None)
 
@@ -205,6 +256,15 @@ class CancelResolver:
         ここに await を1つ挟むと報告が先に配達され、D2 が再発する。
         """
         queued = self._undelivered_candidates()  # ← 同期。await 禁止区間ここから
+        if len(queued) == 1 and not _reference_may_match(req.reference, queued[0]):
+            # E4: 候補は1件だが、ユーザが指した対象とは別物 → **破棄しない**
+            # （実測: 「川の調べ物やめて」で無関係な「琵琶湖の面積」の報告を消していた）。
+            # 2件以上の時と同じ裁定＝誤破棄より誤配達に倒す。
+            logger.info("⚰ 抑止せず（reference 不一致）: ref=%.30s ≠ 「%.30s」",
+                        req.reference, _display_name(queued[0]))
+            await self._report(req, "ごめん、それらしい予約が見つからないよ。"
+                                    "今ちょうど終わったのは別の件だから、そのまま伝えるね。", ok=False)
+            return
         if len(queued) == 1:
             t = queued[0]
             name = _display_name(t)
