@@ -434,6 +434,16 @@ class VoiceLoop:
                 await self.task_store.shutdown()
             except Exception:
                 pass
+        if self.workspace is not None:
+            # E2: 開いたビューアを必ず閉じる。残すと**ランを跨いで画面に居座り**、次セッションの
+            # VLM がそれを「ユーザの画面」として拾って、イブが自分の過去の出力を相手の作業画面
+            # として実況する（実測 2/3ラン）。窓が消える不便より自己観察ループの実害を取る。
+            try:
+                n = self.workspace.close_viewers()
+                if n:
+                    logger.info("表示ウィンドウを %d 個閉じた", n)
+            except Exception:
+                pass
         # feedback worker を先に drain/停止（進行中 add_chunk を rag.shutdown 前に flush 機会を与える。
         # 未完分は watermark 未前進なので次回起動の catch-up が回収＝記憶喪失を作らない）。
         try:

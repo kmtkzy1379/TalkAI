@@ -71,7 +71,14 @@ def register_viewer_capability(registry: CapabilityRegistry, ws: Workspace, *,
     import subprocess
     import sys
 
-    windows: list = []  # 起動中のビューア（死んだものは都度掃除する）
+    # 起動したビューアは **Workspace に持たせる**（VoiceLoop.stop() から閉じられるように）。
+    # E2(実測 2026-08-06): detached のまま放置していたため**ランを跨いで窓が残り**、
+    # 次のセッションで VLM がそれを「ユーザの画面」として拾い、イブが自分の過去の出力を
+    # 相手の作業画面として実況した（2/3ラン）。rep2 は `海.txt` を t=1292 で語ったが、
+    # そのランで実際に作ったのは t=5572（72分後）＝前ランの窓を見ていた。
+    # 当初は「ユーザが見ている窓を勝手に消さない」を優先したが、この自己観察ループの実害
+    # （HANDOFF の D4 が J-3 の表示能力で軽微でなくなる）の方が大きいと判断して反転する。
+    windows: list = ws.viewers
 
     def _show(args: dict) -> str:
         target = ws.paths.resolve((args or {}).get("path", ""))  # 違反は _guard がマーカ化

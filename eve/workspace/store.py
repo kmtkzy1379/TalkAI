@@ -63,6 +63,9 @@ class Workspace:
         self._used = 0
         self._files = 0
         self._scanned_at = 0.0
+        # E2: 開いたビューアの Popen。**停止時に必ず閉じる**（残すとランを跨いで画面に残り、
+        # 次セッションで VLM がそれを「ユーザの画面」として拾って自己観察ループになる）。
+        self.viewers: list = []
 
     # --- ライフサイクル ----------------------------------------------------
 
@@ -177,6 +180,24 @@ class Workspace:
         return f"{name} を消したよ（{_human(freed)} 空いた）。"
 
     # --- 定期の再同期（外部要因のドリフト補正）----------------------------
+
+    def close_viewers(self) -> int:
+        """開いているビューアを全て閉じる（停止時に呼ぶ・同期・raise しない）。
+
+        E2: 閉じないと窓がランを跨いで残り、次セッションの VLM がそれを「ユーザの画面」
+        として拾う（実測 2/3ラン）。ユーザが見ている窓が消える不便より、イブが自分の
+        過去の出力を相手の作業画面として実況する実害の方が大きい、という判断。
+        """
+        closed = 0
+        for p in self.viewers:
+            try:
+                if p.poll() is None:
+                    p.terminate()
+                    closed += 1
+            except Exception:
+                logger.debug("ビューアの終了に失敗（無視）", exc_info=True)
+        self.viewers.clear()
+        return closed
 
     async def maybe_rescan(self, force: bool = False) -> None:
         """再スキャン（子プロセスや人手による台帳外の変更を吸収）。

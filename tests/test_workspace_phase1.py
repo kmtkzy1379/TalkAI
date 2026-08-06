@@ -340,6 +340,40 @@ async def t_e10_leftovers(tmp: Path):
     return ok1 and ok2 and ok3
 
 
+def t_e2_viewer_closed_on_stop(tmp: Path):
+    """E2(実測 2026-08-06): ビューア窓がランを跨いで残り、自己観察ループになっていた。
+
+    detached のまま放置していたため、次セッションで VLM が自分の過去の出力を「ユーザの画面」
+    として拾い、イブがそれを相手の作業画面として実況した（2/3ラン。rep2 は `海.txt` を
+    t=1292 で語ったが、そのランで作ったのは t=5572＝72分後）。実際に検証時点で **26個の
+    ビューアプロセスが残留**していた。
+    停止時に必ず閉じる。GUI は起動しない（fake の Popen で契約だけ検証する）。
+    """
+    from eve.workspace import register_viewer_capability
+
+    class _FakeProc:
+        def __init__(self):
+            self.alive, self.terminated = True, False
+
+        def poll(self):
+            return None if self.alive else 0
+
+        def terminate(self):
+            self.terminated, self.alive = True, False
+
+    ws = _ws(tmp)
+    reg = CapabilityRegistry()
+    register_viewer_capability(reg, ws, max_windows=5)
+    # 起動済みの窓を模して Workspace に積む（capability と同じ置き場を使っていることの確認も兼ねる）
+    procs = [_FakeProc(), _FakeProc(), _FakeProc()]
+    ws.viewers.extend(procs)
+    dead = _FakeProc(); dead.alive = False       # 既に閉じられた窓は数えない
+    ws.viewers.append(dead)
+    n = ws.close_viewers()
+    return (n == 3 and all(p.terminated for p in procs) and not dead.terminated
+            and ws.viewers == [])                # 参照を残さない（次セッションに持ち越さない）
+
+
 def t_location_gate():
     repo = Path(__file__).resolve().parent.parent
     inside, why1 = resolve_workspace_root(str(repo / "ws"))
@@ -421,6 +455,7 @@ async def main():
         check("表示: 登録契約・同期handler・封じ込め・マジックバイト判定", t_viewer_registration(fresh()))
         check("実行: プロファイル配下は実行不可と判定される", t_exec_compatible_gate())
         check("E10 積み残し3件（台帳再同期/.eve_run隠蔽/時間切れ文言）", await t_e10_leftovers(fresh()))
+        check("E2 停止時にビューア窓を閉じる（ラン跨ぎの残留を止める）", t_e2_viewer_closed_on_stop(fresh()))
         check("場所ゲート: リポジトリ配下とドライブ直下を拒否", t_location_gate())
         check("読み書き: 作成/読取/一覧/追記/再帰削除", t_roundtrip(fresh()))
         check("読取: LLM に返す文字数を切る", t_read_cap(fresh()))
