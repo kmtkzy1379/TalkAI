@@ -27,7 +27,12 @@ def register_search_capability(registry: CapabilityRegistry, client: SearchClien
 
     registry.register(Capability(
         name="search_web",
-        description="Webを検索して上位結果のタイトルと概要（スニペット）を得る。調べ物の第一手。"
+        # E5(2026-08-06): 1文目が「タイトルと概要」だけだったため、応答LLM が
+        # `outward_actions()` 経由でそれを読み「ページの中身まで読む手段は持ってない」と
+        # ユーザに答えた（同じランで deep=true を7回実行しており事実と違う）。
+        # deep を含む実態に合わせる。**1文目に括弧を使わない**（`_PAREN` で落ちて文が壊れる）。
+        description="Webを検索して調べ、必要ならページの本文まで読んで要約する。"
+                    "スニペットだけで足りる調べ物の第一手でもある。"
                     "結果が不十分・空振りだったら**別のキーワード**で呼び直してよい"
                     "（同じキーワードの単純反復はしない）。ユーザが「もう一回/最新を調べて」と"
                     "言った時は fresh=true でキャッシュを使わず再検索する。",

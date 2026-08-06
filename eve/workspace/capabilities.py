@@ -97,7 +97,10 @@ def register_viewer_capability(registry: CapabilityRegistry, ws: Workspace, *,
 
     registry.register(Capability(
         name="show_on_screen",
-        description="作業フォルダに保存した画像やテキストを、PCの画面に別ウィンドウで表示する。"
+        # E5: 「保存した」だと既にファイルがある前提に読め、「取ってきて見せる」という
+        # 発想に届かない（SC3 で 0/3）。目的（見せる）を1文目に置く。
+        description="作業フォルダにある画像やテキストを、PCの画面に出してユーザに見せる。"
+                    "言葉で説明しにくいものは、見せた方が早い。"
                     "path に作業フォルダからの相対パスを渡す（画像はそのまま、"
                     "テキストは読める形で出る）。",
         params_schema={"path": {"type": "string", "description": "表示したいファイルの相対パス"}},
@@ -190,7 +193,10 @@ def register_exec_capability(registry: CapabilityRegistry, ws: Workspace, *,
 
     registry.register(Capability(
         name="run_program",
-        description="自分の作業フォルダで、自分が書いたプログラムを実行する。"
+        # E5: 「自分が書いた」だと curl 等の許可済みコマンドを除外して読める（実際には
+        # allowlist にあるものは何でも動かせる。実測で curl による取得も成立している）。
+        description="自分の作業フォルダで、許可されたコマンドやプログラムを実行する。"
+                    "ネットからファイルを取ってくる、作る、変換する、といった作業もこれでできる。"
                     f"program に実行するもの（{'・'.join(sorted(allow_set))} のどれか）、"
                     "args に引数の配列を渡す（例: program=python, args=['hello.py']）。"
                     "作業フォルダの外には出られない。",
