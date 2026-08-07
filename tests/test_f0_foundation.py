@@ -105,6 +105,10 @@ check("1件制: 2つ目を委譲せず今の状況を伝えて聞き返す指示
       "タスクは同時に1つだけ" in tool_sys and "2つ目を委譲せず" in tool_sys)
 check("1件制: 旧「新しい部分だけ別 goal」文言が復活していない",
       "新しく頼む部分だけ" not in tool_sys)
+# 実測 2026-08-07(slot_run2 t=57.9): ゲートに断られた応答LLM が「実行中＋新依頼」を1つの
+# goal に合体させて投げ直した。「2つ目を委譲するな」だけでは塞がらない抜け道の回帰ガード。
+check("1件制: 実行中の内容を新 goal に混ぜ直す抜け道を塞ぐ",
+      "混ぜて出し直さない" in tool_sys and "1つの goal にまとめて" in tool_sys)
 # tools_active=False（自発発話/報告ターン等）ではブロックを出さない（1ホップ抑制と整合）。
 notool_sys = ContextAssembler(system_prompt="SYS").assemble(user_text="x", tools_active=False)[0]["content"]
 check("J-2 ①: tools 無効時は機能ブロックを出さない", "Call-Function" not in notool_sys)
