@@ -21,7 +21,10 @@ $env:PYTHONIOENCODING="utf-8"
 
 ### 前提
 - **セットアップ**: `python -m venv .venv` → `.\.venv\Scripts\pip install -r requirements.txt`
-  （開発時は前作の venv を流用していたが、`requirements.txt` は実 import を反映済みで単体構築できる）
+  **2026-08-08 に v2 専用 `.venv` を実際に作成済**（Python 3.13.3 / torch 2.13.0+cpu / winsdk）。
+  それ以前は前作（`../portfolio8-VLM-AI/venv`）を流用していた。torch は CPU 版で入れる:
+  `pip install torch --index-url https://download.pytorch.org/whl/cpu`。
+  文字ゲート（`VLM_OCR_ENABLED=1`）を使うなら `pip install winsdk` と OCR 言語パック(ja) が要る。
 - **VOICEVOX 起動必須**（`http://127.0.0.1:50021`）。未起動でも落ちないが声が出ない。確認 `curl -s http://127.0.0.1:50021/version`
 - **マイク + イヤホン**（AEC は不採用＝スピーカーだと自分の声を拾う）
 - **`.env` が必要**（`.env.example` をコピーして API キーを入れる）
@@ -54,7 +57,7 @@ VoiceLoop 稼働。話しかけてください。
 
 ## 2. テスト方法
 
-### Tier-1 決定論テスト（API不要・ネットワーク不要・全18ファイルで約11秒）
+### Tier-1 決定論テスト（API不要・ネットワーク不要・全20ファイルで約30秒）
 
 runner は無い（**pytest 未導入**＝`pytest tests/` は動かない）。各ファイルが独立スクリプト。
 
@@ -74,20 +77,24 @@ Get-ChildItem tests\test_*.py | ForEach-Object {
 "PASS $tot / FAIL $fail"
 ```
 
-**実測 2026-07-29: 18ファイル 434件 PASS / FAIL 0**（2回連続一致・flaky なし）
+**実測 2026-08-08: 20ファイル 495件 PASS / FAIL 0**（2回連続一致・flaky なし）
 
 | ファイル | 件数 | ファイル | 件数 |
 |---|---|---|---|
 | test_callfunction_phase1.py | 45 | test_f4_feedback.py | 25 |
-| test_cancel_resolver_phase1.py | 19 | test_f5_speech.py | 61 |
-| test_delivery_checker.py | 10 | test_f6_vlm.py | 44 |
-| test_f0_foundation.py | 53 | test_search_phase1.py | 23 |
-| test_f1_pipeline.py | 26 | test_stt_filter.py | 10 |
-| test_f2_5_integration.py | 4 | test_task_agent_phase1.py | 13 |
-| test_f2_5_robustness.py | 5 | test_task_phase1.py | 14 |
-| test_f2_response.py | 18 | test_voiceloop_wiring.py | 29 |
+| test_cancel_resolver_phase1.py | 15 | test_f5_speech.py | 61 |
+| **test_cleanup.py** | **8** | test_f6_vlm.py | 53 |
+| test_delivery_checker.py | 10 | test_search_phase1.py | 28 |
+| test_f0_foundation.py | 64 | test_stt_filter.py | 10 |
+| test_f1_pipeline.py | 26 | test_task_agent_phase1.py | 13 |
+| test_f2_5_integration.py | 4 | test_task_phase1.py | 18 |
+| test_f2_5_robustness.py | 5 | test_voiceloop_wiring.py | 34 |
+| test_f2_response.py | 18 | **test_workspace_phase1.py** | **23** |
 | test_f3_5_rag.py | 21 | | |
-| test_f3_memory.py | 14 | **合計** | **434** |
+| test_f3_memory.py | 14 | **合計** | **495** |
+
+（`test_cancel_resolver_phase1.py` が 19→15 に減ったのは、1件制で取消の照合LLM を撤去し
+到達不能になったテストを削ったため。死にコードを残さない方針。）
 
 規律: 機能ごと **2回連続 PASS で合格** / 最終統合マージは **5回連続**。
 `test_f6_vlm.py` は例外注入テストで traceback をログ出力するが FAIL ではない。
@@ -107,7 +114,8 @@ $env:SKIP="SRB,SD1,SD2,SD3,SSRC,SVLM,SIDLE,SAUTO,S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,
 
 **`REAL_STATE=1` が重要**: `.env` のフラグ/モデルをそのまま使い、本番の `conversation_history.jsonl` / `rag_memory.jsonl` / `tasks.jsonl` を artifacts に**コピーして**使う（本物は汚れない）。付けないとフラグを強制 ON し記憶が空になるので**実起動の挙動は測れない**（この差が D6 の事故を1か月見逃した原因）。
 
-全20シナリオ。`SKIP` は `名前の _ より前` の完全一致で判定する（例 `SD1`）。
+全35シナリオ（2026-08-08）。`SKIP` は `名前の _ より前` の完全一致で判定する（例 `SD1`）。
+**`ONLY` で絞る方が楽**（2026-08-08 追加）: `$env:ONLY="E15D,S1SLOT"` のように書くと、そのタグだけ回す。
 
 | キー | シナリオ |
 |---|---|
@@ -121,8 +129,19 @@ $env:SKIP="SRB,SD1,SD2,SD3,SSRC,SVLM,SIDLE,SAUTO,S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,
 | `SIDLE` | 3分放置×3の自律発話頻度 |
 | `SAUTO` | 4ラウンド放置の自律発話計測 |
 | `S1`〜`S11` | 検索/タスクの混線・別タスク・別検索・キャンセル・画面移動・深掘り・RAG想起・割り込み・連投・長時間放置・反復ストレス |
+| `SJ1`〜`SJ4` | J-3 複合（作業フォルダ+実行+表示）・実行中の雑談・実行中の取消・複合2件同時 |
+| `SC1`〜`SC3` | 挑戦（未対処・できるか見るだけ）: 自律検索 / 自律タスク実行 / 意図の汲み取り |
+| `S1SLOT` | **タスク1件制**（2026-08-08）。2件目を作らせない・断りが握り潰されない・現在タスクに正しく答える・取消で枠が空く |
+| `E15A`〜`E15G` | **E15 の7類型**（2026-08-08）。単発 / 依頼中の雑談 / 取消タイミング3種 / 2件目の断りと訂正 / 複雑タスク画像DL / 自律タスク / 存在しない語 |
 
-環境変数: `REAL_STATE` / `E2E_ART`（出力先）/ `SKIP`（キーをカンマ区切り）/ `REAL_AUDIO=1`（実スピーカー再生）/ 放置秒の調整 `FULL_IDLE_SEC` `IDLE_NEGLECT_SEC` `SRC_PHASE_SEC` `AUTO_ROUNDS` `AUTO_NEGLECT_SEC` `S10_NEGLECT_SEC`。
+環境変数: `REAL_STATE` / `E2E_ART`（出力先）/ `SKIP`（キーをカンマ区切り）/ **`ONLY`（そのタグだけ回す）** /
+`REAL_AUDIO=1`（実スピーカー再生）/ 放置秒の調整 `FULL_IDLE_SEC` `IDLE_NEGLECT_SEC` `SRC_PHASE_SEC` `AUTO_ROUNDS` `AUTO_NEGLECT_SEC` `S10_NEGLECT_SEC`。
+
+**E2E 判定の書き方（2回続けて踏んだ罠・2026-08-08）**: 固定 `sleep` で判定しない。報告ターンは
+委譲より後に来るので発話が止まっただけでも足りず、実測で判定が4秒早く誤判定した。
+`_wait_speech`（発話が出て静かになるまで）→ `_settle_watching_actives`（パイプラインが静まるまで待ちつつ
+**同時アクティブ数のピーク**を返す）を使う。1件制の不変条件は「同時に1件」であって「2件目を永久に拒否」
+ではないので、**新タスクの差分ではなくピークで測る**。
 
 出力（`E2E_ART` 直下）: `timeline.jsonl`（全イベント）/ `terminal.log` / `summary.json`（handles・latencies・decisions・suppressions・seed_calls・cap_calls・search_calls・tasks_final）/ 記憶の隔離コピー3種。
 **`e2e_logs/` は gitignore**（記憶のコピーを含む）＝残したい結論は docs に転記する。
@@ -154,18 +173,23 @@ $env:SKIP="SRB,SD1,SD2,SD3,SSRC,SVLM,SIDLE,SAUTO,S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,
 | **J-2 Web検索（ddgs スニペット + 深掘り調査）** | `eve/search/`（`client.py` `capability.py` `deep.py`） |
 | **J-3 作業フォルダ（ファイル4能力・128GB 書込ゲート）** | `eve/workspace/`（`paths.py` `store.py` `capabilities.py`） |
 | **J-3 サンドボックス実行（専用アカウント + Job Object）** | `eve/workspace/winexec.py` `runner.py` / `setup_sandbox.py` |
-| **J-3 画面表示（別プロセス Tk ビューア）** | `eve/workspace/viewer.py` |
+| **J-3 画面表示（別プロセス Tk ビューア・`show_on_screen`/`close_window`）** | `eve/workspace/viewer.py` |
 | **報告の配達確認 / barge-in 再配達** | `eve/response/delivery_checker.py` / `voice_loop.py` |
 | **自律発話の改修群（J-2 ①〜③）** | `eve/speech/` `eve/memory/long_term.py` `eve/context_assembler.py` |
+| **タスク1件制 + 取消の照合LLM 撤去**（2026-08-08） | `eve/task/capabilities.py` `eve/task/cancel_resolver.py` |
+| **起動時/終了時のクリーンアップ**（2026-08-08） | `eve/cleanup.py` |
+| **文字ゲート（pHash が拾えない文字変化で VLM を起こす）**（2026-08-08） | `eve/vlm/text_gate.py` |
 
 自律発話の改修群（2026-07-26〜28・すべてコードゲート）:
 ①既出の用件ブロック / ①-b 発話見本の削除 / ②-1,②-2 同内容抑制（bigram 0.25 + 埋め込み 0.87・600秒窓）/ ②-3 記憶の自己参照除外 / ②-4 話題の丸投げ抑制 / ②-5 種の固着解消（クエリ不変時スキップ + メタ要約除外）/ ②-6 時制の混同検出 + 画面不在マーカ / ③ 沈黙バイアスの撤廃。**各ゲートの詳細は `docs/COMPONENT_LOGIC.md` の自律発話節**。
 
 ### 未実装
-UI（Tkinter・本体プロセス側）/ 配線層PORT（vts / run / launcher / app）/ Live2D 連動 / YouTube 配信モード / J-3 の残り（window_op・launch_app・download）/ **(b) 文脈不整合の自己懐疑** / VLM の Gemini Live ストリーム mode。
+UI（Tkinter・本体プロセス側）/ 配線層PORT（vts / run / launcher / app）/ Live2D 連動 / YouTube 配信モード /
+**任意アプリの起動・ウィンドウ操作**（window_op・launch_app。※`download` は `run_program` の curl で実現済み）/
+**(b) 文脈不整合の自己懐疑** / VLM の Gemini Live ストリーム mode。
 
-### J-3 の実測（2026-08-06）
-- **Tier-1: 470 PASS**（J-3 前は 434）。
+### J-3 の実測（2026-08-06・当時の値）
+- **Tier-1: 470 PASS**（J-3 前は 434。**現在は 495**＝上の §2 が正）。
 - **実践通しテスト `tools/ws_e2e_test.py`（実 API）: 14/14**。判定は発話ではなく**実ファイルの状態**。
   S4/S5（エラー自己修復）が **3/3 + 3/3**＝「動かす→エラー→原因を調べる→直す→動く」を
   TaskAgent が1タスク内で完遂している。`TASK_AGENT_MAX_STEPS` を 5→12 にしなければ手数上限で落ちる経路。
@@ -432,6 +456,12 @@ C案が 100% を取るのは**冷たくなる代償**による（「知らない
 **測定で否定され、問題リストから外したもの**（再調査しないこと）:
 - **E7 未知語の知ったかぶり**（2026-08-08）: 上記のとおり測定語の誤り。実際の架空語への
   正直率は baseline で 86〜100%、失敗とされた分も明示ヘッジ付き。実在語への過剰検索は全案 0%。
+  **ユーザによる実機確認（こちらが決定的）**: `tools/e7_probe.py` は tool_call を実行しないので
+  「調べると**言った**」しか測れていない＝「確信度の低い語を実際に検索できるか」の検証にはなっていない。
+  ユーザが実運用の gpt-5.5（検索機能つき）で確認した結果、
+  「ガララワニとは」「橘シェリーの声優」「橘シェリーが最初に潰したもの」がいずれも正答、
+  「遠野ハンナが黒幕だよね？」は**誤った前提をしっかり否定**。存在しない語は検索した上で分からないと答える。
+  → **現状で問題なし。意図的にハルシネーションを起こさせるのも困難で、発生確率は低いと見て許容**（ユーザ裁定）。
 - **画面捏造**: 画面言及 27件を全数 VLM ナレーションと突合し**捏造ゼロ**。`⚠画面捏造の疑い` 2件は「画面」の語だけで発火する検出器の誤検知
 - **D1 時制の誤り（rep2）**: 124秒前の同一セッション発言を正しく参照。ハーネスがセッション全体にキーワード照合するための誤検出
 - **レイテンシ悪化**: 会話（USER_UTTERANCE）は中央 **2.87s / 5秒超 10%** で D5 基準（3.14s / 11%）より良好。全体値 3.22s が悪く見えるのは自律発話（中央 3.77s）の構成比が 18.5%→27.8% に増えたため。同一シナリオ限定では +0.43s（p=0.028）だが**独立単位はラン3対3で原理的に確定不可**＋測定時刻の交絡あり

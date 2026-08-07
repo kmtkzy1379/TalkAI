@@ -20,9 +20,14 @@
 > | ModelRegistry は6 role | **10 role**（`task` `summarize` `search_summarize` `delivery_check` を追加。`vlm_merge` と `youtube` は定義のみで未使用） |
 > | 発話判定の入力は「ランダムRAG2」 | `autonomous_memories(k=3)` ＝ **関連1 + 完全ランダム1 + 重要度1**（`eve/memory/long_term.py`） |
 > | RAGチャンク = フィードバック1 + 応答1 | 実際は **FeedbackLLM 出力のみ**（応答本文は含まない・`eve/feedback/feedback_llm.py`） |
-> | T7 = E2E 4シナリオ | E2E ハーネスは **20シナリオ**（`tools/search_e2e_test.py` の `SCENARIOS`）。T1-T7 の ID は一部だけテスト側に実在する（T1/T3/T7=`tests/test_f1_pipeline.py` / T2=`tests/test_f5_speech.py` / T6=`tests/test_f0_foundation.py`）。**T4・T5 の ID は存在しない**（barge-in は T3 と `tests/test_callfunction_phase1.py` で検証） |
+> | T7 = E2E 4シナリオ | E2E ハーネスは **35シナリオ**（`tools/search_e2e_test.py` の `SCENARIOS`・2026-08-08）。T1-T7 の ID は一部だけテスト側に実在する（T1/T3/T7=`tests/test_f1_pipeline.py` / T2=`tests/test_f5_speech.py` / T6=`tests/test_f0_foundation.py`）。**T4・T5 の ID は存在しない**（barge-in は T3 と `tests/test_callfunction_phase1.py` で検証） |
+> | §9.2 (iii) 真の OS スレッドは「現状ゼロ」 | 本文 §9.2 の表に古い記述が残っている。**上と同じく1本（`vlm-capture`）が稼働中**。この行が本文より優先 |
+> | 画面変化ゲートは pHash のみ | **2段構成**（2026-08-08）。pHash は枠内の文字変化を構造的に拾えない（実測: ほぼ全画面で文字を総入れ替えしても hamming 8 < 閾値12）。二段目に**文字ゲート**（`eve/vlm/text_gate.py`・Windows 組込み OCR）を置き、pHash が静かな時だけ差分10%超で起こす。**pHash 優先**（両方反応する場面では pHash で確定し文字ゲートは参照しない）。**OCR の読み取りは LLM に一切渡さない**（誤読がハルシネの元・外に出るのは bool だけ） |
+> | タスクは同時に複数持てる | **1件制**（2026-08-08 ユーザ裁定）。「依頼を受けてから報告を発話し終えるまで」常に1件。アクティブ(Pending/Running)か未配達の完了報告があれば `delegate_task` を**コードで断る**（`eve/task/capabilities.py`）。取消候補が構造的に1件になるので、取消の照合LLM は撤去した |
 >
 > **中核原理の現状**: surprise の消費者は `should_speak` の1本のみ。**(b) 文脈不整合の自己懐疑は未実装**（§0 の「2点をゲートする」は設計意図であって現状ではない）。
+> なお surprise は `FeedbackWorker` が**応答完了後に非同期で**書く（`eve/feedback/worker.py`）ため、
+> **発話時点で読める値は前ターンの予測差**。「今この語が未知か」の同ターン判定には原理的に使えない（2026-08-08 実測で確認）。
 
 > 本書は新企画書を契約として、**統合パイプラインの骨格**を定義する（実装ステップ②）。
 > 個別機能の深掘りは後続（③優先順位 → ④機能別プランニング）。本書は「まず流れとレイテンシを通す」ための最小骨格と、その不変条件を確定する。
@@ -211,7 +216,7 @@ litellm 等で provider 差を吸収。`feedback_llm.py` の3段 fallback と ca
 |---|---|---|
 | **(i) 単一 asyncio loop** | パイプライン本体。共有状態を所有・書込・読込 | StimulusQueue / Orchestrator / AudioPlayQueue / SurpriseBus / 全サイドカー(F4 FeedbackLLM・F5 発話判定・VLM 推論/統合・task executor・search・screen-op の制御部) / VAD 推論(現状) |
 | **(ii) executor offload** | ブロッキング呼び出しを `run_in_executor`/`asyncio.to_thread` で逃がす。**loop 所有状態に一切触れず、値を返すだけ**。返り値は await したコルーチンが loop 上で適用する | mic read / file I/O(cache・long_term) / embeddings(ruri/openai) / STT(openai/groq) / TTS 再生 / VLM capture(mss) / search fetch / screen-op argv 実行 |
-| **(iii) 真の OS スレッド** | 連続リアルタイム capture が強制する時のみ生成。**loop 所有状態を直接 mutate 禁止**。§9.3 の橋渡し契約で loop に渡す | （現状ゼロ）将来候補=VLM 連続 capture(N fps)・audio callback(PortAudio thread) |
+| **(iii) 真の OS スレッド** | 連続リアルタイム capture が強制する時のみ生成。**loop 所有状態を直接 mutate 禁止**。§9.3 の橋渡し契約で loop に渡す | **1本稼働: `vlm-capture`**（`eve/vlm/capture_thread.py`）。文字ゲートの OCR もこのスレッド内で回す（数秒に1回・約340ms。loop 所有状態には触れず bool を返すだけ）。将来候補=audio callback(PortAudio thread) |
 | **(iv) 別プロセス** | 完全分離・IPC なし | `vts.py`(VTube Studio 制御) |
 
 UI(Tkinter) は別途メインスレッド。widget 更新は `root.after(0, fn)`、UI→loop は `run_coroutine_threadsafe`。

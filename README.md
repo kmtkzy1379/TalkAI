@@ -72,20 +72,31 @@ surprise を反転させると発話/沈黙が反転する death-detection テ�
 | 長期記憶 RAG（Ruri v3 ローカル埋め込み + MMR） | `eve/memory/long_term.py` |
 | 内省 FeedbackLLM（→RAG 書込 + surprise 生成） | `eve/feedback/` |
 | 自発発話（沈黙時に判定LLM + 話題の種 + コードゲート群） | `eve/speech/` |
-| 画面認識 VLM（capture → pHash 変化ゲート → Gemini Flash） | `eve/vlm/` |
+| 画面認識 VLM（capture → pHash + 文字ゲートの2段変化検出 → Gemini Flash） | `eve/vlm/` |
 | Call-Function 能力層（read-only） | `eve/capability/` |
 | 予約タスク / TaskAgent / 取消解決 | `eve/task/` |
 | Web検索（ddgs スニペット + 本文取得の深掘り） | `eve/search/` |
 | 報告の配達確認 / barge-in 後の再配達 | `eve/response/delivery_checker.py` |
 
-**実行できる能力は6つ**: `self_status` / `pc_status`（常時）、
-`delegate_task` / `list_tasks` / `cancel_task`（`TASK_ENABLED=1`）、
-`search_web`（`SEARCH_ENABLED=1` かつ `TASK_ENABLED=1` かつ ddgs 導入時）。
+**実行できる能力は13個**。ただし**応答LLM に見えるのは `delegate_task` / `cancel_task` の2つだけ**で、
+残りは TaskAgent 専用（何をしたいかを振るだけの層と、実際に手を動かす層を分けている）:
+
+| 能力 | 有効条件 |
+|---|---|
+| `self_status` / `pc_status` / `list_tasks` | `TASK_ENABLED=1` |
+| `search_web` | ＋`SEARCH_ENABLED=1` かつ ddgs 導入 |
+| `write_file` / `read_file` / `list_files` / `delete_file` | ＋`WS_ENABLED=1` |
+| `run_program`（専用アカウント + Job Object のサンドボックス） | ＋`WS_EXEC_ENABLED=1`（`setup_sandbox.py apply` 済み） |
+| `show_on_screen` / `close_window`（別ウィンドウ表示） | ＋`WS_VIEWER_ENABLED=1` |
+
+**タスクは同時に1件だけ**。アクティブなタスクか未配達の完了報告がある間、新しい委譲はコードで断られる
+（取消の対象が常に1件に定まるので、取消判定に LLM を使わなくて済む）。
 
 ## 未実装
 
 UI（Tkinter 参照は0件）/ VTube Studio・Live2D 連動（設定値の定義のみ）/ YouTube 配信モード（同）/
-画面操作系（window_op・launch_app 等）/ **文脈不整合の自己懐疑**（surprise の消費者は発話判定のみ）/
+**任意アプリの起動・ウィンドウ操作**（`window_op`・`launch_app`。作業フォルダ内の実行と自前ウィンドウの
+表示はできるが、既存アプリの操作はできない）/ **文脈不整合の自己懐疑**（surprise の消費者は発話判定のみ）/
 `Config.validate()` の呼び出し（起動前チェックは存在しない）。
 
 **作らないと確定したもの**: STT の partial 投機 / AEC（イヤホン前提）/ VLM の複数回 self-consistency。
@@ -123,7 +134,7 @@ $env:PYTHONIOENCODING = "utf-8"   # 日本語+絵文字を出すため必須
 
 ## テスト
 
-**Tier-1 決定論テスト（API・ネットワーク不要）**: 18ファイル・**434 assertion**・約11秒。
+**Tier-1 決定論テスト（API・ネットワーク不要）**: 20ファイル・**495 assertion**・約30秒。
 pytest は使っておらず、各ファイルが独立スクリプトです。
 
 ```powershell
@@ -131,7 +142,7 @@ $env:PYTHONIOENCODING = "utf-8"
 .\.venv\Scripts\python.exe tests\test_f5_speech.py     # 1ファイルずつ実行
 ```
 
-**実機 E2E**（`tools/search_e2e_test.py`・全20シナリオ）は本番の `VoiceLoop` をそのまま起動し、
+**実機 E2E**（`tools/search_e2e_test.py`・全35シナリオ）は本番の `VoiceLoop` をそのまま起動し、
 マイクだけスタブ化して合成音声→実 STT→刺激投入で実機と同じイベント順を再現します。
 
 > ⚠ **実 API 課金が発生し、実際の画面をキャプチャし、メモ帳を自動で開閉します。**

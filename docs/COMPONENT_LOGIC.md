@@ -15,7 +15,8 @@
 > | §F 発話判定の入力「`rag.random` 2件」 | `autonomous_memories(k=3)`＝関連1 + ランダム1 + 重要度1 |
 > | §H A1「最後フレームを取り残さない」 | 判定は **frame_id → 変化フレーム世代(`_change_seq`)** に変更済（旧実装は静止画面で永久自己再トリガした） |
 > | §J search = ddgs + **Scrapling** | Scrapling は**不採用**。ddgs + **curl_cffi** + **trafilatura** + `search_summarize` ロールの隔離要約（`eve/search/deep.py`） |
-> | §J 能力パレット（window_op / download / launch_app） | **未実装**。実在するのは `self_status` `pc_status` `delegate_task` `list_tasks` `cancel_task` `search_web` |
+> | §J 能力パレット（window_op / download / launch_app） | **実在するのは13個**（2026-08-08）。応答LLM に出るのは `delegate_task` `cancel_task` の2つだけで、残りは TaskAgent 専用: `self_status` `pc_status` `list_tasks` `search_web` `write_file` `read_file` `list_files` `delete_file` `run_program` `close_window` `show_on_screen`。**`window_op`／`launch_app` は今も未実装**（J-3 で入ったのは作業フォルダ・サンドボックス実行・別ウィンドウ表示であって、任意アプリの起動やウィンドウ操作ではない） |
+> | 取消は候補が複数ならタスクLLM がファジー照合 | **照合は撤去**（2026-08-08）。**タスク1件制**（アクティブ＋未配達の報告が常に高々1件）を受付ゲートで強制するので、取消候補が構造的に1件しか無く照合の余地が無い。`CancelResolver` は LLM を持たない |
 > | §J「検索結果を StimulusQueue へ再投入」 | `search_web` は `offered=False / agent_tool=True`＝**TaskAgent 専用**。結果は TaskExecutor 経由で `CALLFUNCTION_RESULT` になる |
 > | §N「次はステップ④ Call-Function の実装プランニング」 | J-0 / J-1 / J-2 とも**実装完了**（歴史節） |
 >
