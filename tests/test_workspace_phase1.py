@@ -365,12 +365,25 @@ def t_e2_viewer_closed_on_stop(tmp: Path):
     reg = CapabilityRegistry()
     register_viewer_capability(reg, ws, max_windows=5)
     # 起動済みの窓を模して Workspace に積む（capability と同じ置き場を使っていることの確認も兼ねる）
+    # E12: 窓は `(Popen, 表示中の相対パス)` で持つ（名指しで閉じる/VLM に自分の窓を教えるため）。
     procs = [_FakeProc(), _FakeProc(), _FakeProc()]
-    ws.viewers.extend(procs)
+    ws.viewers.extend([(p, f"f{i}.png") for i, p in enumerate(procs)])
     dead = _FakeProc(); dead.alive = False       # 既に閉じられた窓は数えない
-    ws.viewers.append(dead)
-    n = ws.close_viewers()
-    return (n == 3 and all(p.terminated for p in procs) and not dead.terminated
+    ws.viewers.append((dead, "closed.png"))
+    ok_names = ws.open_window_names() == ["f0.png", "f1.png", "f2.png"]  # 死んだ窓は出さない
+
+    # close_window: 名指しで1つだけ閉じ、他は残す。
+    r1 = reg.execute("close_window", {"path": "f1.png"})
+    ok_one = (procs[1].terminated and not procs[0].terminated and not procs[2].terminated
+              and "f1.png" in r1 and ws.open_window_names() == ["f0.png", "f2.png"])
+    # 開いていない窓を指したら、閉じずに今開いている物を答える（捏造しない）。
+    r_miss = reg.execute("close_window", {"path": "nope.png"})
+    ok_miss = ("開いてない" in r_miss and "f0.png" in r_miss
+               and not procs[0].terminated and not procs[2].terminated)
+
+    n = ws.close_viewers()                       # 引数なし＝全部（停止時と同じ経路）
+    return (ok_names and ok_one and ok_miss
+            and n == 2 and all(p.terminated for p in procs) and not dead.terminated
             and ws.viewers == [])                # 参照を残さない（次セッションに持ち越さない）
 
 

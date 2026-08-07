@@ -36,12 +36,22 @@ VLM_SYSTEM = (
 )
 
 
-def build_messages(frames: list[Frame]) -> list[dict]:
-    """litellm multimodal messages（OpenAI 形式; gemini 経路で inline_data に変換される）。"""
-    content: list[dict] = [{
-        "type": "text",
-        "text": f"連続スクリーンショット {len(frames)} 枚（古い順・最後が今）。今の画面を実況して。",
-    }]
+def build_messages(frames: list[Frame], own_windows: tuple = ()) -> list[dict]:
+    """litellm multimodal messages（OpenAI 形式; gemini 経路で inline_data に変換される）。
+
+    `own_windows` = イブ自身が `show_on_screen` で開いている窓のファイル名。
+
+    E11（実測 2026-08-06/08-07）: これを渡さないと、イブが7秒前に自分で開いた窓を VLM が
+    「デスクトップ上に…が新規に開かれています」とユーザの画面変化として実況し、イブが
+    自分の出力を相手の作業として語る自己観察ループになる。窓を消すのではなく**誰が開いたかを
+    教える**方が副作用が無い（ユーザが見ている窓を勝手に閉じずに済む）。
+    """
+    head = f"連続スクリーンショット {len(frames)} 枚（古い順・最後が今）。今の画面を実況して。"
+    if own_windows:
+        head += ("\nなお次のウィンドウは**あなた自身（イブ）が開いたもの**で、ユーザの作業ではない: "
+                 + "・".join(own_windows)
+                 + "。これらを『ユーザが開いた/新しく現れた』とは言わず、実況の主役にしない。")
+    content: list[dict] = [{"type": "text", "text": head}]
     for f in frames:
         content.append({
             "type": "image_url",
@@ -61,10 +71,20 @@ def _content_of(resp: object) -> str:
         return ""
 
 
-def make_narrate_fn(registry) -> NarrateFn:
-    """ModelRegistry の `vlm_leaf` を叩く本番 narrate_fn。"""
+def make_narrate_fn(registry, own_windows_fn=None) -> NarrateFn:
+    """ModelRegistry の `vlm_leaf` を叩く本番 narrate_fn。
+
+    `own_windows_fn` は呼び出しのたびに評価する（窓は開閉するのでスナップショットにしない）。
+    未接続（作業フォルダ無効）なら従来どおり何も足さない。
+    """
     async def narrate(frames: list[Frame]) -> VisionResult:
-        resp = await registry.complete("vlm_leaf", build_messages(frames))
+        own: tuple = ()
+        if own_windows_fn is not None:
+            try:
+                own = tuple(own_windows_fn())
+            except Exception:  # 自己認識の失敗で画面認識ごと落とさない
+                logger.debug("自分の窓一覧の取得に失敗（注入なしで継続）", exc_info=True)
+        resp = await registry.complete("vlm_leaf", build_messages(frames, own))
         return parse_vision(_content_of(resp))
 
     return narrate

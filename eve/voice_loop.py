@@ -85,7 +85,13 @@ class VoiceLoop:
         # 1回の multi-frame 呼び出しで実況化→latest_vision/note_vlm_surprise→ガード付き発話トリガ。
         self.vlm_worker = VlmWorker(
             vision_state=self.vision_state, prediction_state=self.prediction,
-            narrate_fn=make_narrate_fn(self.registry),  # role=vlm_leaf
+            # E11: 自分が開いた窓を「ユーザの画面変化」として実況しないよう、毎回名前を渡す
+            # （`self.workspace` は下の WS_ENABLED ブロックで後から確定するので遅延 lambda）。
+            narrate_fn=make_narrate_fn(  # role=vlm_leaf
+                self.registry,
+                own_windows_fn=lambda: (self.workspace.open_window_names()
+                                        if self.workspace is not None else ()),
+            ),
             speak_trigger=lambda: self.speech_decider.trigger("vlm"),  # source は観測用（③分析の反省）
             speak_guard=self._vision_can_speak,  # A5/Q4: busy/ユーザ発話中/decider 処理中なら叩かない
             frames_per_call=Config.VLM_MAX_FRAMES_PER_CALL,

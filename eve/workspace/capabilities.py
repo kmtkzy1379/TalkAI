@@ -84,11 +84,13 @@ def register_viewer_capability(registry: CapabilityRegistry, ws: Workspace, *,
         target = ws.paths.resolve((args or {}).get("path", ""))  # 違反は _guard がマーカ化
         if not target.is_file():
             return f"{ws.paths.relative(target)} は見つからなかった。list_files で確認してみて。"
-        windows[:] = [p for p in windows if p.poll() is None]
-        if len(windows) >= max_windows:
-            # 古い窓を勝手に閉じない（ユーザが見ているものを消す方が迷惑）
-            return (f"表示中のウィンドウが{len(windows)}個あるから、これ以上は開けなかった。"
-                    "いらない窓を閉じてから、もう一度言ってね。")
+        live = ws.live_viewers()
+        if len(live) >= max_windows:
+            # 古い窓を勝手に消さない（ユーザが見ているものを閉じる方が迷惑）。ただし
+            # E12: 昔は閉じる手段が無く、上限に当たるとイブは自力で回復できなかった。
+            names = "・".join(n for (_p, n) in live)
+            return (f"表示中のウィンドウが{len(live)}個（{names}）あるから、これ以上は開けなかった。"
+                    "close_window で閉じてから、もう一度出してね。")
         try:
             proc = subprocess.Popen(
                 [sys.executable, "-m", "eve.workspace.viewer", str(target), str(ws.paths.root)],
@@ -99,8 +101,30 @@ def register_viewer_capability(registry: CapabilityRegistry, ws: Workspace, *,
         except Exception as e:
             logger.exception("ビューアの起動に失敗")
             return f"（画面に出せなかった: {type(e).__name__}）"
-        windows.append(proc)
-        return f"{ws.paths.relative(target)} を別ウィンドウで画面に出したよ。"
+        name = ws.paths.relative(target)
+        windows.append((proc, name))
+        return f"{name} を別ウィンドウで画面に出したよ。"
+
+    def _close(args: dict) -> str:
+        match = ((args or {}).get("path") or "").strip()
+        live = ws.live_viewers()
+        if not live:
+            return "今わたしが開いてる窓は無いよ。"
+        if match and not any(match in n for (_p, n) in live):
+            names = "・".join(n for (_p, n) in live)
+            return f"{match} の窓は開いてないよ。今開いてるのは {names}。"
+        n = ws.close_viewers(match)
+        return (f"{match} の窓を閉じたよ。" if match else f"開いてた窓を{n}個ぜんぶ閉じたよ。")
+
+    registry.register(Capability(
+        name="close_window",
+        # E12: 表示だけ与えて閉じる手段が無かったため、5窓の上限に当たるとイブは自力で
+        # 回復できず、窓は停止時まで残り続けた（＝E11 の自己観察ループの燃料になっていた）。
+        description="自分が show_on_screen で開いたウィンドウを閉じる。"
+                    "見せ終わったら閉じてよい。path 省略で全部、指定するとその窓だけ。",
+        params_schema={"path": {"type": "string", "description": "閉じたい窓のファイル名（省略=全部）"}},
+        handler=_close, offered=False, agent_tool=True, mutates_state=True,
+    ))
 
     registry.register(Capability(
         name="show_on_screen",

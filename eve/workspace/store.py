@@ -63,8 +63,10 @@ class Workspace:
         self._used = 0
         self._files = 0
         self._scanned_at = 0.0
-        # E2: 開いたビューアの Popen。**停止時に必ず閉じる**（残すとランを跨いで画面に残り、
-        # 次セッションで VLM がそれを「ユーザの画面」として拾って自己観察ループになる）。
+        # E2: 開いたビューアを `(Popen, 表示中の相対パス)` で持つ。**停止時に必ず閉じる**
+        # （残すとランを跨いで画面に残り、次セッションで VLM がそれを「ユーザの画面」として
+        # 拾って自己観察ループになる）。名前を持つのは E11 のため: VLM に「この窓は自分が
+        # 開いたもの」と伝えるにも、`close_window` で名指しで閉じるにも、実体が要る。
         self.viewers: list = []
 
     # --- ライフサイクル ----------------------------------------------------
@@ -181,22 +183,48 @@ class Workspace:
 
     # --- 定期の再同期（外部要因のドリフト補正）----------------------------
 
-    def close_viewers(self) -> int:
-        """開いているビューアを全て閉じる（停止時に呼ぶ・同期・raise しない）。
+    def live_viewers(self) -> list:
+        """生きている窓だけに間引いて返す（`[(Popen, 相対パス)]`・同期・raise しない）。
+
+        ユーザが窓の × を押して閉じた分をここで落とす＝「開いている」の唯一の判定。
+        """
+        alive = []
+        for item in self.viewers:
+            try:
+                if item[0].poll() is None:
+                    alive.append(item)
+            except Exception:
+                logger.debug("ビューアの生存確認に失敗（閉じたとみなす）", exc_info=True)
+        self.viewers[:] = alive
+        return alive
+
+    def open_window_names(self) -> list[str]:
+        """いま自分が開いている窓のファイル名（VLM への自己認識注入・E11 用）。"""
+        return [n for (_p, n) in self.live_viewers()]
+
+    def close_viewers(self, match: str = "") -> int:
+        """開いているビューアを閉じる（停止時 / `close_window` から・同期・raise しない）。
+
+        `match` 空 = 全部。指定時はファイル名の部分一致だけ閉じる。
 
         E2: 閉じないと窓がランを跨いで残り、次セッションの VLM がそれを「ユーザの画面」
         として拾う（実測 2/3ラン）。ユーザが見ている窓が消える不便より、イブが自分の
         過去の出力を相手の作業画面として実況する実害の方が大きい、という判断。
         """
-        closed = 0
-        for p in self.viewers:
+        closed, keep = 0, []
+        for item in self.viewers:
+            p, name = item
             try:
-                if p.poll() is None:
-                    p.terminate()
-                    closed += 1
+                if p.poll() is not None:          # 既に閉じている
+                    continue
+                if match and match not in name:   # 対象外は残す
+                    keep.append(item)
+                    continue
+                p.terminate()
+                closed += 1
             except Exception:
                 logger.debug("ビューアの終了に失敗（無視）", exc_info=True)
-        self.viewers.clear()
+        self.viewers[:] = keep
         return closed
 
     async def maybe_rescan(self, force: bool = False) -> None:

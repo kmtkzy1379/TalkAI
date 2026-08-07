@@ -1372,7 +1372,92 @@ async def sc3_infer_intent(h: Harness):
     await h.wait_idle()
 
 
+async def s1s_single_slot(h: Harness):
+    """1件制（2026-08-07 裁定）の通し検証。
+
+    検証項目（ユーザ指定）:
+    (1) タスク稼働中の2件目は**作られない**
+    (2) 断りが**声に出る**（`（`始まりでないと dispatcher が握り潰す＝実測で確認した罠の回帰ガード）
+    (3) 断り文が**今なにを抱えているかを正しく言う**（捏造しない）
+    (4) 「今なにかやってる?」に**正しく答えられる**（捏造しない）
+    (5) 取り消せば枠が空き、同じ依頼が**今度は通る**
+    """
+    _h_ref["h"] = h
+    _ws_clear()
+    known = {t.task_id for t in h.goal_tasks()}
+    prep2 = await h.prep("それとね、沖縄の人口も調べてほしいな。")
+    prep_ask = await h.prep("ねえ、今なにかやってるタスクってある?")
+    prep_cancel = await h.prep("さっきのやつ、やっぱりやめていいよ。")
+    prep_retry = await h.prep("じゃあ沖縄の人口を調べて教えて。")
+
+    # **長いタスクを使う**: 検索だけだと7秒で終わり、枠が埋まっている窓が短すぎて
+    # (4)(5) が空振りする（実測 slot_run1）。複合タスクは実測 60〜190s 枠を握る。
+    await h.say("1から100までの素数を求める Python のプログラムを作業フォルダに作って動かして、"
+                "結果を primes.txt に保存して画面に出して。", must=("素数",))
+    tk1 = await h.wait_new_task(known)
+    await asyncio.sleep(8.0)  # Running に入るまで
+
+    # (1)(2)(3) 稼働中に別依頼 → 作らせない・断りが声に出る・抱えている物を正しく言う
+    n_before = len(h.goal_tasks())
+    mark = time.monotonic()
+    await h.say_prepared(prep2, must=("沖縄",))
+    rej = await h.wait_report(dedup_prefix="cf:", after=mark, timeout=45)
+    # 断りは2通りの正解がある: (a) 応答LLM が system の `# 予約タスク` を見て**そもそも呼ばない**
+    # （最善・slot_run1 で実際に起きた）/ (b) 呼んでコードゲートに断られる。両方 OK。
+    ev("ℹ", f"1SLOT 断りの経路: {'コードゲート: ' + rej[2][:100] if rej else 'LLM が自制して呼ばなかった'}")
+    if rej:
+        ev("✅" if "素数" in rej[2] else "❌", f"1SLOT 断り文が抱えている物を名指し: {rej[2][:100]!r}")
+        ev("✅" if rej[2].startswith("（") else "❌",
+           "1SLOT 断りが「（」始まり＝握り潰されない")
+    await asyncio.sleep(12.0)  # 断りを喋るターンを待つ
+    n_after = len(h.goal_tasks())
+    ev("✅" if n_after == n_before else "❌", f"1SLOT 2件目を作らせない: {n_before}→{n_after}件")
+    spoken = " ".join(t for (m, _k, _d, t, _c) in h.handles if m >= mark)
+    ev("✅" if spoken.strip() else "❌", f"1SLOT 断りの発話: {spoken[:180]!r}")
+    # 捏造ガード: まだ調べていないのに沖縄の人口を数字で答えていないか。
+    import re as _re
+    guessed = bool(_re.search(r"沖縄[^。]{0,20}?(万人|人口は[約\d])", spoken))
+    ev("❌" if guessed else "✅", f"1SLOT 未実行の依頼に数字で答えない(捏造): {'答えた' if guessed else '答えず'}")
+
+    # (4) 「今なにかやってる?」に正しく答える（捏造していないか）
+    mark2 = time.monotonic()
+    still = [t for t in h.goal_tasks() if t.status in ("Pending", "Running")]
+    await h.say_prepared(prep_ask, must=("今",))
+    await asyncio.sleep(10.0)
+    ans = " ".join(t for (m, _k, _d, t, _c) in h.handles if m >= mark2)
+    if still:
+        ev("✅" if ("素数" in ans or "プログラム" in ans) else "❌",
+           f"1SLOT 稼働中に現在タスクを正しく答える: {ans[:150]!r}")
+    else:
+        ev("ℹ", f"1SLOT 質問時点で枠は空だった（答え: {ans[:120]!r}）")
+    ev("❌" if "沖縄" in ans and "調べ" not in ans else "✅",
+       f"1SLOT 受けていない依頼を抱えていると言わない(捏造): {'沖縄' in ans}")
+
+    # (5) 取消 → 枠が空く → 同じ依頼が通る
+    mark3 = time.monotonic()
+    await h.say_prepared(prep_cancel, must=("やめ",))
+    crep = await h.wait_report(dedup_prefix="cancel:", after=mark3, timeout=60)
+    ev("✅" if crep else "❌", f"1SLOT 取消報告: {crep[2][:120] if crep else '届かず'}")
+    if crep and tk1 is not None:
+        st = h.vl.task_store.get(tk1.task_id)
+        said_stopped = "止めた" in crep[2] or "終わってた" in crep[2]
+        真 = (st is not None and st.status in ("Cancelled", "Done", "Failed"))
+        ev("✅" if said_stopped and 真 else "❌",
+           f"1SLOT 取消報告が実状態と一致(捏造なし): 報告={crep[2][:60]!r} 実status={st.status if st else '?'}")
+    await h.wait_idle()
+    known2 = {t.task_id for t in h.goal_tasks()}
+    mark4 = time.monotonic()
+    await h.say_prepared(prep_retry, must=("沖縄",))
+    tk2 = await h.wait_new_task(known2, timeout=60)
+    ev("✅" if tk2 else "❌", f"1SLOT 取消後は同じ依頼が通る: {tk2.goal[:40] if tk2 else '通らず'}")
+    if tk2 is not None:
+        rep = await h.wait_report(dedup=f"task:{tk2.task_id}", timeout=240)
+        ev("✅" if rep else "❌", f"1SLOT 再依頼の報告: {rep[2][:120] if rep else '届かず'}")
+    await h.wait_idle()
+
+
 SCENARIOS = [
+    ("S1SLOT_タスク1件制", s1s_single_slot),
     ("SRB_再起動時の挙動", sreboot),
     ("SD1_前セッション未応答依頼", sd1_stale_request),
     ("SD3_能力境界", sd3_capability_boundary),
@@ -1414,11 +1499,14 @@ async def main() -> None:
     logging.getLogger("primp").setLevel(logging.WARNING)  # ddgs auto の HTTP ノイズ
 
     skip = set((os.getenv("SKIP") or "").replace(" ", "").split(","))
+    # ONLY=S1SLOT,S4 で一部だけ回す（修正直後の的を絞った検証用。既定は全件）。
+    only = set(x for x in (os.getenv("ONLY") or "").replace(" ", "").split(",") if x)
     h = Harness()
     await h.start()
     try:
         for name, fn in SCENARIOS:
-            if name.split("_")[0] in skip:
+            tag = name.split("_")[0]
+            if tag in skip or (only and tag not in only):
                 ev("⏭", f"skip {name}")
                 continue
             ev("═══", name)

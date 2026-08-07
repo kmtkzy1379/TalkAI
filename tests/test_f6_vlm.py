@@ -585,6 +585,45 @@ async def t_notable_guarded_trigger() -> bool:
 
 
 # ===== capture / capture_thread（grab は注入・mss 不使用）=====
+def t_own_windows_declared() -> bool:
+    """E11: 自分が show_on_screen で開いた窓を VLM に「自分のもの」と申告する。
+
+    実測（2026-08-06/08-07）: 申告しないと、7秒前に自分で開いた窓を VLM が
+    「デスクトップ上に…が新規に開かれています」とユーザの画面変化として実況し、
+    イブが自分の出力を相手の作業として語る自己観察ループになる。
+    """
+    from eve.vlm.narrator import build_messages
+    from eve.vlm.types import Frame
+    frames = [Frame(frame_id=1, mono_ts=0.0, jpeg_b64="x")]
+    head = build_messages(frames, ("primes.txt", "grid.png"))[1]["content"][0]["text"]
+    return ("primes.txt" in head and "grid.png" in head
+            and "あなた自身" in head and "ユーザの作業ではない" in head)
+
+
+async def t_own_windows_absent_or_broken() -> bool:
+    """窓ゼロ／provider が例外でも、余計な文を足さず画面認識を落とさない。"""
+    from eve.vlm.narrator import build_messages, make_narrate_fn
+    from eve.vlm.types import Frame
+    frames = [Frame(frame_id=1, mono_ts=0.0, jpeg_b64="x")]
+    plain = build_messages(frames, ())[1]["content"][0]["text"]
+    if "あなた自身" in plain:
+        return False
+
+    seen = {}
+
+    class _Reg:
+        async def complete(self, role, messages, **kw):
+            seen["text"] = messages[1]["content"][0]["text"]
+            return {"choices": [{"message": {"content": "narration: ok\nvisible: yes"}}]}
+
+    def _boom():
+        raise RuntimeError("窓一覧の取得に失敗")
+
+    res = await make_narrate_fn(_Reg(), own_windows_fn=_boom)(frames)
+    # 例外は握って注入なしで続行（画面認識ごと落とさない）
+    return res.visible and "あなた自身" not in seen.get("text", "")
+
+
 def t_capture_blank_and_valid() -> bool:
     import numpy as np
 
@@ -679,6 +718,8 @@ async def main() -> None:
     check("vision を応答文脈に注入(# 画面)", await t_vision_injected_into_messages())
     check("⭐画面不在マーカ: 無い事を明示し捏造を禁じる(3値規約)", await t_vision_absence_marker())
     check("⭐配線: 画面情報なしは None でなく不在明示を渡す", await t_orchestrator_reports_vision_absence())
+    check("E11 自分が開いた窓は VLM に自己申告する", t_own_windows_declared())
+    check("E11 窓ゼロ/取得失敗では余計な文を足さない", await t_own_windows_absent_or_broken())
     # capture / capture_thread
     check("capture: 黒→blank / 通常→有効 b64+phash", t_capture_blank_and_valid())
     check("capture_thread step: gate→deliver 橋渡し", t_capture_thread_step_delivers())
