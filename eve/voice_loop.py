@@ -382,10 +382,31 @@ class VoiceLoop:
         # F6: 画面認識を起動（既定 off）。capture スレッドは loop 確定後に生成し on_frame を橋渡し。
         if Config.VLM_ENABLED:
             self.vlm_worker.start()
+            # 文字ゲート（既定 off）: pHash は枠内の文字変化を拾えない（実測 pHash 一致
+            # 15/15 ペアで画素完全一致 0/15）。OCR の読み取りは **LLM に渡さない**。
+            # 生成はキャプチャスレッド開始前だが、winsdk の初期化はここ（loop 上）で1回だけ。
+            text_gate = None
+            if Config.VLM_OCR_ENABLED:
+                from .vlm.text_gate import ScreenTextGate, WindowsOcr
+                ocr = WindowsOcr()
+                if ocr.available:
+                    cap = self.vlm_capture
+                    text_gate = ScreenTextGate(
+                        ocr=ocr,
+                        grab_png=lambda: cap.grab_png(Config.VLM_OCR_DOWNSCALE),
+                        diff_threshold_pct=Config.VLM_OCR_DIFF_PCT,
+                        interval_sec=Config.VLM_OCR_INTERVAL_SEC,
+                    )
+                    logger.info("文字ゲート 稼働（%s・%.0f%%以上の変化・最短%.0f秒間隔）",
+                                ocr.lang, Config.VLM_OCR_DIFF_PCT, Config.VLM_OCR_INTERVAL_SEC)
+                else:
+                    # 起動時 fail-soft（ddgs 未導入時と同流儀）: 文字ゲートだけ無効化して続行。
+                    logger.warning("VLM_OCR_ENABLED=1 だが OCR を初期化できないため文字ゲートを"
+                                   "無効化（pip install winsdk / OCR 言語パックを確認）")
             self.capture_thread = CaptureThread(
                 capture=self.vlm_capture, change_detector=self.vlm_change_detector,
                 deliver=self.vlm_worker.on_frame, loop=asyncio.get_running_loop(),
-                target_fps=Config.VLM_TARGET_FPS,
+                target_fps=Config.VLM_TARGET_FPS, text_gate=text_gate,
             )
             self.capture_thread.start()
             logger.info("画面認識(VLM) 稼働")

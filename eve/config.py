@@ -164,6 +164,13 @@ class Config:
     # `vision_for_user` が「N秒前の画面。以降ずっと変化なし」を自動付与するので誤解は生じない。
     VLM_STATIC_VISION_MAX_SEC = float(os.getenv("VLM_STATIC_VISION_MAX_SEC", "1800.0"))
     VLM_BLANK_STD_THRESHOLD = float(os.getenv("VLM_BLANK_STD_THRESHOLD", "6.0"))  # 黒/空白検出（std 未満=取得不可・A11）
+    # 文字ゲート（pHash が拾えない「枠内の文字だけの変化」で VLM を起こす二段目）。
+    # 実測 2026-08-07: pHash 一致 15/15 ペアで画素完全一致 0/15・OCR 差分は最大24%＝pHash は
+    # 文字変化を見ていない。OCR の読み取りは **LLM に一切渡さない**（誤読がハルシネの元）。
+    VLM_OCR_ENABLED = os.getenv("VLM_OCR_ENABLED", "0") == "1"  # 既定 off（.env で明示 on）
+    VLM_OCR_DIFF_PCT = float(os.getenv("VLM_OCR_DIFF_PCT", "10.0"))  # 何%変われば起こすか（鈍め）
+    VLM_OCR_INTERVAL_SEC = float(os.getenv("VLM_OCR_INTERVAL_SEC", "3.0"))  # OCR の最短間隔
+    VLM_OCR_DOWNSCALE = int(os.getenv("VLM_OCR_DOWNSCALE", "1600"))  # OCR 用キャプチャの長辺
 
     # Call-Function（J-0 即時 Call-Function・increment 1 は read-only 能力のみ）。
     CALLFUNCTION_ENABLED = os.getenv("CALLFUNCTION_ENABLED", "0") == "1"  # 既定 off（実機で明示 on）

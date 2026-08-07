@@ -30,7 +30,8 @@ $env:PYTHONIOENCODING="utf-8"
 ```
 
 - **`$env:PYTHONIOENCODING="utf-8"` は必須**（日本語＋絵文字を出すので付けないと cp932 で落ちる）
-- venv は v1 のものを流用（v2 に venv は無い）。pytest は未導入＝`pytest tests/` は動かない
+- venv は **v2 専用の `.venv`**（2026-08-08 に作成。以前は v1 のものを流用していた）。
+  Python 3.13.3 / torch は CPU 版。pytest は未導入＝`pytest tests/` は動かない
 - **機能フラグは `.env` で明示する**（下記）
 
 ## 中核原理（最優先・絶対に薄めない）

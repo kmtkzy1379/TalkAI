@@ -67,6 +67,26 @@ class ScreenCapture:
         self._counter += 1
         return frame, phash
 
+    def grab_png(self, downscale_max: int = 1600) -> bytes:
+        """OCR（文字ゲート）用に1枚を **PNG=可逆** で返す。失敗は空 bytes。
+
+        VLM 送信用は 1024/JPEG q70 に落としてある（トークンとレイテンシのため）が、
+        その画質で OCR すると読字が落ちてノイズ床が上がる。文字ゲートは**送信しない**ので
+        解像度と可逆性を落とす理由が無い。実測（`tools/ocr_bench.py --controlled` 1600/PNG）:
+        真ノイズ床 最大0.23% / 1行変更 2.89% ＝ 分離比 12.6倍。
+
+        同じスレッド（`vlm-capture`）からしか呼ばれないので mss インスタンスを共有してよい。
+        """
+        import cv2
+
+        bgr = (self._grab_fn or self._grab_mss)()
+        h, w = bgr.shape[:2]
+        if downscale_max and max(h, w) > downscale_max:
+            scale = downscale_max / max(h, w)
+            bgr = cv2.resize(bgr, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
+        ok, buf = cv2.imencode(".png", bgr)
+        return buf.tobytes() if ok else b""
+
     def close(self) -> None:
         if self._sct is not None:
             try:

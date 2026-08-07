@@ -30,10 +30,12 @@ class CaptureThread:
         loop,
         target_fps: float = 2.0,
         schedule: Callable[..., None] | None = None,  # テスト注入用（既定 loop.call_soon_threadsafe）
+        text_gate=None,  # 任意: ScreenTextGate（pHash が拾えない文字変化の二段目）
     ) -> None:
         self._capture = capture
         self._detector = change_detector
         self._deliver = deliver
+        self._text_gate = text_gate
         self._loop = loop
         self._interval = 1.0 / target_fps if target_fps > 0 else 0.5
         self._schedule = schedule or (lambda *a: self._loop.call_soon_threadsafe(*a))
@@ -60,6 +62,15 @@ class CaptureThread:
             logger.exception("画面キャプチャ失敗 → キャプチャ停止（視覚なしで継続・A10）")
             return False
         changed = self._detector.evaluate(phash)
+        if self._text_gate is not None:
+            # **pHash 優先**（ユーザ裁定 2026-08-08）: 文字がぎっしり詰まったタブを閉じると
+            # pHash と文字ゲートが同時に反応する。二重に VLM を起こさないよう、pHash が
+            # 変化と言ったらそこで確定し、文字ゲートは**見ずに基準だけ取り直す**
+            # （直後に文字ゲートが追い撃ちするのを防ぐ）。
+            if changed:
+                self._text_gate.reset()
+            elif self._text_gate.maybe_changed():
+                changed = True
         self._schedule(self._deliver, frame, changed)  # ループ上へ橋渡し（単一書込はループ側）
         return True
 

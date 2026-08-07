@@ -624,6 +624,177 @@ async def t_own_windows_absent_or_broken() -> bool:
     return res.visible and "あなた自身" not in seen.get("text", "")
 
 
+# ===== 文字ゲート（pHash が拾えない枠内の文字変化）=====
+class _FakeOcr:
+    """注入用 OCR。`texts` を順に返す。available=False で「使えない」も再現できる。"""
+
+    def __init__(self, texts, available=True, raise_on=None):
+        self.texts = list(texts)
+        self.available = available
+        self.calls = 0
+        self._raise_on = raise_on
+
+    def read(self, png):
+        self.calls += 1
+        if self._raise_on is not None and self.calls == self._raise_on:
+            return ""  # 実装は例外を握って空文字を返す契約
+        return self.texts[min(self.calls - 1, len(self.texts) - 1)]
+
+
+_T_BASE = "予約タスクは同時に一件だけ受け付ける。画面認識は毎秒二回のキャプチャで動作する。" \
+          "エラーが出たら自分で検索して解決策を探す。応答レイテンシの中央値は三点一四秒だった。"
+_T_SMALL = _T_BASE.replace("三点一四秒", "三点二〇秒")          # ごく一部だけ変わった
+_T_BIG = "全然ちがう内容の画面になった。ここには前の文章の痕跡はひとつも残っていない。" \
+         "別のアプリケーションが最前面に来て、表示されている文字列が総入れ替えになった。"
+
+
+def t_text_gate_threshold() -> bool:
+    """初回は基準作りだけ・小変化は無視・大変化で True（既定10%＝鈍め）。"""
+    from eve.vlm.text_gate import ScreenTextGate, diff_pct
+    clock = [0.0]
+    ocr = _FakeOcr([_T_BASE, _T_SMALL, _T_BIG])
+    g = ScreenTextGate(ocr=ocr, grab_png=lambda: b"png", diff_threshold_pct=10.0,
+                       interval_sec=3.0, now_fn=lambda: clock[0])
+    first = g.maybe_changed()          # 基準を作るだけ
+    clock[0] += 3.0
+    small = g.maybe_changed()          # 小変化 → 起こさない
+    clock[0] += 3.0
+    big = g.maybe_changed()            # 大変化 → 起こす
+    return (first is False and small is False and big is True
+            and diff_pct(_T_BASE, _T_BASE) == 0.0
+            and diff_pct(_T_BASE, _T_SMALL) < 10.0 < diff_pct(_T_BASE, _T_BIG))
+
+
+def t_text_gate_interval() -> bool:
+    """最短間隔を守る（毎フレーム OCR を回さない＝負荷 floor）。"""
+    from eve.vlm.text_gate import ScreenTextGate
+    clock = [0.0]
+    ocr = _FakeOcr([_T_BASE])
+    g = ScreenTextGate(ocr=ocr, grab_png=lambda: b"png", interval_sec=3.0,
+                       now_fn=lambda: clock[0])
+    g.maybe_changed()                  # 1回目（基準）
+    calls_after_first = ocr.calls
+    for _ in range(5):                 # 間隔内は何回呼ばれても OCR しない
+        clock[0] += 0.5
+        g.maybe_changed()
+    within = ocr.calls == calls_after_first
+    clock[0] += 3.0
+    g.maybe_changed()
+    return within and ocr.calls == calls_after_first + 1
+
+
+def t_text_gate_reset_and_short() -> bool:
+    """reset で基準を捨てる（pHash 優先の追い撃ち防止）/ 文字が少ない画面は判定しない。"""
+    from eve.vlm.text_gate import ScreenTextGate
+    clock = [0.0]
+    ocr = _FakeOcr([_T_BASE, _T_BIG])
+    g = ScreenTextGate(ocr=ocr, grab_png=lambda: b"png", interval_sec=0.0,
+                       now_fn=lambda: clock[0])
+    g.maybe_changed()                  # 基準 = _T_BASE
+    g.reset()                          # pHash が変化を検出した想定
+    after_reset = g.maybe_changed()    # 基準が無いので大変化でも起こさない（作り直すだけ）
+    # 文字がほとんど無い画面（動画/ゲーム/真っ黒）は判定しない。
+    g2 = ScreenTextGate(ocr=_FakeOcr(["あ", "い"]), grab_png=lambda: b"png",
+                        interval_sec=0.0, now_fn=lambda: clock[0])
+    short1 = g2.maybe_changed()
+    short2 = g2.maybe_changed()
+    return after_reset is False and short1 is False and short2 is False
+
+
+def t_text_gate_failsoft() -> bool:
+    """OCR が使えない/キャプチャが失敗しても False を返すだけ（例外を出さない）。"""
+    from eve.vlm.text_gate import ScreenTextGate
+
+    def _boom():
+        raise RuntimeError("capture failed")
+
+    off = ScreenTextGate(ocr=_FakeOcr([_T_BASE], available=False), grab_png=lambda: b"x",
+                         interval_sec=0.0)
+    broken = ScreenTextGate(ocr=_FakeOcr([_T_BASE]), grab_png=_boom, interval_sec=0.0)
+    return (off.available is False and off.maybe_changed() is False
+            and broken.maybe_changed() is False)
+
+
+def t_capture_thread_phash_priority() -> bool:
+    """★pHash 優先（ユーザ裁定）: pHash が変化と言った回は文字ゲートを**見ずに** reset する。
+
+    文字がぎっしり詰まったタブを閉じると両方が反応する。二重に VLM を起こさないため。
+    """
+    from eve.vlm.capture_thread import CaptureThread
+
+    class _Cap:
+        def __init__(self, phashes):
+            self.phashes = list(phashes)
+            self.i = 0
+
+        def capture_one(self):
+            p = self.phashes[min(self.i, len(self.phashes) - 1)]
+            self.i += 1
+            return _frame(self.i), p
+
+        def close(self):
+            pass
+
+    class _Gate:
+        def __init__(self):
+            self.resets = 0
+            self.checks = 0
+            self.answer = True
+
+        def reset(self):
+            self.resets += 1
+
+        def maybe_changed(self):
+            self.checks += 1
+            return self.answer
+
+    class _Det:
+        def __init__(self, answers):
+            self.answers = list(answers)
+            self.i = 0
+
+        def evaluate(self, phash):
+            a = self.answers[min(self.i, len(self.answers) - 1)]
+            self.i += 1
+            return a
+
+    delivered = []
+    gate = _Gate()
+    ct = CaptureThread(capture=_Cap([1, 2]), change_detector=_Det([True, False]),
+                       deliver=lambda f, c: delivered.append(c), loop=None,
+                       schedule=lambda fn, *a: fn(*a), text_gate=gate)
+    ct._step()   # pHash=True → gate は見ない・reset される
+    ct._step()   # pHash=False → gate を見る → True で昇格
+    return (delivered == [True, True]
+            and gate.resets == 1 and gate.checks == 1)  # 1回目は checks が増えない
+
+
+def t_capture_thread_text_gate_quiet() -> bool:
+    """文字ゲートが False なら changed も False のまま（勝手に起こさない）。"""
+    from eve.vlm.capture_thread import CaptureThread
+
+    class _Cap:
+        def capture_one(self):
+            return _frame(1), 7
+
+        def close(self):
+            pass
+
+    class _Gate:
+        def reset(self):
+            pass
+
+        def maybe_changed(self):
+            return False
+
+    delivered = []
+    ct = CaptureThread(capture=_Cap(), change_detector=type("D", (), {"evaluate": lambda s, p: False})(),
+                       deliver=lambda f, c: delivered.append(c), loop=None,
+                       schedule=lambda fn, *a: fn(*a), text_gate=_Gate())
+    ct._step()
+    return delivered == [False]
+
+
 def t_capture_blank_and_valid() -> bool:
     import numpy as np
 
@@ -720,6 +891,13 @@ async def main() -> None:
     check("⭐配線: 画面情報なしは None でなく不在明示を渡す", await t_orchestrator_reports_vision_absence())
     check("E11 自分が開いた窓は VLM に自己申告する", t_own_windows_declared())
     check("E11 窓ゼロ/取得失敗では余計な文を足さない", await t_own_windows_absent_or_broken())
+    # 文字ゲート（pHash が拾えない枠内の文字変化）
+    check("文字ゲート: 初回は基準・小変化は無視・大変化で起こす", t_text_gate_threshold())
+    check("文字ゲート: 最短間隔を守る（毎フレーム OCR しない）", t_text_gate_interval())
+    check("文字ゲート: reset で基準を捨てる / 文字が少ない画面は判定しない", t_text_gate_reset_and_short())
+    check("文字ゲート: OCR 不可/キャプチャ失敗は False（例外なし）", t_text_gate_failsoft())
+    check("⭐pHash 優先: 変化した回は文字ゲートを見ず reset", t_capture_thread_phash_priority())
+    check("文字ゲートが静かなら changed は False のまま", t_capture_thread_text_gate_quiet())
     # capture / capture_thread
     check("capture: 黒→blank / 通常→有効 b64+phash", t_capture_blank_and_valid())
     check("capture_thread step: gate→deliver 橋渡し", t_capture_thread_step_delivers())
