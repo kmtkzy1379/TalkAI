@@ -94,15 +94,27 @@ class WinOcr:
             raise RuntimeError("OcrEngine を作れない（OCR 言語パック未導入の可能性）")
         self._eng = eng
 
+    @staticmethod
+    def _seq(v):
+        """WinRT の IVectorView は Python の iter プロトコルに乗らないことがある
+        （実測: TypeError: iter() returned non-iterator）。添字アクセスに倒す。"""
+        try:
+            return list(v)
+        except TypeError:
+            return [v.get_at(i) for i in range(v.size)]
+
     async def _read(self, png: bytes) -> str:
         stream = self._Stream()
         w = self._DataWriter(stream.get_output_stream_at(0))
         w.write_bytes(png)
         await w.store_async()
+        await w.flush_async()
+        w.detach_stream()
+        stream.seek(0)
         dec = await self._BitmapDecoder.create_async(stream)
         bmp = await dec.get_software_bitmap_async()
         res = await self._eng.recognize_async(bmp)
-        return "\n".join(l.text for l in res.lines)
+        return "\n".join(l.text for l in self._seq(res.lines))
 
     def read(self, png: bytes) -> str:
         return self._asyncio.run(self._read(png))
@@ -137,22 +149,24 @@ ENGINES = {"win": WinOcr, "rapid": RapidOcr}
 
 
 # --- キャプチャ -------------------------------------------------------------
-def grab_png(downscale: int = 1600) -> bytes:
-    """全画面を PNG bytes で。VLM 経路と同じ mss を使う（別物を測らない）。"""
+def grab_png(downscale: int = 1600):
+    """全画面を (PNG bytes, phash) で。VLM 経路と同じ mss/imagehash を使う（別物を測らない）。"""
     import io
 
+    import imagehash
     import mss
     from PIL import Image
 
     with mss.mss() as sct:
         raw = sct.grab(sct.monitors[0])
     im = Image.frombytes("RGB", raw.size, raw.rgb)
+    ph = int(str(imagehash.phash(im)), 16)  # `eve/vlm/capture.py:62` と同一の作り方
     if downscale and im.width > downscale:
         h = int(im.height * downscale / im.width)
         im = im.resize((downscale, h), Image.LANCZOS)
     buf = io.BytesIO()
     im.save(buf, format="PNG")
-    return buf.getvalue()
+    return buf.getvalue(), ph
 
 
 def main() -> int:
@@ -164,13 +178,31 @@ def main() -> int:
     args = ap.parse_args()
 
     print(f"■ 連続 {args.shots} 枚を {args.interval}s 間隔でキャプチャ（この間 画面は触らないこと）")
-    shots = []
+    shots, phashes = [], []
     for i in range(args.shots):
-        shots.append(grab_png(args.downscale))
+        png, ph = grab_png(args.downscale)
+        shots.append(png)
+        phashes.append(ph)
         print(f"  {i + 1}/{args.shots}", end="\r")
         if i < args.shots - 1:
             time.sleep(args.interval)
-    print(f"\n  取得完了（1枚 {len(shots[0]) / 1024:.0f}KB）\n")
+    # **pHash が同一の隣接ペアだけ**を「静止」とみなす。これをやらないと、裏で動いている
+    # ターミナルや時計の更新が OCR のノイズとして混入し、ノイズ床を大きく見誤る
+    # （実測 2026-08-07: 混入込みで最大 20.6% → 実際の OCR 揺れはこれよりずっと小さい）。
+    static = [i for i in range(len(shots) - 1) if phashes[i] == phashes[i + 1]]
+    moved = len(shots) - 1 - len(static)
+    # **真に静止**＝PNG バイト列まで一致（可逆圧縮なので画素が1つも変わっていない）。
+    # OCR の純粋なノイズ床はここでしか測れない。pHash 一致は「見た目が似ている」でしかなく、
+    # 実測 2026-08-07: pHash 一致の13ペア全部で文字は変わっていた（＝ライブ更新中のタイマー）。
+    identical = [i for i in range(len(shots) - 1) if shots[i] == shots[i + 1]]
+    print(f"\n  取得完了（1枚 {len(shots[0]) / 1024:.0f}KB）")
+    print(f"  pHash 一致 {len(static)} / pHash 変化 {moved} ペア")
+    print(f"  **画素まで完全一致** {len(identical)} ペア（真の静止・ノイズ床はここで測る）")
+    print(f"  → pHash 一致なのに画素が違う: {len(static) - len(identical)} ペア"
+          f"（＝pHash が見逃した変化。この案が要る理由そのもの）\n")
+    if not static:
+        print("  ★ 静止ペアがゼロ。画面が動き続けているのでノイズ床を測れない。")
+        print("    メモ帳など静止した画面を最前面にして再実行すること。\n")
 
     for key in [e.strip() for e in args.engines.split(",") if e.strip()]:
         cls = ENGINES.get(key)
@@ -197,22 +229,44 @@ def main() -> int:
         rerun = eng.read(shots[0])
         deterministic = norm(rerun) == norm(texts[0])
 
-        # (b) 静止時ノイズ床: 画面が変わっていない連続フレーム間の差分率
-        noise = [diff_ratio(texts[i], texts[i + 1]) for i in range(len(texts) - 1)]
+        # (b) 静止時ノイズ床: **pHash が一致した**隣接ペアだけで測る（実変化を混ぜない）
+        noise = [diff_ratio(texts[i], texts[i + 1]) for i in static]
+        changed = [diff_ratio(texts[i], texts[i + 1])
+                   for i in range(len(texts) - 1) if i not in static]
         chars = [len(norm(t)) for t in texts]
 
         print(f"  言語     : {getattr(eng, 'lang', '?')}")
         print(f"  速度     : 中央値 {st.median(times):.0f}ms / 最大 {max(times):.0f}ms")
         print(f"  文字数   : 中央値 {st.median(chars):.0f} / 最小 {min(chars)} / 最大 {max(chars)}")
         print(f"  決定性   : {'同一画像→同一テキスト' if deterministic else '★同一画像でも揺れる（採用不可）'}")
-        print(f"  ノイズ床 : 中央値 {st.median(noise) * 100:.2f}% / 最大 {max(noise) * 100:.2f}%")
-        ok = deterministic and max(noise) < 0.05
-        print(f"  判定     : {'○ トリガに使える（閾値は最大ノイズの2倍以上に置く）' if ok else '× 静止時に揺れすぎ＝偽トリガ源'}")
+        pure = [diff_ratio(texts[i], texts[i + 1]) for i in identical]
+        if pure:
+            print(f"  真ノイズ床: 中央値 {st.median(pure) * 100:.2f}% / 最大 {max(pure) * 100:.2f}%"
+                  f"（画素完全一致 {len(pure)} ペア）")
+        else:
+            print("  真ノイズ床: 測定不能（画素完全一致のペアなし＝画面が動き続けている）")
+        if noise:
+            print(f"  pHash一致 : 中央値 {st.median(noise) * 100:.2f}% / 最大 {max(noise) * 100:.2f}%"
+                  f"（{len(noise)} ペア・**pHash が見逃した文字変化を含む**）")
+        else:
+            print("  pHash一致 : 測定不能（静止ペアなし）")
+        if changed:
+            print(f"  変化時   : 中央値 {st.median(changed) * 100:.2f}% / 最小 {min(changed) * 100:.2f}%"
+                  f"（pHash が動いた {len(changed)} ペア）")
+        ok = deterministic and noise and max(noise) < 0.05
+        print(f"  判定     : {'○ トリガに使える' if ok else '× 静止時に揺れすぎ＝偽トリガ源' if noise else '- 保留'}")
+        if noise and changed:
+            sep = min(changed) > max(noise)
+            print(f"  分離     : {'○ 変化の最小 > ノイズの最大＝閾値を引ける' if sep else '× 重なる＝閾値を引けない'}"
+                  f"（ノイズ最大 {max(noise) * 100:.2f}% vs 変化最小 {min(changed) * 100:.2f}%）")
         if noise and max(noise) >= 0.05:
-            worst = noise.index(max(noise))
-            print(f"    最悪の隣接ペア {worst}->{worst + 1}:")
-            print(f"      前: {norm(texts[worst])[:110]}")
-            print(f"      後: {norm(texts[worst + 1])[:110]}")
+            worst = static[noise.index(max(noise))]
+            print(f"    最悪の静止ペア {worst}->{worst + 1}（pHash 同一なのに差が出た＝純粋な誤読）:")
+            a, b = norm(texts[worst]), norm(texts[worst + 1])
+            sm = difflib.SequenceMatcher(None, a, b)
+            for tag, i1, i2, j1, j2 in sm.get_opcodes():
+                if tag != "equal":
+                    print(f"      {tag}: {a[i1:i2][:60]!r} -> {b[j1:j2][:60]!r}")
         print()
 
     print("※ 検出力（実際に文字が変わった時の差分率）は、途中で画面の文字を変えて再実行し")
