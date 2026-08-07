@@ -28,8 +28,11 @@ from eve.pipeline.stimulus_queue import StimulusQueue  # noqa: E402
 from eve.task import (  # noqa: E402
     CANCELLED, DONE, FAILED, PENDING, RUNNING,
     ReconcileTimer, Task, TaskExecutor, TaskStore,
-    active_tasks_for_context, register_task_capabilities,
+    active_tasks_for_context, register_task_capabilities, undelivered_reports,
 )
+import eve.task.capabilities as _cap  # noqa: E402  自己取消ガードの窓をテストから畳むため
+
+_GUARD_DEFAULT = _cap.SELF_CANCEL_GUARD_SEC
 
 _passed = 0
 _failed = 0
@@ -245,7 +248,14 @@ async def t_capabilities():
     r_empty = reg.execute("delegate_task", {"goal": "  "})
     tid = s.list_all()[0].task_id
     t = s.get(tid)
-    r_cancel = reg.execute("cancel_task", {"task_id": tid})
+    # 自己取消ガード: 作った直後の cancel は応答LLM の撃ち直し（2026-07-13）→ 弾く。
+    r_guard = reg.execute("cancel_task", {"task_id": tid})
+    guarded = s.get(tid).status != CANCELLED
+    _cap.SELF_CANCEL_GUARD_SEC = 0.0  # 窓を抜けた後＝ユーザの本物の取消に相当
+    try:
+        r_cancel = reg.execute("cancel_task", {"task_id": tid})
+    finally:
+        _cap.SELF_CANCEL_GUARD_SEC = _GUARD_DEFAULT
     cancelled = s.get(tid).status == CANCELLED
     offered = {x["function"]["name"] for x in reg.tool_schemas()}
     agent = {x["function"]["name"] for x in reg.agent_tool_schemas()}
@@ -254,6 +264,7 @@ async def t_capabilities():
     return (
         "引き受けた" in r_del and len(s) == 1  # dup は作られない
         and "もう予約してる" in r_dup and "ゴールが空" in r_empty
+        and guarded and "今引き受けたばかり" in r_guard  # 自己取消ガード
         and t.what == "" and t.goal == "30秒後に時刻を教えて"  # goal タスク
         and cancelled and "取り消した" in r_cancel and t.goal in r_cancel  # 空名でなく goal 名で報告(RC4)
         and del_cap.mutates_state is True and del_cap.report_result is False
@@ -346,6 +357,97 @@ async def t_active_tasks_limit_and_eta():
     return ok_limit and ok_eta
 
 
+async def _put_task_report(q, task_id):
+    """executor と同じ形で完了報告を積む（`executor.py:124-130` の dedup_key 規約）。"""
+    from eve.pipeline.stimulus import CallFunctionResult, Stimulus
+    await q.put(Stimulus(
+        kind=StimulusKind.CALLFUNCTION_RESULT,
+        payload=CallFunctionResult(function_name="delegate_task", content="できたよ", ok=True),
+        dedup_key=f"task:{task_id}",
+    ))
+
+
+async def t_single_slot_gate():
+    # 1件制（2026-08-07 ユーザ裁定）: アクティブが1件あれば2件目は作らせない。
+    s = TaskStore(task_file=_tmp(), now_fn=lambda: BASE)
+    await s.initialize()
+    reg = CapabilityRegistry()
+    q = StimulusQueue()
+    register_task_capabilities(reg, s, queue=q)
+    r1 = reg.execute("delegate_task", {"goal": "北海道の面積を検索して教えて"})
+    r2 = reg.execute("delegate_task", {"goal": "沖縄の人口も調べてほしい"})
+    ok = (
+        "引き受けた" in r1 and len(s) == 1  # 2件目は作られない
+        # **必ず「（」始まり**: dispatcher は report_result=False の戻り値をこれでしか報告しない
+        # （`function_dispatcher.py:100,111`）。付け忘れると依頼が黙って消える。
+        and r2.startswith("（")
+        and "北海道の面積を検索して教えて" in r2  # 何が枠を握っているかを言う
+        and "取り消して" in r2  # 脱出口を示す
+    )
+    # Running でも同じ（枠は状態を問わず1つ）。
+    s.claim_due()
+    r3 = reg.execute("delegate_task", {"goal": "全然別のこと"})
+    ok = ok and r3.startswith("（") and "やってる" in r3 and len(s) == 1
+    await s.shutdown()
+    return ok
+
+
+async def t_single_slot_counts_undelivered():
+    # 「終わったが結果をまだ喋っていない」報告も枠を握る（＝取消候補が常に高々1件になる）。
+    s = TaskStore(task_file=_tmp(), now_fn=lambda: BASE)
+    await s.initialize()
+    reg = CapabilityRegistry()
+    q = StimulusQueue()
+    register_task_capabilities(reg, s, queue=q)
+    reg.execute("delegate_task", {"goal": "琵琶湖の面積を調べて教えて"})
+    tid = s.list_all()[0].task_id
+    s.claim_due()
+    s.set_status(tid, DONE, result="x")
+    await _put_task_report(q, tid)          # 報告はキューに居る＝未配達
+    r_blocked = reg.execute("delegate_task", {"goal": "次のこと"})
+    blocked = r_blocked.startswith("（") and "琵琶湖" in r_blocked and len(s) == 1
+    # 配達されたら（キューから消えたら）枠が空く。
+    q.snapshot()
+    while q.qsize():
+        await q.get()
+    r_ok = reg.execute("delegate_task", {"goal": "次のこと"})
+    freed = "引き受けた" in r_ok and len(s) == 2
+    # 未配達を数える母集団は cancel 側と同一実装（定義の二重管理をしない）。
+    await _put_task_report(q, tid)
+    same = [t.task_id for t in undelivered_reports(s, q)] == [tid]
+    await s.shutdown()
+    return blocked and freed and same
+
+
+async def t_when_seconds_capped():
+    # 1件制の前提: 予約で枠を無限に押さえられると機能が止まる（Pending は再起動でも age-out されない）。
+    s = TaskStore(task_file=_tmp(), now_fn=lambda: BASE)
+    await s.initialize()
+    reg = CapabilityRegistry()
+    register_task_capabilities(reg, s)
+    r = reg.execute("delegate_task", {"goal": "夕方に教えて", "when_seconds": 18000})
+    ok = r.startswith("（") and len(s) == 0
+    r2 = reg.execute("delegate_task", {"goal": "30秒後に教えて", "when_seconds": 30})
+    ok = ok and "引き受けた" in r2 and len(s) == 1
+    await s.shutdown()
+    return ok
+
+
+async def t_undelivered_in_context():
+    # 未配達は system 一覧にも出す（受付ゲートの拒否理由と食い違わせない）。
+    # ただし **ETA を付けない**: humanize_eta は負値を 0 に丸めるので「まもなく実行」＝
+    # これから実行すると読める嘘になる（Fix#2 が潰した事故クラス）。
+    s = TaskStore(task_file=_tmp(), now_fn=lambda: BASE)
+    await s.initialize()
+    s.add(Task(task_id="d1", what="", goal="終わったやつ", when=None))
+    s.set_status("d1", DONE, result="x")
+    joined = "\n".join(active_tasks_for_context(s, now=BASE, undelivered=[s.get("d1")]))
+    ok = ("「終わったやつ」（終わった・結果をまだ伝えていない）" in joined
+          and "実行" not in joined and "d1" not in joined)
+    await s.shutdown()
+    return ok
+
+
 async def main():
     check("Store: 往復+terminal-stays-terminal", await t_store_roundtrip_terminal())
     check("Store: due_now(when≤now のみ)", await t_store_due_now())
@@ -361,6 +463,10 @@ async def main():
     check("Executor: 遅いasync能力中のstop→偽報告なし/Running温存", await t_executor_drain_slow_async())
     check("Fix#2: active_tasks_for_context(状態/ETA/ID leak なし)", await t_active_tasks_context())
     check("Fix#2: 一覧上限+humanize_eta 丸め境界", await t_active_tasks_limit_and_eta())
+    check("1件制: 2件目は作らず「（」始まりで必ず声に出す", await t_single_slot_gate())
+    check("1件制: 未配達の報告も枠を握る/配達で空く", await t_single_slot_counts_undelivered())
+    check("1件制: when_seconds の上限で無限ロックを防ぐ", await t_when_seconds_capped())
+    check("1件制: 未配達は ETA なしで system 一覧に出す", await t_undelivered_in_context())
 
 
 asyncio.run(main())

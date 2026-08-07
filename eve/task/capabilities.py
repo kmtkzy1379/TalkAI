@@ -5,17 +5,37 @@
 - `list_tasks`: **agent 専用**(agent_tool)＝「予約教えて」も委譲で答える。
 実行系能力(self_status/pc_status/将来の検索・画面操作)は agent_tool=True で TaskAgent 専用。
 handler は同期・非ブロッキング（store へ即追加 / 状態は store がコード一本化で持つ）。
+
+**1件制（2026-08-07 ユーザ裁定）**: 「依頼を受けてから報告を発話し終えるまで」が常に1件。
+アクティブ(Pending/Running)か未配達の完了報告が1つでもあれば新規委譲を**コードで断る**。
+狙いは取消の曖昧さの構造的除去（候補が常に高々1件＝どれを指しているか迷う余地が無い）。
+統合・優先度付けは**やらない**（複雑化がバグの起点になるという裁定）。自発タスクが枠を
+埋めてユーザ依頼が断られる場合は、ユーザが取り消すか待つ。
 """
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from ..capability.registry import MEANS_BOUNDARY, NEVER_MEANS, Capability, CapabilityRegistry
 from ..clock import humanize_eta
+from .cancel_resolver import undelivered_reports
 from .schema import CANCELLED, PENDING, RUNNING, TERMINAL, Task, new_task_id
 
 _DEDUP_TOL_SEC = 20.0  # 同一 goal で when がこの秒数以内なら重複予約とみなす
+
+# 1件制の前提: 予約で枠を無限に押さえられると機能が止まる（`_iso_in` に上限が無く、Pending は
+# 再起動しても age-out されない＝`store._age_out_orphans` は Running のみ）。「夕方に教えて」
+# 1件で半日ロックするのを防ぐ。
+MAX_WHEN_SEC = 3600.0
+
+# 応答LLM が同一ターンで delegate_task → cancel_task を続けて撃つ事故（2026-07-13 実機・
+# `tools/task_incident_replay.py:752` が 65μ秒の自己取消として再現）への決定論ガード。
+# tool_calls は逐次実行なのでこの間隔はμ秒オーダー。一方ユーザの本物の取消は、応答音声を
+# 再生し終えてから tool が走る構造（`response/orchestrator.py:453,460`）上、必ず次ターン＝
+# 数秒後になる。よって短い窓で両者は綺麗に分離できる。
+SELF_CANCEL_GUARD_SEC = 1.0
 
 
 def _display_name(t) -> str:
@@ -46,12 +66,17 @@ def _near(a: Optional[datetime], b: Optional[datetime], tol: float = _DEDUP_TOL_
     return abs((a - b).total_seconds()) <= tol
 
 
-def active_tasks_for_context(store, *, now: Optional[datetime] = None, limit: int = 5) -> list[str]:
+def active_tasks_for_context(store, *, now: Optional[datetime] = None, limit: int = 5,
+                             undelivered=()) -> list[str]:
     """応答LLM の system 注入用の予約タスク行（Fix#2・2026-07-13 実機事故対応）。
 
     Pending/Running のみ・**task_id は出さない**（読み上げ leak の唯一の確実な防御は
     そもそも渡さないこと。cancel は reference 自然文で解決するので ID 不要）。
     残り時間は丸め表現（復唱されても自然）。ゼロ件は呼び出し側が「（予約タスクは無い）」を出す。
+
+    `undelivered` は「終わったが結果をまだ喋っていない」タスク（1件制ではこれも枠を握る）。
+    **ETA を付けない**: `humanize_eta` は負値を 0 に丸めるので、完了済みに時刻表現を付けると
+    「まもなく実行」＝これから実行すると読める嘘になる（Fix#2 が潰した事故クラスそのもの）。
     """
     now = now or datetime.now(timezone.utc)
     act = [t for t in store.list_all() if t.status in (PENDING, RUNNING)]
@@ -66,10 +91,31 @@ def active_tasks_for_context(store, *, now: Optional[datetime] = None, limit: in
         lines.append(f"・「{_display_name(t)}」（{eta}）")
     if len(act) > limit:
         lines.append(f"・ほか{len(act) - limit}件")
+    for t in undelivered:
+        lines.append(f"・「{_display_name(t)}」（終わった・結果をまだ伝えていない）")
     return lines
 
 
-def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resolver=None) -> None:
+def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resolver=None,
+                               queue=None) -> None:
+    """`queue` は1件制の「未配達の完了報告」を数えるために使う（None なら未配達は数えない＝
+    アクティブだけで判定する。決定論テストや queue を持たない tools 向けの縮退動作）。"""
+    # 同一ターンの自己取消ガード用（`SELF_CANCEL_GUARD_SEC`）。closure でだけ共有する。
+    last_add = {"mono": 0.0}
+
+    def _slot_holder():
+        """いま枠を握っているタスクと、その状態語（無ければ (None, "")）。"""
+        for t in store.list_all():
+            if t.status == RUNNING:
+                return t, "やってる"
+        for t in store.list_all():
+            if t.status == PENDING:
+                return t, "予約してる"
+        if queue is not None:
+            for t in undelivered_reports(store, queue):
+                return t, "終えたけどまだ結果を伝えてない"
+        return None, ""
+
     def _find_duplicate(goal: str, when: Optional[str]):
         # 同じ goal かつ when が近接の PENDING/Running があれば重複（混乱ターンの再作成を弾く＝RC2。
         # Running も見るのは、実行中に応答LLMが同じゴールを再委譲する事故＝二重検索/二重報告を
@@ -85,14 +131,28 @@ def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resol
         goal = (args.get("goal") or "").strip()
         if not goal:
             return "（ゴールが空でした）"
-        when = _iso_in(args.get("when_seconds"))
+        secs = args.get("when_seconds")
+        if isinstance(secs, (int, float)) and secs > MAX_WHEN_SEC:
+            # 断る文は必ず「（」始まり: dispatcher は report_result=False の能力の戻り値を
+            # `content.startswith("（")` でしか報告しない（`function_dispatcher.py:100,111`）。
+            # 付け忘れると「やっとくね」と言った直後に依頼だけ黙って消える。
+            return f"（{int(MAX_WHEN_SEC // 60)}分より先の予約はまだ受けられないよ）"
+        when = _iso_in(secs)
+        # 重複判定を先に置く: 同じ goal の再委譲には専用の文言がある（RC2）。1件制の一般文より
+        # 正確で、かつ**そのタスクは実在して報告される**ので黙っていても実害が無い。
         dup = _find_duplicate(goal, when)
         if dup is not None:
             if dup.status == RUNNING:
                 return f"それ、今ちょうど調べてるところだよ（ID:{dup.task_id}）。"
             return f"それはもう予約してるよ（ID:{dup.task_id}）。"
+        # 1件制ゲート（2026-08-07 ユーザ裁定）。ここで作らないので**必ず声に出す**。
+        holder, state = _slot_holder()
+        if holder is not None:
+            return (f"（今は「{_display_name(holder)}」を{state}から、それは受けられないよ。"
+                    "終わって結果を伝えたらまた言ってね。先にやりたいなら今のを取り消して）")
         task = Task(task_id=new_task_id(), what="", goal=goal, when=when)
         store.add(task)
+        last_add["mono"] = time.monotonic()
         eta = f"{int(args['when_seconds'])}秒後" if when else "すぐ"
         return f"タスクを引き受けたよ（{goal[:24]} / {eta} / ID:{task.task_id}）。"
 
@@ -105,6 +165,11 @@ def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resol
 
     def _cancel_task(args: dict) -> str:
         reference = (args.get("reference") or args.get("task_id") or "").strip()
+        # 自己取消ガード: いま作ったばかりのタスクへの取消は応答LLM の撃ち直し（2026-07-13）。
+        # 1件制では候補が常に1件＝この cancel は必ず生まれたてのタスクに当たるので、照合ではなく
+        # **時間差**で弾く。ユーザの本物の取消は音声再生後＝必ず次ターンなので巻き込まない。
+        if last_add["mono"] and time.monotonic() - last_add["mono"] < SELF_CANCEL_GUARD_SEC:
+            return "（今引き受けたばかりだから、取り消しはしないでおくね）"
         if cancel_resolver is not None:
             # 本番: タスク側(CancelResolver)がファジー解決＋報告する（非同期）。ここは受付けるだけ。
             cancel_resolver.submit(reference)

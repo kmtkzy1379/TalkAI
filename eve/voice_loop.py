@@ -27,7 +27,7 @@ from .response.delivery_checker import DeliveryChecker
 from .response.function_dispatcher import FunctionDispatcher
 from .task import (
     CancelResolver, ReconcileTimer, TaskAgent, TaskExecutor, TaskStore,
-    active_tasks_for_context, register_task_capabilities,
+    active_tasks_for_context, register_task_capabilities, undelivered_reports,
 )
 from .response.input_source import MicSttInputSource
 from .response.orchestrator import REDELIVER_MAX_ATTEMPTS, ResponseOrchestrator
@@ -75,7 +75,9 @@ class VoiceLoop:
             # J-2 P2-3: self.task_store は下の TASK_ENABLED ブロックで後から確定するため、
             # 呼び出し時点の値を読む遅延 lambda にする（is_busy=lambda: self.runner... と同じ流儀）。
             tasks_provider=lambda: (
-                active_tasks_for_context(self.task_store) if self.task_store is not None else None
+                active_tasks_for_context(
+                    self.task_store, undelivered=undelivered_reports(self.task_store, self.queue))
+                if self.task_store is not None else None
             ),
         )
 
@@ -128,10 +130,10 @@ class VoiceLoop:
                 orphan_timeout_sec=Config.TASK_ORPHAN_TIMEOUT_SEC,
             )
             # 取消はタスク側で解決（別コルーチン・executor と並行）: 応答LLM は reference を渡すだけ。
-            self.cancel_resolver = CancelResolver(
-                store=self.task_store, model_registry=self.registry, queue=self.queue,
-            )
-            register_task_capabilities(self.capabilities, self.task_store, cancel_resolver=self.cancel_resolver)
+            self.cancel_resolver = CancelResolver(store=self.task_store, queue=self.queue)
+            # queue は1件制ゲートが「未配達の完了報告」を数えるのに要る（`capabilities.py`）。
+            register_task_capabilities(self.capabilities, self.task_store,
+                                       cancel_resolver=self.cancel_resolver, queue=self.queue)
             # TaskAgent（inc2）: delegate_task の自然文ゴールを賢い task LLM が境界つきループで完遂。
             task_agent = TaskAgent(
                 registry=self.capabilities, model_registry=self.registry, store=self.task_store,
@@ -146,7 +148,11 @@ class VoiceLoop:
             # Fix#2: 予約タスクの現在状態を応答LLM の system に毎ターン注入（完了済み変更の
             # 再実行・状態と矛盾する約束の防止＝2026-07-13 実機事故の根本原因対応）。
             store = self.task_store
-            tasks_provider = lambda: active_tasks_for_context(store)  # noqa: E731
+            # 1件制: 枠を握るのはアクティブだけでなく「終わったが未配達の報告」も含むので、
+            # 応答LLM にも同じ母集団を見せる（受付ゲートの拒否理由と食い違わせない）。
+            queue = self.queue
+            tasks_provider = lambda: active_tasks_for_context(  # noqa: E731
+                store, undelivered=undelivered_reports(store, queue))
             # J-2 search（既定 off・TASK_ENABLED ブロック内に置く＝TaskAgent 専用能力なので
             # タスク管理なしでは誰も呼べない状態を構造的に不能にする）。
             if Config.SEARCH_ENABLED:

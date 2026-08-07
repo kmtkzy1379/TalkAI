@@ -1,27 +1,27 @@
 """CancelResolver — タスク取消を**タスク側**で解決するサイドカー（dispatcher の近クローン・別コルーチン）。
 
-応答LLM は `cancel_task(reference)` で取消意図（ユーザの言い回し）を渡すだけ。ここが件数で解決:
-- **0件** → コード即時「今止めるタスクは無いよ」（LLM 不要）。
-- **1件 かつ reference が曖昧**（空/「やっぱりいいや」等の常套句のみ）→ コード即時キャンセル
-  （LLM 不要・停止は速く確実に）。
-- **1件 かつ reference に実質語**（「30秒のやつ」等）→ LLM 照合。2026-07-13 実機事故:
-  応答LLMが完了済み変更を再実行して cancel を再発行し、無照合 fast path が唯一のアクティブ
-  （ユーザが残したい方）を削除した。1件でも「その1件が reference の指す対象」とは限らない。
-- **2件以上** → タスクLLM(gpt-5.5) が store を見て reference をファジー照合（match/none/ambiguous）。
+応答LLM は `cancel_task(reference)` で取消意図（ユーザの言い回し）を渡すだけ。**1件制
+（2026-08-07 ユーザ裁定・`task/capabilities.py` の受付ゲート）でアクティブは高々1件**なので、
+ここは reference を照合せず件数だけで解決する（LLM を呼ばない＝速く確実）:
+- **アクティブ0件** → 未配達の報告があればそれを抑止、無ければ「今止めるタスクは無いよ」。
+- **アクティブ1件** → 即キャンセル。reference がどれを指すか迷う余地が構造的に無い。
+
+**なぜ照合をやめたか**（旧実装はタスクLLM でファジー照合していた）:
+1件しか無い以上ユーザが対象を取り違えようがなく、言い間違えても「消す意図」は同じ。
+2026-07-13 実機事故はユーザの勘違いではなく**応答LLM が完了済みターンを再実行して cancel を
+撃ち直した**もので、これは照合ではなく時間差で弾ける（`capabilities.py` SELF_CANCEL_GUARD_SEC）。
+照合ロジックは実害を出した実績もある（E4 差し戻し `6cb6f25`: 日常的な取消表現 9/9 をブロック）。
 
 **executor(single-flight) 経由にしない**＝取消が実行中タスクの後ろで待つのを防ぐ（別コルーチンで並行）。
 実行中 goal は agent の毎step CANCELLED チェックが中断・破棄する（agent/executor 側で既存）。
 
-**TOCTOU**: LLM await の前後で状態が変わり得る→**書込直前に store を読み直し**、`set_status` の戻り値 bool で
+**TOCTOU**: await の前後で状態が変わり得る→**書込直前に store を読み直し**、`set_status` の戻り値 bool で
 分岐（False=既に終了→「もう終わってた」）。スナップショットから「取り消した」と誤報しない。
 """
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import re
-import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -43,70 +43,31 @@ class CancelRequest:
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
 
-CANCEL_SYSTEM = (
-    "あなたはAI VTuber「イブ」のタスク取消担当です。ユーザが取り消したい対象(reference)と、現在の"
-    "未終了タスク一覧が与えられます。どれを取り消すべきか判断し、次の JSON だけを返してください:\n"
-    '{"decision":"match|none|ambiguous","task_id":"<一致したIDまたは空>","message":"<ユーザに話す一言>"}\n'
-    "・match: reference が1つのタスクに対応。task_id を入れ、message は「『〜』を止めるね」等。\n"
-    "・none: 対応するタスクが無い。message は「そんなタスクは入ってないよ。今あるのは〜」等。\n"
-    "・ambiguous: 複数該当で決められない。message は候補を挙げ「〜と〜、どっち?」と聞く。\n"
-    "・一覧が1件だけでも安易に match にしない。reference の数字・時刻・内容がタスクと食い違うなら"
-    "必ず none（例: reference『30秒後のやつ』・一覧『50秒後に気持ちを伝えて』→ none）。\n"
-    "・reference が対象を特定しない取消の言い回しだけ（『やっぱりいい』『さっきの』等）で"
-    "一覧が1件なら、その1件を match としてよい。\n"
-    "message は簡潔に事実だけ。JSON 以外は書かない。"
-)
-
-# --- 曖昧語ゲート（1件 fast path の可否判定）------------------------------------
-# 「取消の常套句・指示語・フィラー・助詞」だけで構成される reference は対象を特定していない
-# → 1件なら即キャンセルしてよい。実質語（数字・内容語）が残れば LLM 照合へ倒す（安全方向:
-# 誤って「具体的」と判定しても遅延が増えるだけで、誤取消にはならない）。
-_PUNCT = re.compile(r"[\s、。,.!?！？〜ー・…「」『』()（）]+")
-_VAGUE_TOKENS = re.compile(
-    "|".join((
-        # 長い語を先に（re の選択は左から先勝ちのため、接頭辞関係は長い順に並べる）
-        "やっぱりいいや", "やっぱりいい", "やっぱり", "やっぱ", "やはり",
-        "取り消して", "取り消し", "取消", "きゃんせる", "キャンセル", "cancel", "stop", "ストップ", "中止",
-        "やめといて", "やめとく", "やめて", "やめる", "やめた", "止めといて", "止めて", "止める",
-        "いらない", "いらん", "いいや", "いいよ", "いいです", "いい", "なしにして", "なしで", "なし",
-        "さっきの", "さっき", "例の", "それも", "それ", "あれ", "その", "あの", "この", "今の",
-        "お願い", "ごめん", "うん", "もう", "全部", "タスク", "予約", "やつ", "奴", "にして", "して",
-        "を", "は", "が", "の", "で", "に", "も", "ね", "よ",
-    ))
-)
-
-
-def _is_vague_reference(ref: str) -> bool:
-    """対象を特定しない取消か（True=1件ならコード即取消してよい / False=LLM 照合へ）。"""
-    s = _PUNCT.sub("", unicodedata.normalize("NFKC", ref or "").strip().lower())
-    if not s:
-        return True  # 空指定 = 「今のをやめて」
-    return not _VAGUE_TOKENS.sub("", s)  # 実質語（数字・内容語）が残れば False
-
-
-def _g(o, k):
-    return o.get(k) if isinstance(o, dict) else getattr(o, k, None)
-
-
-def _content(resp) -> str:
-    choices = _g(resp, "choices") or []
-    if not choices:
-        return ""
-    msg = _g(choices[0], "message")
-    return (_g(msg, "content") or "") if msg is not None else ""
-
-
 def _display_name(t) -> str:
     return t.goal or t.what or "(無題)"
 
 
+def undelivered_reports(store, queue) -> list:
+    """**まだ発話されていない完了報告**を持つ terminal タスク（この定義の唯一の実装）。
+
+    時計だけで「直近の terminal」を選ぶと実機で誤る: 2026-07-29 E2E の D2 時点では 90秒窓に
+    3件（東京タワー56.2s前 / 琵琶湖46.5s前 / 川1.9s前）あったが、先の2件は既に発話済みで、
+    未配達はユーザが指した川の1件だけだった。キューの実体と突き合わせれば候補は一意に決まる。
+    起動時 age-out の孤児（store が updated_at を打ち直す）も put を出さないので自動的に候補外。
+
+    1件制の受付ゲート（`task/capabilities.py`）もこれを使う＝「未配達」の定義を二重に持たない。
+    """
+    queued = {s.dedup_key for s in queue.snapshot() if (s.dedup_key or "").startswith("task:")}
+    return [t for t in store.list_all()
+            if t.status in (DONE, FAILED) and f"task:{t.task_id}" in queued]
+
+
 class CancelResolver:
     def __init__(
-        self, *, store, model_registry, queue,
+        self, *, store, queue,
         now_fn: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     ) -> None:
         self._store = store
-        self._model = model_registry
         self._queue = queue
         self._now = now_fn  # TaskStore と同じシグネチャ（決定論テストで注入する）
         self._inbox: "asyncio.Queue[CancelRequest]" = asyncio.Queue()
@@ -173,17 +134,7 @@ class CancelResolver:
         return (self._now() - dt).total_seconds()
 
     def _undelivered_candidates(self) -> list:
-        """**まだ発話されていない報告**を持つ terminal タスク（＝抑止してよい対象）。
-
-        時計だけで「直近の terminal」を選ぶと実機で誤る: 2026-07-29 E2E の D2 時点では
-        90秒窓に3件（東京タワー56.2s前 / 琵琶湖46.5s前 / 川1.9s前）あったが、先の2件は
-        既に発話済みで、未配達はユーザが指した川の1件だけだった。キューの実体と突き合わせれば
-        候補は一意に決まる。起動時 age-out の孤児（store が updated_at を打ち直す）も
-        put を出さないので自動的に候補外になる。
-        """
-        queued = {s.dedup_key for s in self._queue.snapshot() if (s.dedup_key or "").startswith("task:")}
-        return [t for t in self._store.list_all()
-                if t.status in (DONE, FAILED) and f"task:{t.task_id}" in queued]
+        return undelivered_reports(self._store, self._queue)
 
     def _recent_terminals(self) -> list:
         """キューに実体が無い terminal のうち「ついさっき終わった」もの（再配達の抑止用）。"""
@@ -241,39 +192,18 @@ class CancelResolver:
         logger.info("🚫 取消要求 ref=%.60r actives=%d", req.reference, len(actives))
         if not actives:
             await self._handle_terminal_race(req)
-        elif len(actives) == 1 and _is_vague_reference(req.reference):
-            # 1件×曖昧・空 reference（「やっぱりいいや」等）＝対象はその1件→即キャンセル（速く確実に）。
-            await self._cancel_and_report(req, actives[0].task_id)
-        else:
-            # 2件以上、または1件でも実質語のある reference → タスクLLM がファジー照合。
-            # （1件無照合は 2026-07-13 実機事故: 「30秒の…」で唯一の50秒タスクを誤取消）
-            await self._resolve_with_llm(req, actives)
-
-    async def _resolve_with_llm(self, req: CancelRequest, actives) -> None:
-        listing = "\n".join(f'- id={t.task_id} 内容="{_display_name(t)}" 状態={t.status}' for t in actives)
-        messages = [
-            {"role": "system", "content": CANCEL_SYSTEM},
-            {"role": "user", "content": f"取り消したい対象: {req.reference or '(指定なし)'}\n現在の未終了タスク:\n{listing}"},
-        ]
-        try:
-            resp = await self._model.complete("task", messages)
-        except Exception:
-            logger.exception("キャンセル解決 LLM 失敗")
-            if len(actives) == 1:
-                # fail-safe: 取り消していないことを名前つきで明示（ユーザが「やっぱりいい」と
-                # 言い直せば曖昧ゲート経由で LLM 無しでも止められる）。
-                await self._report(req, f"ごめん、確認できなかったよ。「{_display_name(actives[0])}」はそのままにしてるよ。", ok=False)
-            else:
-                await self._report(req, "ごめん、どのタスクか確認できなかったよ。", ok=False)
             return
-        decision, task_id, message = self._parse(resp)
-        logger.info("🚫 取消解決(LLM): decision=%s task_id=%s", decision or "(空)", task_id or "(空)")
-        if decision == "match" and task_id in {t.task_id for t in actives}:
-            # task_id はスナップショット内のものだけ許可（LLM の幻覚 ID で誤取消/誤報しない）。
-            await self._cancel_and_report(req, task_id, llm_message=message)
-        else:
-            # none / ambiguous / 幻覚ID / 解析失敗 → status は変えず message を報告。
-            await self._report(req, message or "どのタスクのことか分からなかったよ。", ok=False)
+        # 1件制（2026-08-07 ユーザ裁定）: アクティブは高々1件＝reference がどれを指すか迷う余地が
+        # 構造的に無いので、照合はしない。**タスクLLM 照合は撤去した**。理由:
+        # - 1件しか無い以上ユーザが対象を取り違えようがなく、言い間違えても消す意図は同じ
+        # - 2026-07-13 事故はユーザの勘違いではなく**応答LLM の cancel 撃ち直し**だった。
+        #   これは照合ではなく時間差で弾ける（`task/capabilities.py` の SELF_CANCEL_GUARD_SEC）
+        # - 照合の副作用が実害を出した実績がある（E4 差し戻し `6cb6f25`: 日常的な取消表現 9/9 を
+        #   ブロックした）。往復が消えることで取消の不感時間（E3）も縮む
+        if len(actives) > 1:
+            # 1件制ゲートより前に作られた残留（旧バージョンの状態ファイル等）。落とさず最新を止める。
+            logger.warning("1件制の不変条件違反: actives=%d（旧状態の残留?）→ 最新を取り消す", len(actives))
+        await self._cancel_and_report(req, actives[-1].task_id)
 
     async def _cancel_and_report(self, req: CancelRequest, task_id: str, llm_message: str = "") -> None:
         # TOCTOU: 書込直前に読み直し、set_status の bool で成否判定（スナップショットから誤報しない）。
@@ -299,16 +229,3 @@ class CancelResolver:
             payload=CallFunctionResult(function_name="cancel_task", content=message, ok=ok),
             dedup_key=f"cancel:{req.id}",
         ))
-
-    @staticmethod
-    def _parse(resp) -> tuple[str, str, str]:
-        raw = _content(resp).strip()
-        m = re.search(r"\{.*\}", raw, re.DOTALL)  # フェンスや前後テキストを許容
-        if m:
-            try:
-                d = json.loads(m.group(0))
-                if isinstance(d, dict):
-                    return (str(d.get("decision", "")), str(d.get("task_id") or "").strip(), str(d.get("message", "")))
-            except (ValueError, TypeError):
-                pass
-        return ("none", "", "")

@@ -16,10 +16,11 @@ from .executor import TaskExecutor
 from .scheduler import ReconcileTimer
 from .capabilities import active_tasks_for_context, register_task_capabilities
 from .agent import TaskAgent
-from .cancel_resolver import CancelResolver, CancelRequest
+from .cancel_resolver import CancelResolver, CancelRequest, undelivered_reports
 
 __all__ = [
     "Task", "TaskStore", "TaskExecutor", "ReconcileTimer", "register_task_capabilities",
     "active_tasks_for_context", "TaskAgent", "CancelResolver", "CancelRequest",
+    "undelivered_reports",
     "new_task_id", "PENDING", "RUNNING", "DONE", "FAILED", "CANCELLED", "TERMINAL",
 ]

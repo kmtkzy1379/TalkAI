@@ -89,8 +89,8 @@ async def main():
     state = SpeechState(); queue = StimulusQueue()
     store = TaskStore(task_file=os.path.join(art, "t.jsonl"))
     caps = CapabilityRegistry(is_busy=lambda: runner.is_busy(), qsize=lambda: queue.qsize())
-    cancel_resolver = CancelResolver(store=store, model_registry=reg, queue=queue)
-    register_task_capabilities(caps, store, cancel_resolver=cancel_resolver)
+    cancel_resolver = CancelResolver(store=store, queue=queue)
+    register_task_capabilities(caps, store, cancel_resolver=cancel_resolver, queue=queue)
 
     _exec = caps.execute
 

@@ -136,8 +136,9 @@ class World:
         self.store = TaskStore(task_file=self.task_file)
         self.caps = CapabilityRegistry(is_busy=lambda: self.runner.is_busy(), qsize=lambda: self.queue.qsize())
         # 本番同等の要: CancelResolver を配線（voice_loop.py と同じ）。既存ツールはここが欠けていた。
-        self.resolver = CancelResolver(store=self.store, model_registry=self.reg, queue=self.queue)
-        register_task_capabilities(self.caps, self.store, cancel_resolver=self.resolver)
+        self.resolver = CancelResolver(store=self.store, queue=self.queue)
+        register_task_capabilities(self.caps, self.store, cancel_resolver=self.resolver,
+                                   queue=self.queue)
         self.dispatcher = FunctionDispatcher(registry=self.caps, queue=self.queue)
         _submit = self.dispatcher.submit
 
@@ -726,8 +727,8 @@ async def phase_b_probe(reg, art_dir, n, reference, expect_keep):
     store = TaskStore(task_file=os.path.join(art_dir, f"b{n}.jsonl"))
     await store.initialize()
     caps = CapabilityRegistry(is_busy=lambda: False, qsize=lambda: 0)
-    resolver = CancelResolver(store=store, model_registry=reg, queue=q)
-    register_task_capabilities(caps, store, cancel_resolver=resolver)
+    resolver = CancelResolver(store=store, queue=q)
+    register_task_capabilities(caps, store, cancel_resolver=resolver, queue=q)
     resolver.start()
     try:
         caps.execute("delegate_task", {"goal": "50秒後に今の気持ち教えて", "when_seconds": 50})
@@ -755,8 +756,8 @@ async def phase_b_same_turn(reg, art_dir):
     store = TaskStore(task_file=os.path.join(art_dir, "b_pair.jsonl"))
     await store.initialize()
     caps = CapabilityRegistry(is_busy=lambda: False, qsize=lambda: 0)
-    resolver = CancelResolver(store=store, model_registry=reg, queue=q)
-    register_task_capabilities(caps, store, cancel_resolver=resolver)
+    resolver = CancelResolver(store=store, queue=q)
+    register_task_capabilities(caps, store, cancel_resolver=resolver, queue=q)
     dispatcher = FunctionDispatcher(registry=caps, queue=q)
     dispatcher.start(); resolver.start()
     try:
