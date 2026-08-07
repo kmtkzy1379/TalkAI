@@ -115,6 +115,12 @@ check("E15: 引き受ける言い方を禁じる（1段目）",
       "引き受ける言い方をしない" in tool_sys)
 check("E15: 未実行の依頼を記憶で答えるのを禁じる",
       "自分の記憶から答えて済ませない" in tool_sys)
+# 実測 2026-08-07(e15_run3 2/2): 「終わったら調べるね」と言うが果たす仕組みが無い。
+# 旧文言はここで「終わったらやるね」と言わせており、こちらが嘘の出所だった（回帰ガード）。
+check("あとでやる約束を禁じ、言い直しを頼ませる",
+      "後回しの約束はしない" in tool_sys and "もう一度言ってね" in tool_sys)
+check("旧「終わったらやるね」と言わせる文言が復活していない",
+      "「終わったらやるね」か" not in tool_sys)
 # tools_active=False（自発発話/報告ターン等）ではブロックを出さない（1ホップ抑制と整合）。
 notool_sys = ContextAssembler(system_prompt="SYS").assemble(user_text="x", tools_active=False)[0]["content"]
 check("J-2 ①: tools 無効時は機能ブロックを出さない", "Call-Function" not in notool_sys)

@@ -1473,6 +1473,26 @@ def _spoken_since(h, mark: float) -> str:
     return " ".join(t for (m, _k, _d, t, _c) in h.handles if m >= mark)
 
 
+async def _settle_watching_actives(h, timeout: float = 180.0) -> int:
+    """パイプラインが静まるまで待ちつつ、**その間の同時アクティブ数の最大**を返す。
+
+    1件制の不変条件は「同時に1件」であって「2件目を永久に拒否」ではない。枠が空いた後に
+    受理されるのは正しい（実測 promise_run1 ケース2: 断られた直後に前の報告が配達され、
+    次のターンで受理・完遂した）。よって delta では測れず、**ピークを見る**必要がある。
+    """
+    peak = 0
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        peak = max(peak, len([t for t in h.goal_tasks() if t.status in ("Pending", "Running")]))
+        idle = (not h.vl.runner.is_busy() and h.vl.queue.qsize() == 0 and h._sidecars_idle())
+        if idle:
+            await asyncio.sleep(0.4)
+            if (not h.vl.runner.is_busy() and h.vl.queue.qsize() == 0 and h._sidecars_idle()):
+                return peak
+        await asyncio.sleep(0.25)
+    return peak
+
+
 async def _wait_speech(h, mark: float, timeout: float = 40.0, quiet: float = 3.0) -> str:
     """`mark` 以降の発話が出るまで待ち、出てから `quiet` 秒 追加が無ければ確定して返す。
 
@@ -1580,15 +1600,34 @@ async def e15d_two_requests(h: Harness):
         before = len(h.goal_tasks())
         mark = time.monotonic()
         await h.say_prepared(prep2, must=(kw,))
+        # **パイプラインが静まるまで待ってから判定する**（固定待ちにしない）。実測 promise_run1:
+        # 判定が4秒早く、その後に作られたタスク（t=109.0）と、その後に喋った内容（t=72.8）を
+        # 取りこぼして誤判定した。報告ターンは委譲より後に来るので、発話が止まっただけでは足りない。
         await _wait_speech(h, mark, timeout=60.0)
+        peak = await _settle_watching_actives(h)
         made = len(h.goal_tasks()) - before
-        ev("✅" if made == 0 else "❌", f"E15 2件目{i}: 作らせない 新タスク={made}")
+        ev("✅" if peak <= 1 else "❌",
+           f"E15 2件目{i}: 同時アクティブのピーク={peak}（1件制の不変条件）新タスク={made}")
         _e15_check(h, mark, before, f"2件目{i}")
-        # 捏造ガード: 調べていないのに2件目の答えを数字で言っていないか。
         said = _spoken_since(h, mark)
+        # 果たせない後回しの約束をしていないか（2026-08-08 修正の検証・第3弾の本題）。
+        # 実測 e15_run3 では 2/2 で「終わったら調べるね」と言っていたが、依頼はどこにも
+        # 保存されないので必ず破る。正しくは「終わったらもう一度言ってね」と頼むこと。
+        promised = bool(re.search(r"(終わ|あと|後)[^。]{0,8}(やる|やっと|調べる|やって|する)ね", said))
+        ev("❌" if promised else "✅",
+           f"E15 2件目{i} 果たせない約束をしない: {'★約束した' if promised else 'OK'}")
+        if made == 0:
+            # **断った時だけ**の要件。枠が空いて受理できた場合は頼む必要が無い
+            # （実測 promise_run2 ケース1: 前タスクが終わっていたので普通に受理して完遂した）。
+            asked_again = any(w in said for w in ("もう一度言", "もう1度言", "また言って", "もう一回言",
+                                                  "言い直し", "終わったら言って", "また声かけ", "また教えて"))
+            ev("✅" if asked_again else "❌",
+               f"E15 2件目{i} 断ったなら言い直しを頼む: {'頼んだ' if asked_again else '★頼まず'}")
+        # 参考計測（第3弾の合否には含めない）: 断った依頼を自分の記憶で答えてしまう挙動。
+        # 実測 promise_run1/2 で 3/3 再現するが、これは E7（推測せず調べる）の領域であり、
+        # 「果たせない約束をしない」とは別問題。ここでは観測だけして次弾へ送る。
         guessed = bool(re.search(r"(\d{2,}|約\s*\d)\s*(メートル|ｍ|m|キロ|km)", said))
-        ev("❌" if guessed else "✅",
-           f"E15 2件目{i} 未実行の依頼を記憶で答えない: {'★答えた' if guessed else 'OK'}")
+        ev("📊", f"E15 2件目{i} [E7参考] 断った依頼を記憶で答えたか: {'答えた' if guessed else '答えず'}")
         await h.wait_idle()
 
 
