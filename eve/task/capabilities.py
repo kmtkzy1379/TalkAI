@@ -146,10 +146,20 @@ def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resol
                 return f"それ、今ちょうど調べてるところだよ（ID:{dup.task_id}）。"
             return f"それはもう予約してるよ（ID:{dup.task_id}）。"
         # 1件制ゲート（2026-08-07 ユーザ裁定）。ここで作らないので**必ず声に出す**。
+        #
+        # E15 の2重構造（ユーザ裁定 2026-08-07）: 1段目はプロンプト（`context_assembler.py`）で
+        # 「引き受ける言い方をしない」。それをすり抜けて呼んでしまった場合の2段目がここで、
+        # **訂正の指示そのものを戻り値に埋める**。応答本文は tool より先に喋り終わるので
+        # （`response/orchestrator.py:453,460`）、この時点で既に「やっとくね」と言った後の
+        # ことがある＝黙って断ると依頼が蒸発する。だから「訂正しろ」まで書く。
         holder, state = _slot_holder()
         if holder is not None:
-            return (f"（今は「{_display_name(holder)}」を{state}から、それは受けられないよ。"
-                    "終わって結果を伝えたらまた言ってね。先にやりたいなら今のを取り消して）")
+            name = _display_name(holder)
+            return (f"（受け付けられなかった。今は「{name[:40]}」を{state}。"
+                    f"**さっき引き受けるように言っていたら、ここで必ず訂正する**"
+                    f"（例:「ごめん、今『{name[:20]}』をやってて、それはまだ受けられないんだ」）。"
+                    "終わってからやるか、今のを取り消して先にやるかを聞くこと。"
+                    "**この依頼の中身を自分の記憶で答えて済ませない**）")
         task = Task(task_id=new_task_id(), what="", goal=goal, when=when)
         store.add(task)
         last_add["mono"] = time.monotonic()

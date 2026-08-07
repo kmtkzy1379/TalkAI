@@ -169,13 +169,125 @@ def grab_png(downscale: int = 1600):
     return buf.getvalue(), ph
 
 
+# --- 制御下の静止ウィンドウ（真のノイズ床と検出力を同時に測る）------------------
+# デスクトップをそのまま撮ると、時計・ターミナル・カーソル点滅が常に動いていて
+# 「静止」が作れない（実測 2026-08-07: 画素完全一致ペアが 0/15）。
+# 自分で中身を完全に制御した窓を出せば、(a) 一切変えない=ノイズ床、
+# (b) N行だけ変える=検出力、を同じ経路（mss→OCR）で測れる。CI にも載せられる。
+_LINES = [
+    "第1章 タスク管理の設計について",
+    "予約タスクは同時に一件だけ受け付ける",
+    "The quick brown fox jumps over the lazy dog",
+    "画面認識は毎秒二回のキャプチャで動作する",
+    "surprise = 0.42  threshold = 0.75  count = 128",
+    "エラーが出たら自分で検索して解決策を探す",
+    "C:\\eve_ws\\workspace\\primes.txt を表示中",
+    "応答レイテンシの中央値は三点一四秒だった",
+    "OCR text must never be passed to the LLM",
+    "取り消しの言い回しはそのまま渡してよい",
+    "合計 477 件のテストが二回連続で成功した",
+    "ウィンドウを閉じる能力を追加で実装した",
+]
+
+
+class StaticWindow:
+    """中身を完全に制御した Tk 窓。`set_lines` で任意行だけ差し替えられる。"""
+
+    def __init__(self) -> None:
+        import tkinter as tk
+
+        self._tk = tk
+        self.root = tk.Tk()
+        self.root.title("ocr_bench")
+        self.root.geometry("1280x820+40+40")
+        self.root.configure(bg="white")
+        self.text = tk.Text(self.root, font=("Meiryo", 16), bg="white", fg="black",
+                            bd=0, highlightthickness=0, insertwidth=0, wrap="none")
+        self.text.pack(fill="both", expand=True, padx=24, pady=24)
+        self.root.update()
+
+    def set_lines(self, lines) -> None:
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", "\n\n".join(lines))
+        self.text.configure(state="disabled")  # カーソル点滅を消す＝静止を作る
+        self.root.update()
+        self.root.update_idletasks()
+
+    def close(self) -> None:
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+
+def run_controlled(engines, downscale: int, settle: float = 1.2) -> int:
+    """静止窓で「真のノイズ床」と「検出力」を測り、閾値が引けるか判定する。"""
+    win = StaticWindow()
+    try:
+        win.set_lines(_LINES)
+        time.sleep(settle)
+        base = [grab_png(downscale)[0] for _ in range(6)]
+        ident = sum(1 for i in range(len(base) - 1) if base[i] == base[i + 1])
+        print(f"■ 静止窓: 6枚中 隣接ペア {ident}/{len(base) - 1} が画素完全一致\n")
+
+        variants = {}
+        for label, n in (("1行変更", 1), ("3行変更", 3), ("6行変更", 6)):
+            mod = list(_LINES)
+            for i in range(n):
+                mod[i] = f"変更後の行 {i} — modified line {i} でテキストが入れ替わった"
+            win.set_lines(mod)
+            time.sleep(settle)
+            variants[label] = grab_png(downscale)[0]
+        win.set_lines(_LINES)  # 元に戻す
+
+        for key in engines:
+            cls = ENGINES.get(key)
+            if cls is None:
+                continue
+            print(f"── {key} ──")
+            try:
+                eng = cls()
+                texts = [eng.read(p) for p in base]
+                vtexts = {k: eng.read(v) for k, v in variants.items()}
+            except Exception as e:
+                print(f"  使えない: {type(e).__name__}: {e}\n")
+                continue
+            noise = [diff_ratio(texts[i], texts[i + 1]) for i in range(len(texts) - 1)]
+            nmax = max(noise) if noise else 0.0
+            print(f"  読取文字数: {len(norm(texts[0]))}")
+            print(f"  真ノイズ床: 中央値 {st.median(noise) * 100:.2f}% / 最大 {nmax * 100:.2f}%")
+            det = []
+            for k, t in vtexts.items():
+                d = diff_ratio(texts[-1], t)
+                det.append(d)
+                print(f"  検出力 {k}: {d * 100:.2f}%")
+            dmin = min(det) if det else 0.0
+            sep = dmin > nmax * 2 and nmax < 0.03
+            print(f"  判定     : {'○ 閾値を引ける' if sep else '× ノイズと検出が近すぎる'}"
+                  f"（ノイズ最大 {nmax * 100:.2f}% / 最小検出 {dmin * 100:.2f}%）")
+            if sep:
+                print(f"  推奨閾値  : {max(nmax * 2, 0.01) * 100:.1f}%"
+                      "（最大ノイズの2倍・1行の変化は拾える）")
+            print()
+    finally:
+        win.close()
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--engines", default="win,rapid")
     ap.add_argument("--shots", type=int, default=12, help="連続キャプチャ枚数")
     ap.add_argument("--interval", type=float, default=1.0, help="キャプチャ間隔(秒)")
     ap.add_argument("--downscale", type=int, default=1600)
+    ap.add_argument("--controlled", action="store_true",
+                    help="制御下の静止窓で 真ノイズ床/検出力 を測る（推奨・CI 向き）")
     args = ap.parse_args()
+
+    engines = [e.strip() for e in args.engines.split(",") if e.strip()]
+    if args.controlled:
+        return run_controlled(engines, args.downscale)
 
     print(f"■ 連続 {args.shots} 枚を {args.interval}s 間隔でキャプチャ（この間 画面は触らないこと）")
     shots, phashes = [], []
@@ -204,7 +316,7 @@ def main() -> int:
         print("  ★ 静止ペアがゼロ。画面が動き続けているのでノイズ床を測れない。")
         print("    メモ帳など静止した画面を最前面にして再実行すること。\n")
 
-    for key in [e.strip() for e in args.engines.split(",") if e.strip()]:
+    for key in engines:
         cls = ENGINES.get(key)
         if cls is None:
             print(f"× 未知のエンジン {key}")

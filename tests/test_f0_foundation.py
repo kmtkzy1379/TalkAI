@@ -109,6 +109,12 @@ check("1件制: 旧「新しい部分だけ別 goal」文言が復活してい�
 # goal に合体させて投げ直した。「2つ目を委譲するな」だけでは塞がらない抜け道の回帰ガード。
 check("1件制: 実行中の内容を新 goal に混ぜ直す抜け道を塞ぐ",
       "混ぜて出し直さない" in tool_sys and "1つの goal にまとめて" in tool_sys)
+# E15（実測 2026-08-07・2/2ラン再現）: 断られるのに「やっとくね」と言い、さらにその依頼の
+# 中身を自分の記憶で答えて済ませた。応答本文は tool より先に喋り終わるので言う前に止める。
+check("E15: 引き受ける言い方を禁じる（1段目）",
+      "引き受ける言い方をしない" in tool_sys)
+check("E15: 未実行の依頼を記憶で答えるのを禁じる",
+      "自分の記憶から答えて済ませない" in tool_sys)
 # tools_active=False（自発発話/報告ターン等）ではブロックを出さない（1ホップ抑制と整合）。
 notool_sys = ContextAssembler(system_prompt="SYS").assemble(user_text="x", tools_active=False)[0]["content"]
 check("J-2 ①: tools 無効時は機能ブロックを出さない", "Call-Function" not in notool_sys)

@@ -383,6 +383,8 @@ async def t_single_slot_gate():
         and r2.startswith("（")
         and "北海道の面積を検索して教えて" in r2  # 何が枠を握っているかを言う
         and "取り消して" in r2  # 脱出口を示す
+        # E15 の2段目: 既に「やっとくね」と言った後でも訂正させる指示を戻り値に埋める。
+        and "訂正" in r2 and "記憶で答えて済ませない" in r2
     )
     # Running でも同じ（枠は状態を問わず1つ）。
     s.claim_due()
