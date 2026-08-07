@@ -130,6 +130,9 @@ def register_viewer_capability(registry: CapabilityRegistry, ws: Workspace, *,
         name="show_on_screen",
         # E5: 「保存した」だと既にファイルがある前提に読め、「取ってきて見せる」という
         # 発想に届かない（SC3 で 0/3）。目的（見せる）を1文目に置く。
+        # 「見せた方が早い」を1文目へ動かす必要は無い: `outward_actions()`（応答LLM 向け・
+        # 1文目のみ）が要るのは**手段の有無**で、使いどころの示唆は TaskAgent 向けであり、
+        # そちらは `agent_tool_schemas()` が description 全文を渡している（registry.py:144-146）。
         description="作業フォルダにある画像やテキストを、PCの画面に出してユーザに見せる。"
                     "言葉で説明しにくいものは、見せた方が早い。"
                     "path に作業フォルダからの相対パスを渡す（画像はそのまま、"
@@ -226,8 +229,13 @@ def register_exec_capability(registry: CapabilityRegistry, ws: Workspace, *,
         name="run_program",
         # E5: 「自分が書いた」だと curl 等の許可済みコマンドを除外して読める（実際には
         # allowlist にあるものは何でも動かせる。実測で curl による取得も成立している）。
-        description="自分の作業フォルダで、許可されたコマンドやプログラムを実行する。"
-                    "ネットからファイルを取ってくる、作る、変換する、といった作業もこれでできる。"
+        # **1文目に全部入れる**（2026-08-08）: `registry.outward_actions()` は
+        # `description.split("。")[0]` しか取らない（`registry.py:161`）。旧文では
+        # 「ネットから取ってくる」が2文目にあり、応答LLM には**届いていなかった**
+        # （E5 が「3件中 search_web だけ実証」で止まった原因）。ここは能力の一覧として
+        # ユーザ向け発話文脈にも出るので、手段の全体像を1文目で言い切る。
+        description="自分の作業フォルダで、プログラムを書いて動かしたり、"
+                    "ネットからファイルを取ってきたり、形式を変換したりする。"
                     f"program に実行するもの（{'・'.join(sorted(allow_set))} のどれか）、"
                     "args に引数の配列を渡す（例: program=python, args=['hello.py']）。"
                     "作業フォルダの外には出られない。",
