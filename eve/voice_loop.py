@@ -23,6 +23,7 @@ from .pipeline.orchestrator import PipelineRunner
 from .pipeline.stimulus import StimulusKind
 from .pipeline.stimulus_queue import StimulusQueue
 from .capability import CapabilityRegistry
+from .cleanup import sweep as cleanup_sweep
 from .response.delivery_checker import DeliveryChecker
 from .response.function_dispatcher import FunctionDispatcher
 from .task import (
@@ -363,6 +364,13 @@ class VoiceLoop:
         # J-1: タスク管理（既定 off）。store 復元 + executor/scheduler 起動。
         if self.task_store is not None:
             await self.task_store.initialize()
+            # 起動時の掃除（2026-08-08 ユーザ裁定）: **executor を起動する前**に未終了タスクを
+            # 片付ける。後だと reconcile が前回の Pending を掴んで走り出し、1件制では
+            # 起動直後からユーザの最初の依頼が断られる。異常終了した前回の残りもここで回収する。
+            _swept = cleanup_sweep(task_store=self.task_store, workspace=self.workspace,
+                                   phase="startup")
+            if any(_swept.values()):
+                logger.info("🧹 起動時の掃除: %s", _swept)
             self.task_executor.start()
             self.reconcile_timer.start()
             if self.cancel_resolver is not None:
@@ -463,6 +471,16 @@ class VoiceLoop:
             except Exception:
                 pass
         if self.task_store is not None:
+            # 終了時の掃除（2026-08-08 ユーザ裁定）: **executor を止めた後・store を閉じる前**。
+            # 未終了タスクを terminal にしておかないと、次の起動で 1件制の枠を塞ぐ。
+            # 異常終了ではここに来ないが、その分は起動時の掃除が回収する（両端でやる理由）。
+            try:
+                swept = cleanup_sweep(task_store=self.task_store, workspace=self.workspace,
+                                      phase="shutdown")
+                if any(swept.values()):
+                    logger.info("🧹 終了時の掃除: %s", swept)
+            except Exception:
+                pass
             try:
                 await self.task_store.shutdown()
             except Exception:
