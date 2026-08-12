@@ -168,7 +168,12 @@ class Config:
     # 実測 2026-08-07: pHash 一致 15/15 ペアで画素完全一致 0/15・OCR 差分は最大24%＝pHash は
     # 文字変化を見ていない。OCR の読み取りは **LLM に一切渡さない**（誤読がハルシネの元）。
     VLM_OCR_ENABLED = os.getenv("VLM_OCR_ENABLED", "0") == "1"  # 既定 off（.env で明示 on）
-    VLM_OCR_DIFF_PCT = float(os.getenv("VLM_OCR_DIFF_PCT", "10.0"))  # 何%変われば起こすか（鈍め）
+    # 何%変われば起こすか。**25%**（裁定 2026-08-12）。実測で決めた:
+    # 作文中(5.1分)の発火は 10%→3.9回/分 / 20%→1.4 / 25%→0.8 / 30%→0。
+    # 通常利用（画面が動く一般的なE2E 82分）の検知は 10%→0.51回/分 / 25%→0.34 とほぼ維持される。
+    # 30% は作文中を完全に黙らせるが「12行中6行の入れ替え(20.1%)」も見逃すので採らない。
+    # クールダウンは採らない: 大きな変化が立て続けに起きた時に見逃すため（ユーザ裁定）。
+    VLM_OCR_DIFF_PCT = float(os.getenv("VLM_OCR_DIFF_PCT", "25.0"))
     VLM_OCR_INTERVAL_SEC = float(os.getenv("VLM_OCR_INTERVAL_SEC", "3.0"))  # OCR の最短間隔
     VLM_OCR_DOWNSCALE = int(os.getenv("VLM_OCR_DOWNSCALE", "1600"))  # OCR 用キャプチャの長辺
 

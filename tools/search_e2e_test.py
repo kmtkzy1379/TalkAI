@@ -2020,7 +2020,104 @@ async def socr_writing_load(h: Harness):
     await h.wait_idle()
 
 
+# 動画再生の子プロセス（OpenCV）。**自分が起動したものだけを PID で閉じる**。
+# 既定プレイヤー（WMP）を使わないのは、notepad と同じ理由＝他人の窓を掴む/巻き添えで殺すため。
+_VIDEO_WIN = r'''
+import sys, time, cv2
+path, dur = sys.argv[1], float(sys.argv[2])
+cap = cv2.VideoCapture(path)
+fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+win = "E2E video"
+cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+cv2.resizeWindow(win, 1280, 800)
+cv2.moveWindow(win, 60, 40)
+end = time.time() + dur
+while time.time() < end:
+    ok, fr = cap.read()
+    if not ok:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)   # ループ再生（尺より長く測りたい時のため）
+        continue
+    cv2.imshow(win, fr)
+    if cv2.waitKey(max(1, int(1000 / fps))) == 27:
+        break
+cap.release(); cv2.destroyAllWindows()
+'''
+
+
+async def svid_video_watch(h: Harness):
+    """★動画再生中の画面認識 — 「見えてないけど」が出ないか / 実況が正確か。
+
+    アニメ動画は**常時ほぼ全画面が変化し続ける**ため、文字ゲート（文字の差分）ではなく
+    pHash 側が連続で反応し、実況が追いつかない状況が作れる。
+    作文（文字が増える）とは別種の負荷で、`state.py` の「実況の後に画面が変わった → 画面情報なし」
+    経路（今の言い回しの出どころ）を最も踏みやすい。
+
+    測るもの:
+      (1) 「今なにが見えてる?」に**正しく答えられるか**（動画だと認識できるか）
+      (2) 「見えてない」型の言い回しが出るか（出たらプロンプト改修の根拠になる）
+      (3) 放置中の自発発話が画面を捏造しないか
+    """
+    path = os.getenv("E2E_VIDEO") or r"c:\Users\tester\Videos\画面録画\画面録画 2026-08-12 233704.mp4"
+    dur = float(os.getenv("E2E_VIDEO_SEC") or 130)
+    if not os.path.isfile(path):
+        ev("⚠", f"SVID 動画が無いのでスキップ: {path}")
+        return
+    prep2 = await h.prep("今も同じの流れてる？")
+    prep3 = await h.prep("どんな雰囲気の映像だった？")
+    proc = subprocess.Popen([sys.executable, "-c", _VIDEO_WIN, path, str(dur)],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    n0 = len(h.handles)
+    try:
+        await asyncio.sleep(12.0)  # 再生が始まって実況が1回は回るまで
+
+        mark = time.monotonic()
+        await h.say("ねえ、今なにが見えてる？", must=("見え",))
+        await _wait_speech(h, mark, timeout=90.0)
+        s1 = _spoken_since(h, mark)
+        ev("💬", f"SVID 1) 再生中『今なにが見えてる?』: {s1[:200]!r}")
+
+        await asyncio.sleep(35.0)  # 放置（自発発話が出るか・捏造しないか）
+        mark2 = time.monotonic()
+        await h.say_prepared(prep2, must=("同じ",))
+        await _wait_speech(h, mark2, timeout=90.0)
+        s2 = _spoken_since(h, mark2)
+        ev("💬", f"SVID 2) 再生中『今も同じの流れてる?』: {s2[:200]!r}")
+
+        await asyncio.sleep(40.0)
+    finally:
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(5)
+                except Exception:
+                    proc.kill()
+        except Exception:
+            pass
+    await asyncio.sleep(8.0)  # 動画を閉じた直後
+    mark3 = time.monotonic()
+    await h.say_prepared(prep3, must=("雰囲気",))
+    await _wait_speech(h, mark3, timeout=90.0)
+    s3 = _spoken_since(h, mark3)
+    ev("💬", f"SVID 3) 停止後『どんな雰囲気だった?』: {s3[:220]!r}")
+
+    # --- 判定 ---
+    said = " ".join(t for (_m, _k, _d, t, _c) in h.handles[n0:])
+    autos = [t for (_m, k, _d, t, _c) in h.handles[n0:] if k == "AUTONOMOUS_SPEECH"]
+    blind = re.findall(r"[^。]{0,24}(?:画面[^。]{0,6}(?:見えて(?:い)?な|見えません|分から)|見えてない)[^。]{0,24}", said)
+    ev("❌" if blind else "✅",
+       f"SVID 「見えてない」型の言い回し: {len(blind)}件 {blind[:3] if blind else '(無し)'}")
+    got = any(w in said for w in ("動画", "映像", "アニメ", "再生", "流れて", "シーン"))
+    ev("✅" if got else "❌", f"SVID 動画だと認識できた: {got}")
+    ev("📊", f"SVID 放置中の自発発話 {len(autos)}件")
+    for t in autos:
+        ev("🗣", f"SVID 自発: {t[:130]}")
+    await h.wait_idle()
+
+
 SCENARIOS = [
+    ("SVID_動画再生中の画面認識", svid_video_watch),
     ("SPUSH_迎合の二段目", spush_sycophancy),
     ("SFAIL_タスク失敗系", sfail_task_failures),
     ("SREP_既出用件", srep_repeat_request),
