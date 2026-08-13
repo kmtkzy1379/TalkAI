@@ -287,8 +287,33 @@ Tier-1 実測: 改修前 **495 PASS** → 改修後 **542 PASS / FAIL 0**（2回
 
 Tier-1: 608 → **656 PASS / FAIL 0**（2回連続）。
 
+#### キャプチャ除外（実装済 2026-08-14・`eve/capture_guard.py`・`UI_HIDE_FROM_CAPTURE` 既定 ON）
+
+イブ自身のウィンドウ（Live2D UI / 表示ビューア）を**イブの画面認識から隠す**
+（D4 / E11 自己観察ループ対策）。`SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`。
+**黒塗りマスクは採らない**（跡地が真っ黒になり「画面が真っ黒」という新しい実況材料を
+こちらで作ってしまう＝ユーザ指摘）。DisplayAffinity は DWM が**背後を合成する**ので
+窓が最初から無かったのと同じ画面になる（実測: 跡地は背後色 98.9% / 黒 0.6%）。
+
+**この設定だけ既定 ON**: 能力フラグではなく**ガード**で、OFF は既知の不具合状態だから
+（`CLAUDE.md` の「機能フラグはコード既定 off」は能力の話）。`.env.example` に明記済み。
+**この設定だけ即時反映**（OS API を直接叩くだけで `Config` を読み直さない）＝ UI の
+チェックボックスから配信直前に切り替えられる。有効な間は **OBS からも消える**
+（裁定 2026-08-13: 配信中は画面認識を使わない想定なので実運用で衝突しない）。
+
+実測で確定した制約:
+- **他プロセスの窓には適用できない**（`ERROR_ACCESS_DENIED(5)`）。よって別プロセスの
+  ビューアは**自分で**呼ぶ（設定は環境変数を継承）。トグルは**既に開いている窓には効かない**。
+- ctypes は `argtypes` を指定しないと **64bit の HWND が黙って切り捨てられる**（実際に踏んだ）。
+- venv の `python.exe` は実体を子プロセスで起動するため、**ビューアの窓は Popen の pid に
+  属さない**（capture_guard 導入前からの挙動）。窓を探すならタイトルで探す。
+
+検証: `tools/capture_guard_check.py`（**API コストゼロ・約30秒**・2回連続 7/7）/
+Tier-1 `tests/test_capture_guard.py` 25件 / 実起動 `tools/ui_chat.py` で窓の矩形を撮ると
+**背後のエディタが写る**ことを目視確認。Tier-1 全体 656 → **681 PASS / FAIL 0**。
+
 ### 未実装
-UI のメニュー/設定/ログ表示/画面表示ペイン/キャプチャ除外（`docs/UI_DESIGN.md` の P1 以降）/
+UI のメニュー/設定/ログ表示/画面表示ペイン（`docs/UI_DESIGN.md` の P1 以降）/
 配線層PORT（vts / run / launcher / app）/ YouTube 配信モード /
 **任意アプリの起動・ウィンドウ操作**（window_op・launch_app。※`download` は `run_program` の curl で実現済み）/
 **(b) 文脈不整合の自己懐疑** / VLM の Gemini Live ストリーム mode。

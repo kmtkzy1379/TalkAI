@@ -26,9 +26,11 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QApplication, QHBoxLayout, QLabel, QSlider, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QHBoxLayout, QLabel, QSlider, QVBoxLayout, QWidget,
 )
 
+from .. import capture_guard
+from ..config import Config
 from .live2d_view import Live2DView, assets_ready
 
 logger = logging.getLogger(__name__)
@@ -160,10 +162,20 @@ class MainWindow(QWidget):
             s.valueChanged.connect(fn)
             row.addWidget(s)
 
+        # キャプチャ除外の ON/OFF。**この設定だけ即時反映**（OS API を直接叩くだけで
+        # `Config` を読み直さないため。配信の直前に切り替えられる方が実用的）。
+        self.hide_cb = QCheckBox("イブの画面認識からこのウィンドウを隠す")
+        self.hide_cb.setChecked(Config.UI_HIDE_FROM_CAPTURE)
+        self.hide_cb.setEnabled(capture_guard.available())
+        self.hide_cb.toggled.connect(self._toggle_hide)
+        self.hide_state = QLabel("")
+
         root = QVBoxLayout(self)
         root.addWidget(self.view, 1)
         root.addWidget(self.line)
         root.addLayout(row)
+        root.addWidget(self.hide_cb)
+        root.addWidget(self.hide_state)
         root.addWidget(self.status)
 
         self._poll = QTimer(self)
@@ -177,6 +189,22 @@ class MainWindow(QWidget):
 
     def start_loop(self) -> None:
         self.thread_.start()
+
+    # --- キャプチャ除外 ---
+    def apply_capture_guard(self) -> None:
+        """自分の窓に適用する。**窓が実際に出てから**でないと HWND が確定しない。"""
+        self._toggle_hide(self.hide_cb.isChecked())
+
+    def _toggle_hide(self, hide: bool) -> None:
+        ok = capture_guard.set_window(int(self.winId()), hide)
+        # これから開くビューア（別プロセス）が同じ設定を継承するように環境変数も更新する。
+        # **既に開いている窓には効かない**（他プロセスの窓へは適用できない＝実測で
+        # ERROR_ACCESS_DENIED）。ビューアは都度開き直す前提なので実害は小さい。
+        os.environ["UI_HIDE_FROM_CAPTURE"] = "1" if hide else "0"
+        mark = "✅" if ok else ("—" if not capture_guard.available() else "⚠")
+        self.hide_state.setText(f"{mark} {capture_guard.describe(hide)}"
+                                + ("" if ok or not capture_guard.available()
+                                   else "（適用に失敗）"))
 
     # --- UI スレッド（queued connection で呼ばれる） ---
     def _on_sentence_started(self, text: str, meta) -> None:
@@ -253,6 +281,8 @@ def main() -> int:
         win = MainWindow()
         win.resize(960, 760)
         win.show()
+        # show() の直後は HWND が確定していないことがあるので1拍おいて適用する
+        QTimer.singleShot(50, win.apply_capture_guard)
         win.start_loop()
         if os.environ.get("UI_AUTOCLOSE_SEC"):  # スモークテスト用
             QTimer.singleShot(int(float(os.environ["UI_AUTOCLOSE_SEC"]) * 1000), win.close)

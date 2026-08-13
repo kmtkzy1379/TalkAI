@@ -177,6 +177,13 @@ class Config:
     VLM_OCR_INTERVAL_SEC = float(os.getenv("VLM_OCR_INTERVAL_SEC", "3.0"))  # OCR の最短間隔
     VLM_OCR_DOWNSCALE = int(os.getenv("VLM_OCR_DOWNSCALE", "1600"))  # OCR 用キャプチャの長辺
 
+    # UI（Live2D ウィンドウ）。**この項目だけ既定 ON**（`docs/UI_DESIGN.md` §4.6）:
+    # 機能フラグ（能力）ではなく**ガード**で、OFF は「イブが自分のログと自分の顔を
+    # ユーザの画面として実況する」既知の不具合状態（D4 / E11 自己観察ループ）だから。
+    # 有効な間は OBS 等の画面キャプチャからも消えるので、配信時は OFF にする
+    # （裁定 2026-08-13: 配信中は画面認識を使わない想定なので実運用で衝突しない）。
+    UI_HIDE_FROM_CAPTURE = os.getenv("UI_HIDE_FROM_CAPTURE", "1") not in ("0", "false", "no")
+
     # Call-Function（J-0 即時 Call-Function・increment 1 は read-only 能力のみ）。
     CALLFUNCTION_ENABLED = os.getenv("CALLFUNCTION_ENABLED", "0") == "1"  # 既定 off（実機で明示 on）
 

@@ -138,6 +138,20 @@ def main(argv: list[str]) -> int:
         text.config(state="disabled")
 
     win.bind("<Escape>", lambda e: win.destroy())
+
+    # イブ自身の画面認識からこの窓を隠す（D4/E11 自己観察ループ対策）。
+    # **別プロセスなので自分で適用する必要がある**（親から他プロセスの窓へ
+    # `SetWindowDisplayAffinity` を掛けると ERROR_ACCESS_DENIED になる・2026-08-14 実測）。
+    # 設定は親から環境変数で継承する。窓が実際に出てから掛ける（`after` で1回）。
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
+        from eve.capture_guard import enabled_by_env, set_own_windows
+
+        if enabled_by_env():
+            win.after(120, lambda: set_own_windows(True))
+    except Exception:  # 表示機能そのものは止めない
+        pass
+
     win.mainloop()
     return 0
 
