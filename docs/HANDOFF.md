@@ -231,6 +231,36 @@ Tier-1 実測: 改修前 **495 PASS** → 改修後 **542 PASS / FAIL 0**（2回
 - → `docs/UI_DESIGN.md` の **P4「自律発話 ON/OFF」**と **§4.2「自発発話頻度」設定**で実装する
   （既定レートは変えず、ユーザが選べるようにするのが目的）。
 
+#### UI 前提工事（2026-08-14・`docs/UI_DESIGN.md` P2）
+
+メニューの ON/OFF を作る**前**に必要な2つの原始的な欠落を埋めた。**まだ本番の呼び出し元は
+無い**（消費者は P4 のメニュー実装）。テストからは呼んでおり死にコードではない。
+
+1. **サイドカーが再開できなかった**: 全 stop() が `_stopping = True` を立てたままで、
+   `start()` しても新しい run ループが最初の `while not self._stopping` で即座に抜けていた。
+   → 該当 **9クラス全部**の `start()` で `_stopping = False` に戻す
+   （FeedbackWorker / DeliveryChecker / FunctionDispatcher / SpeechDecider / SilenceMonitor /
+   CancelResolver / TaskExecutor / ReconcileTimer / VlmWorker）。
+   - `_stopping` は `__init__` / `stop()` / run ループの中でしか読まれない（grep 全件確認）ので、
+     start() で戻しても他の判断に影響しない。
+   - **start() と stop() は重ねてはいけない**: stop() は最後まで `_task` を非 None に保つので、
+     stop 中の start() は**黙って no-op** になる（壊れはしないが意図が消える）。
+     P4 の ControlPlane が遷移を1件ずつ直列化する前提。
+2. **`CapabilityRegistry.unregister()` が無かった**: タスク機能を OFF にしても
+   `delegate_task` を応答LLM から外せなかった。外すと `tool_schemas()` /
+   `agent_tool_schemas()` / `outward_actions()` が**自動で縮む**（全て `_caps` からの導出）。
+   束（タスク+検索+作業フォルダ）は登録前後の `names()` 差分で作るのが安全。
+
+**まだ再開できないもの（P4 で扱う）**: `CaptureThread` は OS スレッドなので再 start 不可
+＝画面認識の再 ON は**インスタンス再生成**が要る。
+
+テスト `tests/test_restartable.py`（38件）。**欠陥クラスを守る作りにした**（E13 の反省）:
+`eve/` を走査して「`_stopping` を持ち start/stop を備えたクラス」を**実際に列挙**し、全件に
+同じ不変条件を課す＝今後同じ形のサイドカーが追加されたら自動的に検査対象に入る。
+修正を1箇所だけ意図的に戻すと、構造チェックと挙動チェックの**両方が落ちる**ことを実測で確認済み。
+
+Tier-1: 608 → **646 PASS / FAIL 0**（2回連続）。
+
 ### 未実装
 UI のメニュー/設定/ログ表示/画面表示ペイン/キャプチャ除外（`docs/UI_DESIGN.md` の P1 以降）/
 配線層PORT（vts / run / launcher / app）/ YouTube 配信モード /

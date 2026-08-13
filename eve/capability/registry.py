@@ -107,6 +107,23 @@ class CapabilityRegistry:
     def register(self, cap: Capability) -> None:
         self._caps[cap.name] = cap
 
+    def unregister(self, *names: str) -> list[str]:
+        """能力を取り外す。**実際に取り外した名前**を返す（未登録名は黙って無視）。
+
+        UI からタスク機能を OFF にするための前提工事（`docs/UI_DESIGN.md` P4）。
+        外すと `tool_schemas()` / `agent_tool_schemas()` / `outward_actions()` が
+        **自動的に縮む**（すべて `_caps` からの導出なので二重管理が発生しない）。
+        つまり「タスクを止めたのに応答LLM が delegate_task を呼べてしまう」状態や
+        「できることの一覧に嘘が残る」状態が構造的に起きない。
+
+        取り外す側の責任: **束（タスク + 検索 + 作業フォルダ）は一緒に外す**。
+        `voice_loop.py` は search / workspace を TASK_ENABLED の内側でしか登録しないので、
+        タスクだけ外して検索を残すと「TaskAgent 専用能力なのに呼び出す主体がいない」
+        という起動時と違う構成になる。呼び出し側は登録前後の `names()` の差分で
+        束を作るのが安全（構成差で名前が変わっても腐らない）。
+        """
+        return [n for n in names if self._caps.pop(n, None) is not None]
+
     def has(self, name: str) -> bool:
         return name in self._caps
 

@@ -39,6 +39,9 @@ class FeedbackWorker:
 
     def start(self) -> None:
         if self._task is None:
+            # 再開可能にする: stop() は `_stopping` を立てたままなので、ここで戻さないと
+            # 新しい run ループが即座に抜けて二度と回らない（UI の ON/OFF の前提工事）。
+            self._stopping = False
             self._task = asyncio.create_task(self._run_forever())
 
     async def stop(self, drain_timeout: float = 2.0) -> None:

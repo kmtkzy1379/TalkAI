@@ -83,6 +83,7 @@ class DeliveryChecker:
 
     def start(self) -> None:
         if self._task is None:
+            self._stopping = False  # 再開可能にする（stop() は立てたままにする）
             self._task = asyncio.create_task(self._run())
 
     async def stop(self, drain_timeout: float = 3.0) -> None:
