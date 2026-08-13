@@ -264,6 +264,9 @@ class VoiceLoop:
         # 再配達（barge-in で潰れた機能報告）の待機タスク。done で自己除去・stop() で cancel。
         self._redeliver_waiters: "set[asyncio.Task]" = set()
         self._ui_tasks: "set[asyncio.Task]" = set()  # UI からの投入（キーボード入力）の保持
+        # 起動の進み具合を UI に見せるフック（既定 None＝ヘッドレスの挙動は不変）。
+        # `fn(key: str, text: str)`。loop 上から同期で呼ぶ＝UI 側は emit だけして戻ること。
+        self.on_progress = None
         self._redeliver_grace_sec = 2.0  # user_speaking 解除→put までの STT 完了猶予
         self._redeliver_max_wait_sec = 60.0  # 話し終わり待ちの上限（餓死防止）
 
@@ -350,29 +353,61 @@ class VoiceLoop:
             and self.speech_decider.is_idle()
         )
 
+    def _progress(self, key: str, text: str) -> None:
+        """起動の進み具合を UI へ知らせる（既定 None＝ヘッドレスでは何もしない）。
+
+        同期・非ブロッキング契約（UI 側は Qt signal を emit するだけ）。例外は握る
+        ＝表示のための機能が起動そのものを壊さない。
+        """
+        if self.on_progress is None:
+            return
+        try:
+            self.on_progress(key, text)
+        except Exception:
+            logger.exception("起動進捗の通知で例外（起動は継続）")
+
     async def warmup(self) -> None:
-        """STT/LLM/TTS を1回空打ちして cold-start（初回の数秒遅延）を消す。"""
-        logger.info("ウォームアップ開始")
-        await self.stt.warmup()
-        try:
-            await self.rag.warmup()  # 埋め込みモデルの初回ロードを先に済ませる
-        except Exception as e:
-            logger.warning("RAG ウォームアップ失敗（続行）: %s", e)
-        try:
-            # max_tokens は付けない: reasoning 系(gpt-5.x)は1トークンで完了できず BadRequest 警告に
-            # なる。warmup は一度きり・"hi" への短応答なのでコストは無視できる。
-            await self.registry.complete("response", [{"role": "user", "content": "hi"}])
-        except Exception as e:
-            logger.warning("LLM ウォームアップ失敗（続行）: %s", e)
-        try:
-            await self.tts.generate("。")
-        except Exception as e:
-            logger.warning("TTS ウォームアップ失敗（続行）: %s", e)
-        logger.info("ウォームアップ完了")
+        """STT/RAG/LLM/TTS の cold-start を**並列に**潰す。
+
+        直列だと合計 15〜36秒かかっていた（実測8ラン・2026-08-14）。4つは互いに独立で、
+        しかも重い RAG（Ruri のロード）は `run_in_executor` の中で動く＝**ループを塞がない**
+        ので、`gather` すれば実質「いちばん遅い1つ」ぶんで済む。
+        失敗は各ステップ内で握るので `gather` に例外は上がらない（1つ落ちても他は進む）。
+        """
+        logger.info("ウォームアップ開始（並列）")
+        t0 = now_mono()
+
+        async def step(key: str, label: str, coro_factory) -> None:
+            s = now_mono()
+            self._progress(key, f"{label}を準備中…")
+            try:
+                await coro_factory()
+                ok = True
+            except Exception as e:
+                logger.warning("%s ウォームアップ失敗（続行）: %s", label, e)
+                ok = False
+            d = now_mono() - s
+            logger.info("ウォームアップ %s: %.1fs%s", label, d, "" if ok else "（失敗・続行）")
+            self._progress(key, f"{label} {'OK' if ok else '失敗（続行）'} {d:.1f}s")
+
+        await asyncio.gather(
+            step("stt", "音声認識", self.stt.warmup),
+            # 埋め込みモデル（Ruri）の初回ロード。実測でここが最長になりやすい
+            step("rag", "記憶（埋め込み）", self.rag.warmup),
+            # max_tokens は付けない: reasoning 系(gpt-5.x)は1トークンで完了できず BadRequest
+            # 警告になる。warmup は一度きり・"hi" への短応答なのでコストは無視できる。
+            step("llm", "応答モデル",
+                 lambda: self.registry.complete("response", [{"role": "user", "content": "hi"}])),
+            step("tts", "音声合成", lambda: self.tts.generate("。")),
+        )
+        logger.info("ウォームアップ完了 %.1fs", now_mono() - t0)
+        self._progress("warmup", f"ウォームアップ完了 {now_mono() - t0:.1f}秒")
 
     async def run(self) -> None:
+        self._progress("memory", "記憶を読み込み中…")
         await self.cache.initialize()  # 既存ログ復元 + 書き込み worker 起動
         await self.rag.initialize()  # 既存 RAG 記憶を復元 + 書き込み worker 起動
+        self._progress("memory", f"記憶 OK（会話 {len(self.cache.recent())} / RAG {len(self.rag)}）")
         # F4 起動時 catch-up: watermark を永続 RAG の最新 timestamp から復元し、
         # それより新しい復元会話（前回 feedback 途中で落ちた tail）を1回取り戻す。
         self.prediction.watermark = self.rag.latest_timestamp()
@@ -380,6 +415,7 @@ class VoiceLoop:
         if self.cache.turns_since(self.prediction.watermark):
             self.feedback_worker.trigger()
         await self.warmup()
+        self._progress("features", "機能を起動中…")
         self._tasks.append(asyncio.create_task(self.audio.play_worker()))
         self._tasks.append(asyncio.create_task(self.runner.run()))
         # F5: 発話判定 worker + 沈黙監視を起動（沈黙時計の baseline をここでリセット）。
@@ -448,8 +484,10 @@ class VoiceLoop:
             )
             self.capture_thread.start()
             logger.info("画面認識(VLM) 稼働")
+        self._progress("mic", "マイクを開いています…")
         await self.input.start()  # mic + STT 消費タスクを起動
         logger.info("VoiceLoop 稼働。話しかけてください。")
+        self._progress("ready", "準備完了。話しかけてください")
         await asyncio.Event().wait()  # キャンセルされるまで稼働
 
     async def stop(self) -> None:

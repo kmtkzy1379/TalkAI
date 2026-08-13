@@ -116,7 +116,11 @@ class Live2DView(QOpenGLWidget):
         self.setMouseTracking(True)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self.update)
-        self._timer.start(16)  # 約60fps
+        # **起動中は描画を落とす**（既定 10fps 相当）。60fps で回したまま起動すると、
+        # 埋め込みモデル（Ruri）のロードと GIL / CPU を奪い合って**起動が 2倍以上遅くなる**。
+        # 実測 2026-08-14: Ruri のロードは UI 無し 11〜15秒 / UI 60fps 併走 26〜44秒。
+        # 準備完了で `set_full_speed()` により 60fps へ戻す。
+        self._timer.start(100)
 
     # ------------------------------------------------------------ 口の駆動（UI スレッドから）
     def set_plan(self, plan: Optional[MouthPlan]) -> None:
@@ -127,6 +131,10 @@ class Live2DView(QOpenGLWidget):
         self._plan = plan
         self._plan_t0 = time.monotonic() + self.lipsync_offset_sec
         self._plan_dur = plan_duration(plan)
+
+    def set_full_speed(self) -> None:
+        """起動が終わったら 60fps に戻す（起動中は CPU をモデルのロードに譲っている）。"""
+        self._timer.start(16)
 
     def clear_plan(self) -> None:
         """発話終了・barge-in。**口を閉じる**（開きっぱなしを構造的に防ぐ）。"""

@@ -45,6 +45,7 @@ class LoopBridge(QObject):
     sentence_ended = Signal(str)
     mood = Signal(str, int)                 # (イブの感情の自由記述, surprise 0-100)
     status = Signal(dict)                   # 表示用スナップショット（値のコピーのみ）
+    progress = Signal(str, str)             # 起動の進み具合 (key, 表示文)
     open_item = Signal(str, str, str)       # タスクウィンドウに開く (path, 表示名, window_id)
     close_item = Signal(str)                # タスクウィンドウから閉じる (window_id)
     loop_stopped = Signal(str)              # 異常終了時の理由（正常終了は空文字）
@@ -200,6 +201,8 @@ class VoiceLoopThread(threading.Thread):
         self._loop = asyncio.get_running_loop()
         vl = VoiceLoop()
         self._vl = vl
+        # 起動の進み具合（案B: 2分間なにも分からない状態をやめる）。emit するだけで戻る。
+        vl.on_progress = lambda key, text: self._bridge.progress.emit(key, text)
         # 再生開始/終了フック（既定 None のところへ差し込む＝本体の挙動は変えない）
         vl.audio.on_sentence_start = self._on_start
         vl.audio.on_sentence_end = self._on_end
@@ -280,6 +283,7 @@ class MainWindow(QWidget):
         self.bridge.sentence_ended.connect(self._on_sentence_ended)
         self.bridge.mood.connect(self._on_mood)
         self.bridge.status.connect(self._on_status)
+        self.bridge.progress.connect(self._on_progress)
         self.bridge.loop_stopped.connect(self._on_loop_stopped)
         self.view.ready.connect(lambda ok, msg: self.status.setText(("✅ " if ok else "❌ ") + msg))
 
@@ -355,6 +359,8 @@ class MainWindow(QWidget):
         self._close_deadline = 0.0
         self._emotion_text = ""
         self._speaking = False
+        self._progress_rows: dict = {}
+        self._ready = False
 
     def start_loop(self) -> None:
         self.thread_.start()
@@ -420,7 +426,23 @@ class MainWindow(QWidget):
         ("idle", "🟢 待機中", "#f0f0f0", "#555"),
     )
 
+    # 起動中に「何が終わって何を待っているか」を出す（順序は起動の流れどおり）
+    _PROGRESS_ORDER = ("memory", "stt", "rag", "llm", "tts", "warmup", "features", "mic", "ready")
+
+    def _on_progress(self, key: str, text: str) -> None:
+        self._progress_rows[key] = text
+        if key == "ready":
+            self._ready = True
+            # 起動中は描画を落として CPU をモデルのロードに譲っていた（§起動時間）。戻す。
+            self.view.set_full_speed()
+        rows = [self._progress_rows[k] for k in self._PROGRESS_ORDER
+                if k in self._progress_rows]
+        self.status.setText("　/　".join(rows[-4:]))  # 直近4件だけ出す（横に伸びすぎない）
+        self.pill.setText("⏳ 起動中" if not self._ready else self.pill.text())
+
     def _on_status(self, s: dict) -> None:
+        if not self._ready:
+            return  # 起動中は進捗表示を上書きしない
         if self._speaking:
             key = "speaking"
         elif s.get("user_speaking"):
@@ -467,11 +489,10 @@ class MainWindow(QWidget):
         self.status.setText("⏹ VoiceLoop 停止" + (f": {reason}" if reason else "（正常終了）"))
 
     def _refresh(self) -> None:
-        if not self._loop_alive:
-            return
-        base = self.status.text().split(" ／ ")[0]
+        if not self._loop_alive or not self._ready:
+            return  # 起動中は `_on_progress` の表示を残す
         self.status.setText(
-            f"{base} ／ {self.view.fps:.0f} fps ／ 口={self.view.mouth:.2f} ／ 発話 {self._spoken} 文"
+            f"{self.view.fps:.0f} fps ／ 口={self.view.mouth:.2f} ／ 発話 {self._spoken} 文"
             f" ／ 感情={self.view.emotion_label}"
             f"（{self._emotion_text or '—'}） ／ surprise={self.view.surprise}")
 
