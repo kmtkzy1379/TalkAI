@@ -20,7 +20,7 @@ from .memory.embed import make_embedder
 from .model_registry import ModelRegistry
 from .pipeline.audio_play_queue import AudioPlayQueue
 from .pipeline.orchestrator import PipelineRunner
-from .pipeline.stimulus import StimulusKind
+from .pipeline.stimulus import Stimulus, StimulusKind
 from .pipeline.stimulus_queue import StimulusQueue
 from .capability import CapabilityRegistry
 from .cleanup import sweep as cleanup_sweep
@@ -263,6 +263,7 @@ class VoiceLoop:
         self._tasks: list[asyncio.Task] = []
         # 再配達（barge-in で潰れた機能報告）の待機タスク。done で自己除去・stop() で cancel。
         self._redeliver_waiters: "set[asyncio.Task]" = set()
+        self._ui_tasks: "set[asyncio.Task]" = set()  # UI からの投入（キーボード入力）の保持
         self._redeliver_grace_sec = 2.0  # user_speaking 解除→put までの STT 完了猶予
         self._redeliver_max_wait_sec = 60.0  # 話し終わり待ちの上限（餓死防止）
 
@@ -274,6 +275,33 @@ class VoiceLoop:
         # F5: ユーザ優先。判定中の自発発話は seq 変化で自己破棄、キュー済みの自発刺激は削除。
         self.speech_state.mark_user_speech_start()
         self.queue.discard_kind(StimulusKind.AUTONOMOUS_SPEECH)
+
+    def submit_user_text(self, text: str) -> None:
+        """キーボードで打った文を**マイク発話と同じ経路**でパイプラインへ入れる。
+
+        **loop 上で呼ぶこと**（UI スレッドからは `call_soon_threadsafe` 経由）。
+        マイク経路（`response/input_source.py:78-96`）と同じ順序で state を進める:
+        1. `_barge_in()` — 喋っている途中なら譲る。口頭で割り込むのと挙動を揃える
+           （黙って待たせると「打ったのに無視された」ように見える）。キュー済みの
+           自発発話も捨てる。
+        2. `mark_user_utterance()` — `_barge_in` が立てた `user_speaking` を戻し、
+           沈黙時計をリセットする。これを忘れると自律発話が永久に止まる。
+        3. 刺激を投入。会話履歴への記録は `response/orchestrator.py:378` が行う
+           （マイク由来と同じ扱い＝記憶の中で区別されない）。
+
+        STT を通らないので `stt_pending` の窓は開かない（待つ理由が無い）。
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        self._barge_in()
+        self.speech_state.mark_user_utterance()
+        logger.info("⌨ %s", text)
+        task = asyncio.create_task(self.queue.put(
+            Stimulus(StimulusKind.USER_UTTERANCE, payload=text)))
+        # 参照を保持する（create_task の戻り値を捨てると GC で消えうる）
+        self._ui_tasks.add(task)
+        task.add_done_callback(self._ui_tasks.discard)
 
     def _on_response_complete(self) -> None:
         """応答 正常完了: F4 feedback を起こす + F5 沈黙時計をリセット（Eve が喋った）。"""
@@ -506,6 +534,8 @@ class VoiceLoop:
         for t in self._tasks:
             t.cancel()
         for t in list(self._redeliver_waiters):  # 再配達待機の孤児化防止（未配達分は消える＝許容）
+            t.cancel()
+        for t in list(self._ui_tasks):  # UI 投入の孤児化防止
             t.cancel()
         try:
             await self.cache.shutdown()  # 書き込みキューをドレイン（記録を取りこぼさない）

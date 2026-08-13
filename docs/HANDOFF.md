@@ -312,8 +312,28 @@ Tier-1: 608 → **656 PASS / FAIL 0**（2回連続）。
 Tier-1 `tests/test_capture_guard.py` 25件 / 実起動 `tools/ui_chat.py` で窓の矩形を撮ると
 **背後のエディタが写る**ことを目視確認。Tier-1 全体 656 → **681 PASS / FAIL 0**。
 
+#### キーボード入力欄 + 状態インジケータ（実装済 2026-08-14）
+
+**キーボード入力**: `VoiceLoop.submit_user_text(text)` を新設。マイク経路
+（`response/input_source.py:78-96`）と**同じ順序で state を進める**:
+`_barge_in()` → `mark_user_utterance()` → 刺激投入。
+- `mark_user_utterance()` を忘れると `user_speaking` が True で固着し、
+  **自律発話が二度と起きなくなる**（テストで固定）。
+- STT を通らないので `stt_pending` の窓は開かない。会話履歴への記録は
+  `response/orchestrator.py:378` が行う＝マイク由来と記憶の中で区別されない。
+- **検証コストが劇的に下がる**（実測）: 従来は口パク1つ確かめるのに実起動 + 発話待ちが
+  要ったが、打って Enter で済む。実測で `⌨ hello are you there` → **1.2秒で応答**。
+
+**状態インジケータ**: 喋ってる / 聞いてる / 聞き取り中 / 考え中 / 待機中 のピル + マイクレベル +
+実行中タスク + 刺激キューの待ち数。値は**すべて loop 側で作ったスナップショット**
+（bool/float/str/int のみ）を 4Hz で Qt signal に流す＝ UI スレッドは loop 所有 state を読まない。
+マイクレベルは `AudioInput.speech_prob`（VAD の発話確率）を新たに公開したもので、
+**表示専用**（判定は従来どおりローカル変数のまま＝テストで固定）。
+
+テスト `tests/test_ui_input.py` 24件。Tier-1 688 → **712 PASS / FAIL 0**（2回連続）。
+
 ### 未実装
-UI のメニュー/設定/ログ表示/画面表示ペイン（`docs/UI_DESIGN.md` の P1 以降）/
+UI のメニュー/設定/ログ表示/タスクウィンドウ（画像表示の集約）（`docs/UI_DESIGN.md` の P1 以降）/
 配線層PORT（vts / run / launcher / app）/ YouTube 配信モード /
 **任意アプリの起動・ウィンドウ操作**（window_op・launch_app。※`download` は `run_program` の curl で実現済み）/
 **(b) 文脈不整合の自己懐疑** / VLM の Gemini Live ストリーム mode。

@@ -26,7 +26,8 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QHBoxLayout, QLabel, QSlider, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
+    QPushButton, QSlider, QVBoxLayout, QWidget,
 )
 
 from .. import capture_guard
@@ -42,6 +43,7 @@ class LoopBridge(QObject):
     sentence_started = Signal(str, object)  # (文, 口の開閉計画 or None)
     sentence_ended = Signal(str)
     mood = Signal(str, int)                 # (イブの感情の自由記述, surprise 0-100)
+    status = Signal(dict)                   # 表示用スナップショット（値のコピーのみ）
     loop_stopped = Signal(str)              # 異常終了時の理由（正常終了は空文字）
 
 
@@ -53,6 +55,7 @@ class VoiceLoopThread(threading.Thread):
         self._bridge = bridge
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._task: Optional[asyncio.Task] = None
+        self._vl = None  # 実体は loop スレッドが持つ。UI からは submit_text 経由でしか触らない
         self.started_ok = threading.Event()
 
     # --- loop スレッド上で実行される（UI の状態には触らない） ---
@@ -63,28 +66,65 @@ class VoiceLoopThread(threading.Thread):
         self._bridge.sentence_ended.emit(text)
 
     async def _mood_poller(self, vl) -> None:
-        """感情と surprise を **loop 上で読んで**値のコピーだけを UI へ流す（0.5秒ごと）。
+        """状態と感情を **loop 上で読んで**値のコピーだけを UI へ流す（4Hz）。
 
-        UI スレッドが `PredictionState` を直接読むと §9.3 の「loop 所有 state を他スレッドが
-        触らない」に反する。読むのはここ（loop タスク＝分類(i)）で、渡すのは str と int だけ。
-        **読むだけ**で書き戻さない＝ surprise を発話判定に使っていない（中核原理は無傷）。
+        UI スレッドが loop 所有 state を直接読むと §9.3 の「loop 所有 state を他スレッドが
+        触らない」に反する。読むのはここ（loop タスク＝分類(i)）で、渡すのは
+        **bool / float / str だけ**。**読むだけ**で書き戻さないので、surprise を発話判定に
+        使っていないという中核原理の不変条件も侵さない。
         """
-        last: tuple[str, int] = ("", -1)
+        last_mood: tuple[str, int] = ("", -1)
         while True:
             try:
-                cur = (vl.prediction.last_emotion or "", vl.prediction.surprise)
-                if cur != last:
-                    last = cur
-                    self._bridge.mood.emit(cur[0], cur[1])
+                mood = (vl.prediction.last_emotion or "", vl.prediction.surprise)
+                if mood != last_mood:
+                    last_mood = mood
+                    self._bridge.mood.emit(mood[0], mood[1])
+                self._bridge.status.emit(self._snapshot(vl))
             except Exception:
-                logger.exception("mood ポーリングで例外（UI の見た目だけの機能なので継続）")
-            await asyncio.sleep(0.5)
+                logger.exception("状態ポーリングで例外（UI の見た目だけの機能なので継続）")
+            await asyncio.sleep(0.25)
+
+    @staticmethod
+    def _snapshot(vl) -> dict:
+        """loop 上で作る表示用スナップショット（値のコピーのみ・参照を渡さない）。"""
+        ai = vl.input._ai
+        task = ""
+        if vl.task_store is not None:
+            try:
+                from ..task import active_tasks_for_context, undelivered_reports
+
+                rows = active_tasks_for_context(
+                    vl.task_store, undelivered=undelivered_reports(vl.task_store, vl.queue))
+                task = rows[0] if rows else ""
+            except Exception:
+                task = ""
+        return {
+            "mic_on": bool(ai is not None and ai.running),
+            "mic_level": float(getattr(ai, "speech_prob", 0.0) or 0.0) if ai else 0.0,
+            "user_speaking": bool(vl.speech_state.user_speaking),
+            "stt_pending": bool(vl.speech_state.stt_pending),
+            "busy": bool(vl.runner.is_busy()),
+            "queued": int(vl.queue.qsize()),
+            "task": str(task)[:80],
+        }
+
+    def submit_text(self, text: str) -> None:
+        """UI スレッドから安全に投入する（§9.3 手段1: `call_soon_threadsafe` のみ）。"""
+        loop, vl = self._loop, self._vl
+        if loop is None or vl is None:
+            return
+        try:
+            loop.call_soon_threadsafe(vl.submit_user_text, text)
+        except RuntimeError:
+            pass  # 既に閉じている
 
     async def _main(self) -> None:
         from ..voice_loop import VoiceLoop
 
         self._loop = asyncio.get_running_loop()
         vl = VoiceLoop()
+        self._vl = vl
         # 再生開始/終了フック（既定 None のところへ差し込む＝本体の挙動は変えない）
         vl.audio.on_sentence_start = self._on_start
         vl.audio.on_sentence_end = self._on_end
@@ -136,10 +176,31 @@ class MainWindow(QWidget):
         self.line.setWordWrap(True)
         self.line.setStyleSheet("font-size: 15px;")
 
+        # 状態インジケータ: 音声だけだと「今こっちの声が届いているのか」が分からない。
+        # 値はすべて loop 側スナップショット由来（UI は loop 所有 state を読まない）。
+        self.pill = QLabel("起動中")
+        self.pill.setAlignment(Qt.AlignCenter)
+        self.pill.setMinimumWidth(150)
+        self.mic = QProgressBar()
+        self.mic.setRange(0, 100)
+        self.mic.setTextVisible(False)
+        self.mic.setFixedHeight(10)
+        self.task_line = QLabel("")
+        self.task_line.setStyleSheet("color:#666;")
+
+        # キーボード入力: マイクを使わずに話しかける。実起動での確認が
+        # 「喋って待つ」から「打って Enter」になるので検証がずっと軽くなる。
+        self.entry = QLineEdit()
+        self.entry.setPlaceholderText("キーボードで話しかける（Enter で送信・マイクと同じ扱い）")
+        self.entry.returnPressed.connect(self._send_text)
+        send = QPushButton("送信")
+        send.clicked.connect(self._send_text)
+
         self.bridge = LoopBridge()
         self.bridge.sentence_started.connect(self._on_sentence_started)
         self.bridge.sentence_ended.connect(self._on_sentence_ended)
         self.bridge.mood.connect(self._on_mood)
+        self.bridge.status.connect(self._on_status)
         self.bridge.loop_stopped.connect(self._on_loop_stopped)
         self.view.ready.connect(lambda ok, msg: self.status.setText(("✅ " if ok else "❌ ") + msg))
 
@@ -170,9 +231,20 @@ class MainWindow(QWidget):
         self.hide_cb.toggled.connect(self._toggle_hide)
         self.hide_state = QLabel("")
 
+        top = QHBoxLayout()
+        top.addWidget(self.pill)
+        top.addWidget(self.mic, 1)
+        top.addWidget(self.task_line, 2)
+
+        entry_row = QHBoxLayout()
+        entry_row.addWidget(self.entry, 1)
+        entry_row.addWidget(send)
+
         root = QVBoxLayout(self)
         root.addWidget(self.view, 1)
+        root.addLayout(top)
         root.addWidget(self.line)
+        root.addLayout(entry_row)
         root.addLayout(row)
         root.addWidget(self.hide_cb)
         root.addWidget(self.hide_state)
@@ -186,6 +258,7 @@ class MainWindow(QWidget):
         self._closing = False
         self._close_deadline = 0.0
         self._emotion_text = ""
+        self._speaking = False
 
     def start_loop(self) -> None:
         self.thread_.start()
@@ -212,9 +285,57 @@ class MainWindow(QWidget):
         self.view.set_plan(meta)
         self.line.setText(f"🤖 {text}")
         self._spoken += 1
+        self._speaking = True
 
     def _on_sentence_ended(self, text: str) -> None:
         self.view.clear_plan()  # barge-in で口が開きっぱなしにならない
+        self._speaking = False
+
+    # 状態表示。優先順位は「今いちばん知りたいこと」の順（喋っている > 聞いている > 考えている）。
+    _PILLS = (
+        ("speaking", "🗣 喋ってる", "#e8f2ff", "#1f6feb"),
+        ("user_speaking", "👂 聞いてる", "#e9f9ec", "#1a7f37"),
+        ("stt_pending", "✍ 聞き取り中", "#fff8e1", "#9a6700"),
+        ("busy", "💭 考え中", "#f3eaff", "#6f42c1"),
+        ("idle", "🟢 待機中", "#f0f0f0", "#555"),
+    )
+
+    def _on_status(self, s: dict) -> None:
+        if self._speaking:
+            key = "speaking"
+        elif s.get("user_speaking"):
+            key = "user_speaking"
+        elif s.get("stt_pending"):
+            key = "stt_pending"
+        elif s.get("busy"):
+            key = "busy"
+        else:
+            key = "idle"
+        for k, text, bg, fg in self._PILLS:
+            if k == key:
+                self.pill.setText(text)
+                self.pill.setStyleSheet(
+                    f"background:{bg}; color:{fg}; border-radius:9px; padding:5px 10px;"
+                    "font-weight:bold;")
+                break
+        if not s.get("mic_on"):
+            self.mic.setValue(0)
+            self.mic.setEnabled(False)
+        else:
+            self.mic.setEnabled(True)
+            self.mic.setValue(int(max(0.0, min(1.0, s.get("mic_level", 0.0))) * 100))
+        task = s.get("task") or ""
+        q = s.get("queued", 0)
+        self.task_line.setText((f"🔍 {task}" if task else "")
+                               + (f"　待ち {q}" if q else ""))
+
+    def _send_text(self) -> None:
+        text = self.entry.text().strip()
+        if not text:
+            return
+        self.entry.clear()
+        self.line.setText(f"🧑 {text}")
+        self.thread_.submit_text(text)
 
     def _on_mood(self, emotion: str, surprise: int) -> None:
         self.view.set_mood(emotion, surprise)

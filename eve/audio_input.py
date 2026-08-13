@@ -51,6 +51,9 @@ class AudioInput:
         self._pa = pyaudio.PyAudio()
         self.stream = None
         self.running = False
+        # 直近チャンクの VAD 発話確率（0-1）。**UI のマイクレベル表示専用**で、
+        # 判定には一切使わない（書くのは `_process_loop` だけ＝loop 上の単一書込）。
+        self.speech_prob = 0.0
         self.callback_on_speech_start = callback_on_speech_start
         self.speech_queue: "asyncio.Queue[bytes]" = asyncio.Queue()
         logger.info("Silero VAD ロード中...")
@@ -118,6 +121,7 @@ class AudioInput:
 
             audio_f32 = np.frombuffer(data, np.int16).astype(np.float32) / 32768.0
             speech_prob = self.model(torch.from_numpy(audio_f32), self.rate).item()
+            self.speech_prob = speech_prob  # UI 表示専用（判定はこの下の既存ロジックのまま）
 
             if speech_prob > Config.VAD_THRESHOLD:
                 speech_run += 1
