@@ -230,7 +230,16 @@ class SpeechDecider:
 
     def start(self) -> None:
         if self._task is None:
-            self._stopping = False  # 再開可能にする（stop() は立てたままにする）
+            # 再開時は「作った直後」と同じ状態に戻す。
+            # `stop()` は wait を解くために `_event.set()` するが、idle なら await を
+            # 挟まずに cancel まで進むので **event が立ったまま残る**。そのまま再開すると
+            # (a) 無駄な判定LLM が1回走り (b) その間 `is_idle()` が False なので
+            # SilenceMonitor が発火できない（実測 2026-08-14: 再開後の初回トリガが 11秒遅れた）。
+            # `_idle` も、drain 期限切れで処理中に cancel されると clear のまま残りうる
+            # ＝ `is_idle()` が永久に False になる（発火が二度と起きない）。
+            self._stopping = False
+            self._event.clear()
+            self._idle.set()
             self._task = asyncio.create_task(self._run_forever())
 
     async def stop(self, drain_timeout: float = 2.0) -> None:

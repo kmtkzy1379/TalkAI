@@ -33,8 +33,21 @@ def check(name: str, cond: bool, extra: str = "") -> None:
         print(f"  ❌ {name} {extra}")
 
 
+# 「停止フラグを立てる書き方」→「再開時に戻す書き方」の対応。
+# **形が違うだけの同じ欠陥**を1つの規則で捕まえる（`_stopping` のブール型と、
+# CaptureThread の `threading.Event` は別物に見えるが不変条件は同じ）。
+STOP_FLAG_PATTERNS: tuple[tuple[str, str], ...] = (
+    ("_stopping = True", "_stopping = False"),
+    ("_stop.set()", "_stop.clear()"),
+    # stop() が wait を解くために立てる起床イベント。idle な時は set から cancel まで
+    # await を挟まないので**立ったまま残る**（実測 2026-08-14: 再開直後に無駄な1周が走り、
+    # その間 is_idle() が False で沈黙監視が発火できず初回が11秒遅れた）。
+    ("_event.set()", "_event.clear()"),
+)
+
+
 def _sidecar_classes() -> list[type]:
-    """`eve/` 配下から「`_stopping` を持ち start/stop を備えたクラス」を実際に集める。"""
+    """`eve/` 配下から「start/stop を持ち、stop で停止フラグを立てるクラス」を実際に集める。"""
     import eve
 
     found: list[type] = []
@@ -46,10 +59,15 @@ def _sidecar_classes() -> list[type]:
         except Exception:
             continue  # 重い依存（torch/mss 等）で読めないモジュールは飛ばす
         for _, obj in inspect.getmembers(m, inspect.isclass):
-            if obj.__module__ != mod.name:
+            if obj.__module__ != mod.name or not _safe_source(obj):
                 continue
-            src = inspect.getsource(obj) if _safe_source(obj) else ""
-            if "_stopping" in src and "def start" in src and "def stop" in src:
+            if not (hasattr(obj, "start") and hasattr(obj, "stop")):
+                continue
+            try:
+                stop_src = inspect.getsource(obj.stop)
+            except (OSError, TypeError):
+                continue
+            if any(set_form in stop_src for set_form, _ in STOP_FLAG_PATTERNS):
                 found.append(obj)
     return found
 
@@ -63,17 +81,30 @@ def _safe_source(obj: type) -> bool:
 
 
 def t_all_sidecars_reset_stopping() -> None:
-    print("\n[1] `_stopping` を持つ全サイドカーが start() で再開可能")
+    print("\n[1] stop で停止フラグを立てる全クラスが start() で再開可能")
     classes = _sidecar_classes()
-    check(f"サイドカーを検出できた（{len(classes)} 個）", len(classes) >= 8,
+    check(f"対象クラスを検出できた（{len(classes)} 個）", len(classes) >= 9,
           f"{[c.__name__ for c in classes]}")
     for cls in sorted(classes, key=lambda c: c.__name__):
-        src = inspect.getsource(cls.start)
-        check(f"{cls.__name__}.start() が _stopping を戻す",
-              "_stopping = False" in src, "→ 一度 stop すると二度と回らない")
+        start_src = inspect.getsource(cls.start)
         stop_src = inspect.getsource(cls.stop)
-        check(f"{cls.__name__}.stop() が _task を None に戻す",
-              "_task = None" in stop_src, "→ start() のガードに引っかかり再開できない")
+        for set_form, reset_form in STOP_FLAG_PATTERNS:
+            if set_form not in stop_src:
+                continue
+            check(f"{cls.__name__}.start() が `{reset_form}` を行う",
+                  reset_form in start_src, "→ 一度 stop すると二度と回らない")
+        # 実行体のハンドルも戻さないと start() のガード（`is None`）に弾かれる
+        handle = "_task = None" if "_task" in stop_src else "_thread = None"
+        check(f"{cls.__name__}.stop() が `{handle}` を行う", handle in stop_src,
+              "→ start() のガードに引っかかり再開できない")
+        # single-flight 用の idle フラグ。処理中に cancel されると clear のまま固着し、
+        # `is_idle()` が永久に False ＝ 二度と起動しなくなる（沈黙監視の発火条件）。
+        # 「self._idle = ...」で**自分が所有している**クラスだけが対象。
+        # `self._decider.is_idle()` のように他人のものを参照しているだけのクラス
+        # （SilenceMonitor / ReconcileTimer）を巻き込まない。
+        if "self._idle = " in inspect.getsource(cls):
+            check(f"{cls.__name__}.start() が `_idle.set()` で idle に戻す",
+                  "_idle.set()" in start_src, "→ drain 期限切れの cancel で固着する")
 
 
 def t_restart_actually_works() -> None:

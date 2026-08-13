@@ -251,15 +251,41 @@ Tier-1 実測: 改修前 **495 PASS** → 改修後 **542 PASS / FAIL 0**（2回
    `agent_tool_schemas()` / `outward_actions()` が**自動で縮む**（全て `_caps` からの導出）。
    束（タスク+検索+作業フォルダ）は登録前後の `names()` 差分で作るのが安全。
 
-**まだ再開できないもの（P4 で扱う）**: `CaptureThread` は OS スレッドなので再 start 不可
-＝画面認識の再 ON は**インスタンス再生成**が要る。
+3. **`CaptureThread` にも同じ欠陥が別の形で**（実起動検証の準備中に発見）: `stop()` が立てる
+   `threading.Event` の `_stop` を `start()` が clear しておらず、新しいスレッドの `_run` が
+   最初の `while not self._stop.is_set()` で即抜けしていた。→ `start()` で `_stop.clear()`。
+   mss は `capture.close()` 後に `_grab_mss` が遅延再生成するので、**インスタンスを作り直さず
+   再 start してよい**（当初「再生成が必要」と書いたが誤り。実起動で同一インスタンスのまま
+   再開できることを確認）。
+4. **`_event` / `_idle` の消し忘れ**（実起動検証で発見・実測で確認）: `stop()` は wait を解く
+   ために `_event.set()` するが、idle な時は set から cancel まで await を挟まないので
+   **event が立ったまま残る**。そのまま再開すると (a) 無駄な判定LLM が1回走り
+   (b) その間 `is_idle()` が False なので沈黙監視が発火できない。
+   **実測: 再開後の初回トリガが 11秒遅れ → 修正後 1.0秒**。
+   `_idle` も drain 期限切れで処理中に cancel されると clear のまま残り、`is_idle()` が
+   永久に False ＝ 二度と発火しなくなる。→ `_event`/`_idle` を持つ4クラス
+   （SpeechDecider / TaskExecutor / VlmWorker / FeedbackWorker）の `start()` で初期状態に戻す。
 
-テスト `tests/test_restartable.py`（38件）。**欠陥クラスを守る作りにした**（E13 の反省）:
-`eve/` を走査して「`_stopping` を持ち start/stop を備えたクラス」を**実際に列挙**し、全件に
-同じ不変条件を課す＝今後同じ形のサイドカーが追加されたら自動的に検査対象に入る。
+**実起動での ON/OFF 検証 `tools/restart_e2e.py`（本番 VoiceLoop をそのまま起動・22項目・
+2回連続 PASS）**: 自律発話（トリガ発火回数）/ 画面認識（橋渡しフレーム数）/ タスク
+（応答LLM に見える tool 一覧 + サイドカーのハンドル）/ マイク（AudioInput の再生成）を
+**発話やログ文字列ではなく実際に回っている回数**で判定する。約4分・実 API を使う。
+短時間で観測するため `SILENCE_THRESHOLD_SEC` を下げて起動する（`.env` は書き換えない）。
+
+**この検証で分かった運用上の注意**: タスク能力の再登録は**登録関数が5本**あり
+（task / search / workspace / exec / viewer）、フラグごとに分かれている。1本でも忘れると
+能力が欠けたまま復帰する（初回の実測で `run_program` / `show_on_screen` / `close_window` を
+取りこぼした）。**P4 の ControlPlane は「登録手順そのもの」を保持する必要がある**
+（名前の一覧を持つだけでは足りない）。
+
+テスト `tests/test_restartable.py`（48件）。**欠陥クラスを守る作りにした**（E13 の反省）:
+`eve/` を走査して「stop() で停止フラグを立てる start/stop 持ちのクラス」を**実際に列挙**し
+（現在10クラス）、`(立てる書き方 → 戻す書き方)` の対応表で全件に同じ不変条件を課す。
+`_stopping`（bool）と `_stop`（threading.Event）と `_event`（asyncio.Event）は**形が違うだけの
+同じ欠陥**なので1つの規則で捕まえる。今後同じ形が追加されたら自動的に検査対象に入る。
 修正を1箇所だけ意図的に戻すと、構造チェックと挙動チェックの**両方が落ちる**ことを実測で確認済み。
 
-Tier-1: 608 → **646 PASS / FAIL 0**（2回連続）。
+Tier-1: 608 → **656 PASS / FAIL 0**（2回連続）。
 
 ### 未実装
 UI のメニュー/設定/ログ表示/画面表示ペイン/キャプチャ除外（`docs/UI_DESIGN.md` の P1 以降）/

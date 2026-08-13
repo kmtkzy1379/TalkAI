@@ -39,9 +39,12 @@ class FeedbackWorker:
 
     def start(self) -> None:
         if self._task is None:
-            # 再開可能にする: stop() は `_stopping` を立てたままなので、ここで戻さないと
-            # 新しい run ループが即座に抜けて二度と回らない（UI の ON/OFF の前提工事）。
+            # 「作った直後」の状態に戻す。`_stopping` を戻さないと新しい run ループが即座に
+            # 抜けて二度と回らず、`stop()` が立てた `_event` が残ると無駄な1周が走り、
+            # drain 期限切れで cancel されると `_idle` が clear のまま固着する。
             self._stopping = False
+            self._event.clear()
+            self._idle.set()
             self._task = asyncio.create_task(self._run_forever())
 
     async def stop(self, drain_timeout: float = 2.0) -> None:

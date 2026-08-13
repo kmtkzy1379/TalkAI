@@ -44,6 +44,12 @@ class CaptureThread:
 
     def start(self) -> None:
         if self._thread is None:
+            # 再開可能にする: stop() が立てた Event をここで下ろさないと、新しいスレッドの
+            # `_run` が最初の `while not self._stop.is_set()` で即座に抜ける
+            # （`_stopping` を戻さないサイドカーと**同じ欠陥の別形**・UI の ON/OFF の前提工事）。
+            # mss は stop() の `capture.close()` で閉じるが `_grab_mss` が遅延再生成するので、
+            # **インスタンスを作り直さずに再 start してよい**。
+            self._stop.clear()
             self._thread = threading.Thread(target=self._run, name="vlm-capture", daemon=True)
             self._thread.start()
 

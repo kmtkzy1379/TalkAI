@@ -69,7 +69,11 @@ class VlmWorker:
     # --- ライフサイクル ---
     def start(self) -> None:
         if self._task is None:
-            self._stopping = False  # 再開可能にする（stop() は立てたままにする）
+            # 「作った直後」の状態に戻す（stop() の `_event.set()` が残ると無駄な1周が走り、
+            # drain 期限切れで cancel されると `_idle` が clear のまま固着する）。
+            self._stopping = False
+            self._event.clear()
+            self._idle.set()
             self._task = asyncio.create_task(self._run_forever())
 
     async def stop(self, drain_timeout: float = 2.0) -> None:
