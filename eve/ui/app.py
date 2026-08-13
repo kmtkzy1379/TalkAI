@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
 from .. import capture_guard
 from ..config import Config
 from .live2d_view import Live2DView, assets_ready
+from .task_window import TaskWindow
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +45,34 @@ class LoopBridge(QObject):
     sentence_ended = Signal(str)
     mood = Signal(str, int)                 # (イブの感情の自由記述, surprise 0-100)
     status = Signal(dict)                   # 表示用スナップショット（値のコピーのみ）
+    open_item = Signal(str, str, str)       # タスクウィンドウに開く (path, 表示名, window_id)
+    close_item = Signal(str)                # タスクウィンドウから閉じる (window_id)
     loop_stopped = Signal(str)              # 異常終了時の理由（正常終了は空文字）
+
+
+class _ItemHandle:
+    """`Popen` の代わりに `Workspace.viewers` へ入れるハンドル。
+
+    `store.py` は `poll()`（開いていれば None）と `terminate()` しか呼ばないので、
+    この2つだけ実装すれば `live_viewers()` / `close_viewers()` / 上限判定は**無改造で動く**。
+    フラグを書くのは **loop スレッドだけ**（ユーザが閉じた時は UI から
+    `call_soon_threadsafe` で戻してくる）＝単一書込を保つ。
+    """
+
+    def __init__(self, window_id: str, request_close) -> None:
+        self.window_id = window_id
+        self._closed = False
+        self._request_close = request_close
+
+    def poll(self):
+        return None if not self._closed else 0
+
+    def terminate(self) -> None:
+        self._closed = True
+        self._request_close(self.window_id)
+
+    def mark_closed(self) -> None:
+        self._closed = True
 
 
 class VoiceLoopThread(threading.Thread):
@@ -56,6 +84,8 @@ class VoiceLoopThread(threading.Thread):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._task: Optional[asyncio.Task] = None
         self._vl = None  # 実体は loop スレッドが持つ。UI からは submit_text 経由でしか触らない
+        self._handles: dict = {}   # window_id -> _ItemHandle（loop 所有）
+        self._aggregate = Config.WS_VIEWER_MODE != "external"
         self.started_ok = threading.Event()
 
     # --- loop スレッド上で実行される（UI の状態には触らない） ---
@@ -109,6 +139,51 @@ class VoiceLoopThread(threading.Thread):
             "task": str(task)[:80],
         }
 
+    # --- タスクウィンドウ（イブの表示物の集約）---
+    def open_viewer(self, path, name: str):
+        """**loop 上**で `show_on_screen` から呼ばれる。集約 OFF なら None（＝別プロセス）。"""
+        if not self._aggregate:
+            return None
+        import uuid
+
+        wid = uuid.uuid4().hex[:12]
+        handle = _ItemHandle(wid, self._request_close_item)
+        self._handles[wid] = handle
+        self._bridge.open_item.emit(str(path), name, wid)
+        return handle
+
+    def _request_close_item(self, window_id: str) -> None:
+        """loop 上（`terminate()` から）。UI へ「閉じて」を queued で伝える。"""
+        self._handles.pop(window_id, None)
+        self._bridge.close_item.emit(window_id)
+
+    def notify_user_closed(self, window_id: str) -> None:
+        """UI スレッドから: ユーザが子ウィンドウを閉じた → loop 側の台帳に反映する。"""
+        loop = self._loop
+        if loop is None:
+            return
+
+        def _apply() -> None:
+            h = self._handles.pop(window_id, None)
+            if h is not None:
+                h.mark_closed()
+
+        try:
+            loop.call_soon_threadsafe(_apply)
+        except RuntimeError:
+            pass
+
+    def set_aggregate(self, on: bool) -> None:
+        """UI スレッドから集約の ON/OFF を切り替える（既に開いている窓はそのまま）。"""
+        loop = self._loop
+        if loop is None:
+            self._aggregate = on
+            return
+        try:
+            loop.call_soon_threadsafe(setattr, self, "_aggregate", bool(on))
+        except RuntimeError:
+            self._aggregate = on
+
     def submit_text(self, text: str) -> None:
         """UI スレッドから安全に投入する（§9.3 手段1: `call_soon_threadsafe` のみ）。"""
         loop, vl = self._loop, self._vl
@@ -128,6 +203,10 @@ class VoiceLoopThread(threading.Thread):
         # 再生開始/終了フック（既定 None のところへ差し込む＝本体の挙動は変えない）
         vl.audio.on_sentence_start = self._on_start
         vl.audio.on_sentence_end = self._on_end
+        # イブの表示物をタスクウィンドウへ集約する（既定 None のところへ差し込む）。
+        # 作業フォルダが無効な構成では workspace 自体が None なので何もしない。
+        if vl.workspace is not None:
+            vl.workspace.viewer_open_fn = self.open_viewer
         self._task = asyncio.create_task(vl.run())
         mood = asyncio.create_task(self._mood_poller(vl))
         self.started_ok.set()
@@ -231,6 +310,22 @@ class MainWindow(QWidget):
         self.hide_cb.toggled.connect(self._toggle_hide)
         self.hide_state = QLabel("")
 
+        # イブの表示物をタスクウィンドウ内に閉じ込めるか（OFF なら従来どおり画面の好きな位置）
+        self.taskwin = TaskWindow()
+        self.taskwin.closed_by_user.connect(self.thread_.notify_user_closed)
+        self.bridge.open_item.connect(self._open_item)
+        self.bridge.close_item.connect(self.taskwin.close_file)
+        self.aggregate_cb = QCheckBox("イブの表示をタスクウィンドウ内に集約する")
+        self.aggregate_cb.setChecked(Config.WS_VIEWER_MODE != "external")
+        self.aggregate_cb.toggled.connect(self._toggle_aggregate)
+        show_task = QPushButton("タスクウィンドウを表示")
+        show_task.clicked.connect(self._show_task_window)
+        self.aggregate_state = QLabel("")
+        task_row = QHBoxLayout()
+        task_row.addWidget(self.aggregate_cb, 1)
+        task_row.addWidget(self.aggregate_state, 2)
+        task_row.addWidget(show_task)
+
         top = QHBoxLayout()
         top.addWidget(self.pill)
         top.addWidget(self.mic, 1)
@@ -246,6 +341,7 @@ class MainWindow(QWidget):
         root.addWidget(self.line)
         root.addLayout(entry_row)
         root.addLayout(row)
+        root.addLayout(task_row)
         root.addWidget(self.hide_cb)
         root.addWidget(self.hide_state)
         root.addWidget(self.status)
@@ -268,7 +364,31 @@ class MainWindow(QWidget):
         """自分の窓に適用する。**窓が実際に出てから**でないと HWND が確定しない。"""
         self._toggle_hide(self.hide_cb.isChecked())
 
+    def _open_item(self, path: str, name: str, wid: str) -> None:
+        self.taskwin.open_file(path, name, wid)
+        # 開いた直後の窓にもキャプチャ除外を掛ける（イブが自分の出力を実況しないように）
+        self._apply_hide_to_task_window()
+
+    def _show_task_window(self) -> None:
+        self.taskwin.show()
+        self.taskwin.raise_()
+        self._apply_hide_to_task_window()
+
+    def _toggle_aggregate(self, on: bool) -> None:
+        self.thread_.set_aggregate(on)
+        if not on:
+            self.aggregate_state.setText("OFF: 画面の好きな位置に別ウィンドウで出します"
+                                         "（既に出ている分はそのまま）")
+        else:
+            self.aggregate_state.setText("ON: タスクウィンドウの中だけに出します")
+
+    def _apply_hide_to_task_window(self) -> None:
+        """タスクウィンドウは**イブ自身の窓**なので、UI と同じ設定で隠す。"""
+        if self.taskwin.isVisible():
+            capture_guard.set_window(int(self.taskwin.winId()), self.hide_cb.isChecked())
+
     def _toggle_hide(self, hide: bool) -> None:
+        self._apply_hide_to_task_window()
         ok = capture_guard.set_window(int(self.winId()), hide)
         # ビューア（別プロセス）へは**状態だけ**を渡し、向こうが自分で掛け直す。
         # 他プロセスの窓へ直接は適用できない（実測 ERROR_ACCESS_DENIED）ため。
@@ -382,6 +502,7 @@ class MainWindow(QWidget):
         self._close_timer.stop()
         if self.thread_.is_alive():
             logger.warning("VoiceLoop スレッドが 30 秒で止まらなかった（そのまま終了する）")
+        self.taskwin.force_close()  # ×は隠すだけなので明示的に閉じる
         self.view.release()
         self.close()
 

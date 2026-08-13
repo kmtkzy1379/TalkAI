@@ -332,8 +332,38 @@ Tier-1 `tests/test_capture_guard.py` 25件 / 実起動 `tools/ui_chat.py` で窓
 
 テスト `tests/test_ui_input.py` 24件。Tier-1 688 → **712 PASS / FAIL 0**（2回連続）。
 
+#### タスクウィンドウ（実装済 2026-08-14・`eve/ui/task_window.py`・`WS_VIEWER_MODE` 既定 window）
+
+イブが `show_on_screen` で出すものを**1枚の窓の中に集約する**（従来は画面の好きな位置に
+別プロセスの窓が最大5枚）。中身は `QMdiArea`＝**窓の中の小さなデスクトップ**で、子ウィンドウは
+中で自由に動かせるが枠の外には出ない。外側の窓はふつうのウィンドウとして移動・拡大縮小できる。
+UI のチェックボックスで**集約 ON/OFF を即時に切り替えられる**（OFF＝従来どおり別プロセス）。
+
+**本体側の改修は受け口1つだけ**: `Workspace.viewer_open_fn`（既定 None）。
+契約は `fn(path, name) -> ハンドル or None` で、ハンドルは `poll()`/`terminate()` だけ持てばよい
+＝ `Popen` と同じ形なので **`live_viewers()` / `close_viewers()` / 5枚上限は無改造で動く**。
+`None` を返すと別プロセスへ落ちる（＝UI のトグルを再登録なしで切り替えられる）。
+**ヘッドレス（`tools/voice_chat.py`）はフックが刺さらないので従来どおり**。
+
+安全規律は `viewer.py` から **import して共有**（`sniff` / `MAX_BYTES` / `MAX_PIXELS` /
+`TEXT_MAX_CHARS`）＝片方だけ古くなる事故を防ぐ。失うのは**クラッシュ隔離**だけなので、
+デコードは必ず try で囲み、`WS_VIEWER_MODE=external` で旧方式に戻せる。
+
+**実物の GUI を動かして見つけた欠陥3件**（決定論テストでは出ない）:
+1. ユーザが子ウィンドウを閉じても通知が**アプリ終了時までまとめて遅延**した（`destroyed`
+   シグナルは実際の破棄まで飛ばない）。台帳が遅れると「5枚開いている扱いなのに画面には無い」
+   になる → `QMdiSubWindow` を継承して `closeEvent` で即通知。
+2. 終了時に `Internal C++ object already deleted` で毎回クラッシュ（親が消えた後に子の
+   closeEvent が走る）→ 表示更新を try で囲む。
+3. 既定の cascade だと開くたびに右下へずれて**枠外へ出た**→ 枠に収まるサイズに縮め、
+   右下に着いたら左上へ折り返す。
+
+テスト `tests/test_task_window.py` 24件（既定は挙動不変 / None で別プロセスへ落ちる /
+フック例外でも表示が死なない / 上限が効く / 安全規律を再実装していない）。
+Tier-1 712 → **736 PASS / FAIL 0**（2回連続）。
+
 ### 未実装
-UI のメニュー/設定/ログ表示/タスクウィンドウ（画像表示の集約）（`docs/UI_DESIGN.md` の P1 以降）/
+UI のメニュー/設定/ログ表示（`docs/UI_DESIGN.md` の P1 以降）/
 配線層PORT（vts / run / launcher / app）/ YouTube 配信モード /
 **任意アプリの起動・ウィンドウ操作**（window_op・launch_app。※`download` は `run_program` の curl で実現済み）/
 **(b) 文脈不整合の自己懐疑** / VLM の Gemini Live ストリーム mode。

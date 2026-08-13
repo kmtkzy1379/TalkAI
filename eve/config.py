@@ -241,6 +241,11 @@ class Config:
     # 画面表示（J-3 inc3）。**WS_ENABLED 前提**。別プロセスの Tk ビューアで開く（管理者操作は不要）。
     WS_VIEWER_ENABLED = os.getenv("WS_VIEWER_ENABLED", "0") == "1"  # 既定 off
     WS_VIEWER_MAX_WINDOWS = int(os.getenv("WS_VIEWER_MAX_WINDOWS", "5"))  # 同時に開ける窓の上限
+    # 表示先。`window`=UI の「タスクウィンドウ」の中に集約（既定）/ `external`=従来どおり
+    # 画面の好きな位置に別プロセスで開く。**UI が無いヘッドレス実行では常に external 相当**
+    # （UI が `viewer_open_fn` を差さないので自動的に別プロセスへ落ちる）。UI から即時に
+    # 切り替えられる（再登録不要）。
+    WS_VIEWER_MODE = os.getenv("WS_VIEWER_MODE", "window")
 
     @classmethod
     def validate(cls) -> list[str]:

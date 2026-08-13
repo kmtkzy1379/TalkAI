@@ -91,6 +91,18 @@ def register_viewer_capability(registry: CapabilityRegistry, ws: Workspace, *,
             names = "・".join(n for (_p, n) in live)
             return (f"表示中のウィンドウが{len(live)}個（{names}）あるから、これ以上は開けなかった。"
                     "close_window で閉じてから、もう一度出してね。")
+        name = ws.paths.relative(target)
+        # UI が起動していれば**タスクウィンドウの中**に開く（`store.py` の `viewer_open_fn`）。
+        # None が返る＝集約 OFF なので、従来どおり別プロセスで画面の好きな位置に開く。
+        if ws.viewer_open_fn is not None:
+            try:
+                handle = ws.viewer_open_fn(target, name)
+            except Exception:
+                logger.exception("タスクウィンドウへの表示に失敗（別プロセスに切り替える）")
+                handle = None
+            if handle is not None:
+                windows.append((handle, name))
+                return f"{name} をタスクウィンドウに出したよ。"
         try:
             proc = subprocess.Popen(
                 [sys.executable, "-m", "eve.workspace.viewer", str(target), str(ws.paths.root)],
@@ -101,7 +113,6 @@ def register_viewer_capability(registry: CapabilityRegistry, ws: Workspace, *,
         except Exception as e:
             logger.exception("ビューアの起動に失敗")
             return f"（画面に出せなかった: {type(e).__name__}）"
-        name = ws.paths.relative(target)
         windows.append((proc, name))
         return f"{name} を別ウィンドウで画面に出したよ。"
 
