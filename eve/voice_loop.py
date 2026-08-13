@@ -233,7 +233,9 @@ class VoiceLoop:
             # system プロンプト= SPEECH_STYLE（最小スタイル指示・ペルソナではない）。
             # 空 ContextAssembler() を渡すと system 無しで応答が "システム応答…" と自己ラベル化する
             # leak が出るため、明示的に SPEECH_STYLE を与える。
-            self.audio, stream_fn, self.tts.generate,
+            # tts は `generate_with_meta`（= (WAV, 口の開閉計画)）を渡す。UI が無い時は
+            # 計画が誰にも読まれないだけで挙動は同じ（orchestrator が tuple を吸収する）。
+            self.audio, stream_fn, self.tts.generate_with_meta,
             ContextAssembler(system_prompt=SPEECH_STYLE),
             conversation_cache=self.cache, rag_store=self.rag,
             prediction_state=self.prediction,

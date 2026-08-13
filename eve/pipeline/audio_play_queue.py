@@ -56,6 +56,17 @@ class AudioPlayQueue:
         self._next_seq = 0  # 現 generation で次に再生すべき seq
         self._buffer: dict[int, _Item] = {}  # 順不同で来た seq の待避（現 generation 分）
         self._reserve: dict[int, int] = {}  # generation -> 次に予約する seq
+        # UI（リップシンク）用の再生開始フック。**既定 None＝既存挙動は完全に不変**。
+        # 属性として持つ（`__init__`/`enqueue` のシグネチャは変えない）＝ E2E ハーネスが
+        # `enqueue` を固定シグネチャで wrap している（tools/search_e2e_test.py:381 /
+        # tools/task_incident_replay.py:183）ため、引数を足すと **ログ0行で全ターン無音**に
+        # なる（`response/orchestrator.py:411` は try の外・`:449` の gather が例外を吸う）。
+        self.on_sentence_start: Optional[Callable[[str, Any], None]] = None
+        # 再生が終わった/打ち切られた通知。**barge-in で口が開きっぱなしになるのを防ぐ**
+        # （途中停止でも `_play` は正常 return するので必ずここに来る）。
+        self.on_sentence_end: Optional[Callable[[str], None]] = None
+        self._meta: dict[tuple[int, int], Any] = {}  # (generation, seq) -> 口の開閉計画
+        self._meta_max = 64  # bound（barge-in で再生されなかった分の溜まり込みを防ぐ）
 
     def current_generation(self) -> int:
         return self._generation
@@ -66,11 +77,26 @@ class AudioPlayQueue:
         self._reserve[generation] = n + 1
         return n
 
+    def note_meta(self, generation: int, seq: int, meta: Any) -> None:
+        """UI 用のメタ（口の開閉計画）を (generation, seq) に紐づけて預かる。
+
+        **新規メソッド**なので既存の呼び出し元・モンキーパッチを一切壊さない（`enqueue` に
+        引数を足す案を捨てた理由は `__init__` のコメント参照）。再生開始時に `pop` して渡す。
+        """
+        if meta is None:
+            return
+        if len(self._meta) >= self._meta_max:  # 溜まり込み防止（古いものから捨てる）
+            for k in list(self._meta)[: len(self._meta) - self._meta_max + 1]:
+                self._meta.pop(k, None)
+        self._meta[(generation, seq)] = meta
+
     def bump_generation(self) -> int:
         """barge-in / 新ターン。世代を進め、古い世代の待機・buffer を破棄する。"""
         self._generation += 1
         self._next_seq = 0
         self._buffer.clear()
+        # 再生されなかった文のメタを捨てる（世代が変わればもう使わない）
+        self._meta = {k: v for k, v in self._meta.items() if k[0] >= self._generation}
         # 古い世代の予約カウンタを破棄（世代ごとに1エントリ増え続ける無制限増加を防ぐ）。
         self._reserve = {g: n for g, n in self._reserve.items() if g >= self._generation}
         kept: list[_Item] = []
@@ -127,7 +153,21 @@ class AudioPlayQueue:
         while self._next_seq in self._buffer:
             it = self._buffer.pop(self._next_seq)
             self._next_seq += 1
+            # UI: **音が出る直前**に「この文を今から喋る」を通知する（既定 None なら何もしない）。
+            # 番兵(audio=None)では鳴らないので通知しない＝on_played と同じ判定に揃える。
+            # 同期・非ブロッキング契約（await を挟まない＝ここに世代変化の隙間を作らない）。
+            meta = self._meta.pop((it.generation, it.seq), None)
+            if it.audio is not None and self.on_sentence_start is not None:
+                try:
+                    self.on_sentence_start(it.text, meta)
+                except Exception:
+                    logger.exception("on_sentence_start コールバックでエラー（再生は継続）")
             await self._play(it.audio, it.generation)
+            if it.audio is not None and self.on_sentence_end is not None:
+                try:
+                    self.on_sentence_end(it.text)
+                except Exception:
+                    logger.exception("on_sentence_end コールバックでエラー（再生は継続）")
             # C5: 実際に再生した文だけ「喋った」と報告（B3 の途中停止も聞かれた扱い）。
             # 番兵(audio=None)は再生していないので報告しない。
             if it.audio is not None and it.on_played is not None:

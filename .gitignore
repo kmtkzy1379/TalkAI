@@ -34,6 +34,11 @@ artifacts/
 *.log
 terminal.log
 summary.json
+# P0 スパイクの出力（描画確認の PNG）
+spike/out/
+# UI 素材（2026-08-13）: 購入した Live2D モデルと背景画像。**公開 MIT リポジトリに入れない**
+# （モデルは第三者の著作物で再配布不可。Live2D Cubism の資産も同様）。
+eve_ui/
 # エディタ / OS メタファイル
 .idea/
 .vscode/

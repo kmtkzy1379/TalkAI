@@ -36,6 +36,10 @@ class PredictionState:
     def __init__(self) -> None:
         self.last_prediction: Optional[str] = None
         self.last_feedback: Optional[str] = None
+        # イブの今の感情（FeedbackLLM の自由記述・例「ほっとした」「少し戸惑い」）。
+        # **UI の動きの味付け専用**（`eve/ui/emotion.py`）。応答・発話判定は読まない
+        # ＝ここに何が入っていても対話の挙動は変わらない。書き手は FeedbackLLM だけ（単一書込）。
+        self.last_emotion: Optional[str] = None
         self.watermark: Optional[str] = None  # iso（排他）。これより後のターンが未 feedback
         # surprise は2生産者（F4 feedback / F6 VLM screen-diff）。各 source を ts 付きで保持し
         # **most-recent-source-wins** で読む（max でない＝過去の画面フラッシュが高値固定する

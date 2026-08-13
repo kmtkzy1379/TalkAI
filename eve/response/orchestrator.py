@@ -396,17 +396,34 @@ class ResponseOrchestrator:
             # 埋めないと AudioPlayQueue._drain_buffer が連続 seq で永久停止
             # （= head-of-line デッドロック / 1文目失敗でターン丸ごと無音）。
             wav = None
+            meta = None  # UI のリップシンク計画（TTS が返した時だけ非 None）
             try:
                 async with sem:
                     if self._audio.current_generation() != gen:
                         return  # barge-in 済み: 起こさない（古い世代は破棄される）
                     wav = await self._tts_fn(sentence)
+                # tts_fn が `(wav, meta)` を返す実装（`VoicevoxTTS.generate_with_meta`）にも対応。
+                # 単一値を返す従来の tts_fn（テスト/tools の偽物・`generate`）はここを素通りする
+                # ＝ meta は None のまま＝以降の UI 経路は完全に休眠する。
+                if isinstance(wav, tuple) and len(wav) == 2:
+                    wav, meta = wav
             except Exception:
                 logger.exception("TTS 失敗（文をスキップして継続）: %.20s", sentence)
                 wav = None
+                meta = None
             if wav is None:
                 logger.warning("TTS が音声を返さず（文をスキップ）: %.20s", sentence)
             if self._audio.current_generation() == gen:
+                # UI 用メタは enqueue の**前**に預ける（再生開始時に pop される）。
+                # `enqueue` のシグネチャは変えない（E2E ハーネスが固定引数で wrap している）。
+                # **必ず握り潰す**: ここで例外が出ると下の enqueue に到達せず seq に穴が空き、
+                # `_drain_buffer` が contiguous で止まってターン丸ごと無音になる（A1 の規律）。
+                # しかもこの関数の例外は `gather(return_exceptions=True)` に吸われlog も出ない。
+                if meta is not None:
+                    try:
+                        self._audio.note_meta(gen, seq, meta)
+                    except Exception:
+                        logger.exception("note_meta 失敗（口パクを諦めて音声は続行）")
                 # on_played は「実際に再生し終えた時」だけ呼ばれる → spoken に積む（C5）。
                 self._audio.enqueue(gen, seq, wav, text=sentence, on_played=spoken.append)
 

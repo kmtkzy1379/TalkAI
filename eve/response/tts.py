@@ -35,15 +35,38 @@ class VoicevoxTTS:
         return self._session
 
     async def generate(self, text: str) -> Optional[bytes]:
-        """文 → WAV バイト。失敗時は None（落とさない）。"""
+        """文 → WAV バイト。失敗時は None（落とさない）。
+
+        **公開契約は変えない**（bytes を返す）。`tools/` の多数のスクリプトがこの形に依存している。
+        リップシンク付きが要る呼び出し側は `generate_with_meta()` を使う。
+        """
+        wav, _ = await self._generate(text)
+        return wav
+
+    async def generate_with_meta(self, text: str) -> tuple[Optional[bytes], Optional[list]]:
+        """文 → `(WAV バイト, 口の開閉計画)`。UI のリップシンク用（本番 VoiceLoop はこちらを使う）。
+
+        `audio_query` は元々この関数の中で取得して**捨てていた**ので、**HTTP 往復は増えない**。
+        返す計画は float タプルのリスト（`eve/response/lipsync.py`）＝スレッドを跨いで渡しても
+        loop 所有オブジェクトへの参照が漏れない。音声が出せない時は `(None, None)`。
+        """
+        wav, query = await self._generate(text)
+        if wav is None:
+            return None, None
+        from .lipsync import plan_from_query_safe
+
+        return wav, plan_from_query_safe(query)
+
+    async def _generate(self, text: str) -> tuple[Optional[bytes], Optional[dict]]:
+        """audio_query → synthesis の本体。`(WAV, 合成に使った query)` を返す。"""
         if not text or not text.strip():
-            return None
+            return None, None
         try:
             session = await self._get_session()
             params = {"text": text, "speaker": self.speaker}
             async with session.post(f"{self.base_url}/audio_query", params=params) as resp:
                 if resp.status != 200:
-                    return None
+                    return None, None
                 query = await resp.json()
             query["speedScale"] = self.speed
             query["pitchScale"] = self.pitch
@@ -51,11 +74,12 @@ class VoicevoxTTS:
                 f"{self.base_url}/synthesis", json=query, params={"speaker": self.speaker}
             ) as resp:
                 if resp.status != 200:
-                    return None
-                return await resp.read()
+                    return None, None
+                # query は speedScale 適用後のものを返す（口の開閉計画は速度込みで作る）
+                return await resp.read(), query
         except Exception as e:  # 起こりやすい一時失敗 → ログして None（呼び出し側が文をスキップ）
             logger.warning("TTS 失敗（None を返す）: %s", e)
-            return None
+            return None, None
 
     async def close(self) -> None:
         if self._session and not self._session.closed:

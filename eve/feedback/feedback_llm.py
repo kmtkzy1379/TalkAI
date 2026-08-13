@@ -164,4 +164,7 @@ class FeedbackLLM:
             self._state.note_feedback_surprise(result.prediction_diff)
         # (d) 文脈注入用の短い1ブロック（最新1件）
         self._state.last_feedback = render_last_feedback(result)
+        # (e) UI（Live2D の動きの味付け）用。**表示専用**で、応答や発話判定には一切使わない。
+        if result.emotions:
+            self._state.last_emotion = result.emotions
         return True

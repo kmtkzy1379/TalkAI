@@ -68,6 +68,12 @@ try:
     check("VLM 既定 off では capture スレッド未生成(構築は可)", vl.capture_thread is None)
     # play_fn が should_stop を取れる＝文途中 barge-in(B3) の配線が生きている
     check("audio が mid-sentence stop 対応 play_fn を保持", vl.audio._play_takes_stop is True)
+    # リップシンク: 実起動では (WAV, 口の開閉計画) を返す TTS が刺さっていること。
+    # ここが `tts.generate` に戻ると、UI は口を動かせないのに Tier-1 は全部 PASS する。
+    check("tts_fn が generate_with_meta（リップシンク計画つき）",
+          vl.orchestrator._tts_fn == vl.tts.generate_with_meta)
+    check("再生開始/終了フックは既定 None（UI 未接続では既存挙動が不変）",
+          vl.audio.on_sentence_start is None and vl.audio.on_sentence_end is None)
     # J-1/Fix#2: 予約タスク状態注入の配線（TASK_ENABLED に連動）
     from eve.config import Config as _Cfg  # noqa: E402
     check("tasks_provider の配線が TASK_ENABLED に連動",

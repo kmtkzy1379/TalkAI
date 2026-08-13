@@ -183,8 +183,57 @@ $env:SKIP="SRB,SD1,SD2,SD3,SSRC,SVLM,SIDLE,SAUTO,S1,S2,S3,S4,S5,S6,S7,S8,S9,S10,
 自律発話の改修群（2026-07-26〜28・すべてコードゲート）:
 ①既出の用件ブロック / ①-b 発話見本の削除 / ②-1,②-2 同内容抑制（bigram 0.25 + 埋め込み 0.87・600秒窓）/ ②-3 記憶の自己参照除外 / ②-4 話題の丸投げ抑制 / ②-5 種の固着解消（クエリ不変時スキップ + メタ要約除外）/ ②-6 時制の混同検出 + 画面不在マーカ / ③ 沈黙バイアスの撤廃。**各ゲートの詳細は `docs/COMPONENT_LOGIC.md` の自律発話節**。
 
+### UI / Live2D（2026-08-13 着手・設計は `docs/UI_DESIGN.md`）
+
+**方式確定**: PySide6（Tkinter ではない）+ `live2d-py`。P0 スパイク `spike/live2d_test.py` で
+描画・3層合成・口の外部駆動・61fps・HiDPI を実測（自己検証 2回連続 5/5 PASS・`spike/README.md`）。
+
+| 機能 | モジュール | 状態 |
+|---|---|---|
+| 口の開閉計画（モーラ長→開き量・純関数） | `eve/response/lipsync.py` | **実装済** |
+| TTS が計画を返す（`generate_with_meta`） | `eve/response/tts.py` | **実装済**（`generate()` は bytes のまま＝既存呼び出し元は無傷） |
+| 再生開始/終了フック | `eve/pipeline/audio_play_queue.py` | **実装済**（既定 None＝UI 未接続なら挙動不変） |
+| Live2D 表示・アイドル動作・口パク | `eve/ui/live2d_view.py` | **実装済** |
+| UI アプリ（Qt メイン + loop ワーカースレッド） | `eve/ui/app.py` / `tools/ui_chat.py` | **実装済**（この段階のスコープは「AI 応答で口が動く」まで） |
+
+**リップシンクは RMS ではなくモーラ長で作る**（実測: RMS は日本語で閉じ 2.4回/秒 が上限＝口が
+開きっぱなしに見える。モーラ長なら 5.1回/秒 で実モーラ速度に追随）。採用値は子音の開き 0.08 /
+attack 20ms / release 40ms。母音別の**口の形は作れない**（`ParamA/I/U/E/O` がモデルに無い）。
+
+**設計で意図的に避けたこと**: `AudioPlayQueue.enqueue` と `RealAudioPlayer.play_fn` の
+**シグネチャを一切変えていない**。`enqueue` に引数を足すと `tools/search_e2e_test.py:381` と
+`tools/task_incident_replay.py:183` の wrap が TypeError を投げ、それが
+`response/orchestrator.py:411`（try の外）→ `:449` の `gather(return_exceptions=True)` に吸われて
+**ログ0行のまま全ターン無音**になる（一次ソースで確認済）。代わりに新メソッド `note_meta()` と
+属性 `on_sentence_start` / `on_sentence_end` を足した＝既存の呼び出し元・モンキーパッチを
+構造的に壊せない形にしてある。回帰テストは `tests/test_lipsync.py`（46件・シグネチャ固定を含む）。
+
+Tier-1 実測: 改修前 **495 PASS** → 改修後 **542 PASS / FAIL 0**（2回連続・増分は新規47件のみ）。
+
+#### 長時間放置時の自律発話レート（2026-08-13・69分・`tools/ui_chat.py`）
+
+リップシンクは実 VOICEVOX 経路で動作を確認。同じランで自律発話のレートが取れた:
+
+| 指標 | 実測（69分・ほぼ放置） |
+|---|---|
+| 発話判定トリガ | **543回**（`SILENCE_THRESHOLD_SEC=5.0` の既定・`.env` に記載なし） |
+| 実際に喋った | **119文**（≈50発話＝**約1.4分に1回**） |
+| 同内容抑制 | 67件 発火（それでも「ネガシット」「電子レンジ」「空が青い」等が4〜5回ずつ再登場） |
+
+**裁定（ユーザ 2026-08-13）: この 1〜2分に1回というレートは理想的。既定値は変更しない。**
+（HANDOFF 落とし穴 #7 の「1セッション3-4件」は短時間セッションの観測値で、長時間放置の
+レートはこちらが正しい基準値。）
+
+ただしこの実測で**設定手段が無い**ことが分かった（記録として残す・実装は UI 側でやる）:
+- `Config` に自律発話の有効/無効フラグは無く、`voice_loop.run()` は `speech_decider` /
+  `silence_monitor` を**無条件に start** する。頻度を動かす唯一の既存 knob は
+  `SILENCE_THRESHOLD_SEC`（判定回数がそのまま増減する）。
+- → `docs/UI_DESIGN.md` の **P4「自律発話 ON/OFF」**と **§4.2「自発発話頻度」設定**で実装する
+  （既定レートは変えず、ユーザが選べるようにするのが目的）。
+
 ### 未実装
-UI（Tkinter・本体プロセス側）/ 配線層PORT（vts / run / launcher / app）/ Live2D 連動 / YouTube 配信モード /
+UI のメニュー/設定/ログ表示/画面表示ペイン/キャプチャ除外（`docs/UI_DESIGN.md` の P1 以降）/
+配線層PORT（vts / run / launcher / app）/ YouTube 配信モード /
 **任意アプリの起動・ウィンドウ操作**（window_op・launch_app。※`download` は `run_program` の curl で実現済み）/
 **(b) 文脈不整合の自己懐疑** / VLM の Gemini Live ストリーム mode。
 
