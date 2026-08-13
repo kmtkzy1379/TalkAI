@@ -197,10 +197,11 @@ class MainWindow(QWidget):
 
     def _toggle_hide(self, hide: bool) -> None:
         ok = capture_guard.set_window(int(self.winId()), hide)
-        # これから開くビューア（別プロセス）が同じ設定を継承するように環境変数も更新する。
-        # **既に開いている窓には効かない**（他プロセスの窓へは適用できない＝実測で
-        # ERROR_ACCESS_DENIED）。ビューアは都度開き直す前提なので実害は小さい。
+        # ビューア（別プロセス）へは**状態だけ**を渡し、向こうが自分で掛け直す。
+        # 他プロセスの窓へ直接は適用できない（実測 ERROR_ACCESS_DENIED）ため。
+        # 環境変数はこれから起動する子の初期値、共有ファイルは**既に開いている窓**用。
         os.environ["UI_HIDE_FROM_CAPTURE"] = "1" if hide else "0"
+        capture_guard.publish(hide)
         mark = "✅" if ok else ("—" if not capture_guard.available() else "⚠")
         self.hide_state.setText(f"{mark} {capture_guard.describe(hide)}"
                                 + ("" if ok or not capture_guard.available()

@@ -141,6 +141,38 @@ def set_own_windows(hide: bool) -> int:
         return 0
 
 
+def state_path():
+    """設定の共有先。**別プロセスの窓には親から適用できない**ので、状態だけを共有して
+    各プロセスが自分で適用する（環境変数は起動時に固定されるので実行中の切替に使えない）。
+
+    一時ディレクトリに置く: 作業フォルダに置くと `list_files` に見えてイブの視界に入り、
+    リポジトリに置くと gitignore の管理が増える。落ちても既定に倒れるだけなので永続性は不要。
+    """
+    import tempfile
+    from pathlib import Path
+
+    return Path(tempfile.gettempdir()) / "eve_capture_guard.state"
+
+
+def publish(hide: bool) -> None:
+    """今の設定を子プロセス（ビューア）へ共有する。失敗しても無視（見た目だけの機能）。"""
+    try:
+        state_path().write_text("1" if hide else "0", encoding="ascii")
+    except OSError:
+        logger.debug("capture_guard: 状態の共有に失敗", exc_info=True)
+
+
+def desired(default: bool = True) -> bool:
+    """今あるべき状態。共有ファイル → 環境変数 → 既定 の順に見る。"""
+    try:
+        raw = state_path().read_text(encoding="ascii").strip()
+        if raw in ("0", "1"):
+            return raw == "1"
+    except OSError:
+        pass
+    return enabled_by_env(default)
+
+
 def describe(hide: bool) -> str:
     """UI に出す短い説明（状態の取り違えを防ぐため、効果を明示する）。"""
     if not available():

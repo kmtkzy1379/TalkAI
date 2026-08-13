@@ -157,6 +157,7 @@ def main() -> int:
         f.write("キャプチャ除外の確認用\n" * 40)
 
     def run_viewer(hide: bool):
+        capture_guard.publish(hide)  # 共有ファイルも起動前に揃える（起動直後の追従を見る）
         env = dict(os.environ, UI_HIDE_FROM_CAPTURE=("1" if hide else "0"))
         p = subprocess.Popen([sys.executable, "-m", "eve.workspace.viewer", sample,
                               os.path.dirname(sample)], cwd=root, env=env,
@@ -215,7 +216,25 @@ def main() -> int:
         whiteish = float(((sub > 235).all(axis=2)).mean() * 100) if sub.size else 0.0
         check("**ON でビューアが自分で消える（別プロセスでも効く）**", whiteish < 40,
               f"白地 {whiteish:.1f}%")
+    print("\n[5] **既に開いているビューア**が切替に追従する（共有ファイル経由）")
+    if not h_on:
+        check("追従の確認（窓が無いので判定不能）", False)
+    else:
+        seen = []
+        for want in (False, True, False):
+            capture_guard.publish(want)
+            time.sleep(2.0)  # ビューアは1秒ごとに見る
+            r = window_rect(h_on)
+            img, mon2 = grab()
+            sub = img[max(0, r[1] - mon2["top"]) + 40:r[3] - mon2["top"] - 40,
+                      max(0, r[0] - mon2["left"]) + 40:r[2] - mon2["left"] - 40]
+            white = float(((sub > 235).all(axis=2)).mean() * 100) if sub.size else 0.0
+            seen.append(white > 40)  # 白地が見える＝写っている
+        check("開いたまま OFF→ON→OFF に追従する", seen == [True, False, True],
+              f"{['見' if s else '隠' for s in seen]}")
+
     _kill_viewers(p_on)
+    capture_guard.publish(True)  # 既定（ON）に戻す
     try:
         os.remove(sample)
     except OSError:

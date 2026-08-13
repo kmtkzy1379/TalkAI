@@ -143,12 +143,25 @@ def main(argv: list[str]) -> int:
     # **別プロセスなので自分で適用する必要がある**（親から他プロセスの窓へ
     # `SetWindowDisplayAffinity` を掛けると ERROR_ACCESS_DENIED になる・2026-08-14 実測）。
     # 設定は親から環境変数で継承する。窓が実際に出てから掛ける（`after` で1回）。
+    # 設定は共有ファイルで**実行中も追従する**（親から他プロセスの窓へは適用できないので、
+    # 状態だけ受け取って自分で掛け直す）。1秒ごとに見て、変わった時だけ適用する。
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-        from eve.capture_guard import enabled_by_env, set_own_windows
+        from eve.capture_guard import desired, set_own_windows
 
-        if enabled_by_env():
-            win.after(120, lambda: set_own_windows(True))
+        state = {"hide": None}
+
+        def _follow() -> None:
+            try:
+                want = desired()
+                if want != state["hide"]:
+                    set_own_windows(want)
+                    state["hide"] = want
+            except Exception:
+                pass
+            win.after(1000, _follow)
+
+        win.after(120, _follow)
     except Exception:  # 表示機能そのものは止めない
         pass
 

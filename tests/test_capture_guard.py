@@ -51,6 +51,36 @@ def t_env() -> None:
             os.environ[capture_guard._ENV] = saved
 
 
+def t_shared_state() -> None:
+    """共有状態: **既に開いているビューア**へ実行中の切替を届ける経路。
+
+    環境変数は起動時に固定されるので、実行中の ON/OFF には使えない。
+    親から他プロセスの窓へ直接適用することもできない（ERROR_ACCESS_DENIED・実測）。
+    そこで**状態だけ**をファイルで共有し、各プロセスが自分の窓に掛け直す。
+    """
+    print("\n[1b] 共有状態（実行中の切替を別プロセスへ渡す）")
+    saved_env = os.environ.pop(capture_guard._ENV, None)
+    try:
+        for want in (True, False, True):
+            capture_guard.publish(want)
+            check(f"publish({want}) → desired() が {want}",
+                  capture_guard.desired() is want)
+        capture_guard.state_path().unlink(missing_ok=True)
+        os.environ[capture_guard._ENV] = "0"
+        check("共有ファイルが無ければ環境変数に落ちる", capture_guard.desired() is False)
+        capture_guard.state_path().write_text("broken", encoding="ascii")
+        check("壊れた内容なら環境変数に落ちる（例外を出さない）",
+              capture_guard.desired() is False)
+        os.environ.pop(capture_guard._ENV, None)
+        check("共有も環境変数も無ければ既定 ON", capture_guard.desired() is True)
+    finally:
+        capture_guard.state_path().unlink(missing_ok=True)
+        if saved_env is None:
+            os.environ.pop(capture_guard._ENV, None)
+        else:
+            os.environ[capture_guard._ENV] = saved_env
+
+
 def t_safe() -> None:
     print("\n[2] 壊れた入力でも落ちない（表示や対話を止めない）")
     for hwnd in (0, None, -1, 123456789, "abc", 2 ** 63):
@@ -94,14 +124,16 @@ def t_viewer_applies_itself() -> None:
     with open(path, encoding="utf-8") as f:
         src = f.read()
     check("viewer が capture_guard を呼んでいる", "capture_guard" in src)
-    check("viewer が環境変数を見ている", "enabled_by_env" in src)
+    check("viewer が共有状態を見ている（実行中の切替に追従する）", "desired" in src)
     check("viewer が自プロセスの窓に適用している", "set_own_windows" in src)
+    check("viewer が周期的に見直している（開いたままでも追従する）", "after(1000" in src)
     check("表示機能を止めないよう例外を握っている",
           "except Exception" in src.split("capture_guard")[1][:400])
 
 
 if __name__ == "__main__":
     t_env()
+    t_shared_state()
     t_safe()
     t_config()
     t_viewer_applies_itself()
