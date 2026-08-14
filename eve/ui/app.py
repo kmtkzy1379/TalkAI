@@ -27,13 +27,17 @@ from typing import Optional
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
-    QPushButton, QSlider, QVBoxLayout, QWidget,
+    QPushButton, QSlider, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from .. import capture_guard
 from ..config import Config
 from .live2d_view import Live2DView, assets_ready
+from .log_bridge import LogBridge
+from .log_panel import LogPanel
+from .menu_bar import MenuBar
 from .task_window import TaskWindow
+from .theme import LOG_FRAME, TEXT_FRAME, app_qss, frame_qss
 
 logger = logging.getLogger(__name__)
 
@@ -339,16 +343,81 @@ class MainWindow(QWidget):
         entry_row.addWidget(self.entry, 1)
         entry_row.addWidget(send)
 
+        # 本体のログをタブへ振り分ける（パイプラインは無改造・`log_bridge.py`）
+        self.log_bridge = LogBridge()
+        self.log_bridge.line.connect(self._on_log_line)
+        self.log_bridge.install()
+
+        # --- メニュータブ（1-A では表示のみ。実際に止める配線は 1-B）---
+        self.menu = MenuBar()
+        self.menu.requested.connect(self._menu_requested)
+        self.menu.settings_clicked.connect(lambda: self.pages.setCurrentIndex(1))
+
+        # --- メインタブ: 左に Live2D、右にログ、下に発話テキスト（参考画像の構成）---
+        self.logs = LogPanel()
+        log_box = QWidget()
+        # 枠画像は角に装飾がある。**スライス幅を小さく**して装飾の比率を保ち、
+        # 中身は装飾の内側に十分な余白を取って置く（大きすぎると文字が枠に重なる）。
+        log_box.setStyleSheet(frame_qss(LOG_FRAME, border=90))
+        log_box.setMinimumWidth(300)
+        lb = QVBoxLayout(log_box)
+        lb.setContentsMargins(34, 40, 34, 40)
+        lb.addWidget(self.logs)
+
+        stage = QHBoxLayout()
+        stage.setSpacing(8)
+        stage.addWidget(self.view, 5)
+        stage.addWidget(log_box, 3)
+
+        self.line.setObjectName("speech")
+        speech_box = QWidget()
+        speech_box.setStyleSheet(frame_qss(TEXT_FRAME, border=90))
+        sb = QVBoxLayout(speech_box)
+        sb.setContentsMargins(46, 30, 46, 26)
+        sb.addWidget(self.line)
+        speech_box.setMinimumHeight(96)
+
+        main = QWidget()
+        ml = QVBoxLayout(main)
+        ml.setContentsMargins(6, 6, 6, 6)
+        ml.addLayout(stage, 1)
+        ml.addWidget(speech_box)
+        ml.addLayout(top)
+        ml.addLayout(entry_row)
+
+        # --- 設定タブ（1-A では枠だけ。中身と機能は Phase 2）---
+        settings = QWidget()
+        sl = QVBoxLayout(settings)
+        head = QLabel("設定")
+        head.setStyleSheet("font-size:17px; font-weight:bold;")
+        note = QLabel("（この画面の項目は次の段階で実装します。"
+                      "設定は原則、保存して再起動してから反映されます）")
+        note.setObjectName("hint")
+        back = QPushButton("メインに戻る")
+        back.clicked.connect(lambda: self.pages.setCurrentIndex(0))
+        sl.addWidget(head)
+        sl.addWidget(note)
+        # 開発用の調整つまみ。Phase 2 で設定タブの正式な項目へ移す
+        adj = QLabel("調整（開発用・のちに設定へ移動）")
+        adj.setObjectName("hint")
+        sl.addWidget(adj)
+        sl.addLayout(row)
+        sl.addLayout(task_row)
+        sl.addWidget(self.hide_cb)
+        sl.addWidget(self.hide_state)
+        sl.addStretch(1)
+        sl.addWidget(back)
+
+        self.pages = QStackedWidget()
+        self.pages.addWidget(main)
+        self.pages.addWidget(settings)
+
         root = QVBoxLayout(self)
-        root.addWidget(self.view, 1)
-        root.addLayout(top)
-        root.addWidget(self.line)
-        root.addLayout(entry_row)
-        root.addLayout(row)
-        root.addLayout(task_row)
-        root.addWidget(self.hide_cb)
-        root.addWidget(self.hide_state)
+        root.setContentsMargins(0, 0, 6, 6)
+        root.addWidget(self.menu)
+        root.addWidget(self.pages, 1)
         root.addWidget(self.status)
+        self.setStyleSheet(app_qss())
 
         self._poll = QTimer(self)
         self._poll.timeout.connect(self._refresh)
@@ -407,9 +476,30 @@ class MainWindow(QWidget):
                                    else "（適用に失敗）"))
 
     # --- UI スレッド（queued connection で呼ばれる） ---
+    def _on_log_line(self, tab: str, who: str, text: str) -> None:
+        # 会話タブは**会話だけ**（ユーザ裁定）。イブの発話は `sentence_started` 側で
+        # 実際に喋った瞬間に載せるので、ここでは重複させない。
+        if tab == "chat" and who == "eve":
+            return
+        self.logs.add(tab, who, text)
+
+    def _menu_requested(self, key: str, want_on: bool) -> None:
+        """1-A では**まだ何も止めない**。押されたことだけを見せる。
+
+        実際にパイプラインを止める配線は 1-B（ControlPlane）。ここで先に
+        「押した瞬間には切り替わらない」動きを作っておく（要件がこの形を要求している）。
+        """
+        self.menu.set_state(key, "pending")
+        self.logs.add("chat", "system",
+                      f"「{key}」の切替を要求（安全なタイミングで反映されます）"
+                      "※この配線は次の段階で入ります")
+        # 1-A: すぐ元の状態へ戻す（嘘の状態を残さない）
+        QTimer.singleShot(900, lambda: self.menu.set_state(key, "on" if not want_on else "off"))
+
     def _on_sentence_started(self, text: str, meta) -> None:
         self.view.set_plan(meta)
-        self.line.setText(f"🤖 {text}")
+        self.line.setText(text)
+        self.logs.add("chat", "eve", text)
         self._spoken += 1
         self._speaking = True
 
@@ -476,7 +566,7 @@ class MainWindow(QWidget):
         if not text:
             return
         self.entry.clear()
-        self.line.setText(f"🧑 {text}")
+        self.logs.add("chat", "user", text)
         self.thread_.submit_text(text)
 
     def _on_mood(self, emotion: str, surprise: int) -> None:
@@ -523,6 +613,7 @@ class MainWindow(QWidget):
         self._close_timer.stop()
         if self.thread_.is_alive():
             logger.warning("VoiceLoop スレッドが 30 秒で止まらなかった（そのまま終了する）")
+        self.log_bridge.uninstall()  # 破棄後の Qt オブジェクトへ emit しない
         self.taskwin.force_close()  # ×は隠すだけなので明示的に閉じる
         self.view.release()
         self.close()
