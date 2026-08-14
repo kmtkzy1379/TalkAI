@@ -637,6 +637,105 @@ def t_disabled() -> None:
 # [12] 応答LLM への伝え方（「機能が無い」と言わせない）
 # --------------------------------------------------------------------------
 
+def t_mic() -> None:
+    print("\n[15] マイク OFF: 声だけ止める（キーボードは生きたまま）")
+
+    async def scenario() -> None:
+        vl = _FakeVL()
+        cp = _plane(vl)
+        cp.start()
+        check("既定は ON", cp.is_on("mic") is True)
+
+        cp.request("mic", False)
+        await _settle(cp)
+        check("マイクを閉じる", vl.input.running is False)
+        check("**待たない**（押した瞬間に効く）", cp.is_on("mic") is False)
+        check("停止（pause）はしていない", vl.runner.paused is False)
+        check("イブの発話は止めていない（ミュートとは別物）", vl.player.muted is False)
+        check("自律発話も止めていない", vl.speech_decider.stopped == 0)
+        check("応答LLM に「今は聞こえない」と伝える",
+              any("声を聞く機能" in t for t in cp.features_off()), f"{cp.features_off()}")
+        check("  その文言は「キーボードなら読める」と言っている",
+              any("キーボード" in t for t in cp.features_off()))
+
+        cp.request("mic", True)
+        await _settle(cp)
+        check("ON でマイクが開く", vl.input.running is True and vl.input.starts == 1)
+        check("ON 時に沈黙時計をリセットする（OFF 中の沈黙で即独り言を防ぐ）",
+              vl.speech_state.marks >= 1, f"{vl.speech_state.marks}")
+        await cp.stop()
+
+    asyncio.run(scenario())
+
+    async def with_pause() -> None:
+        """マイクを切ってある時、停止→再開でマイクが**勝手に戻らない**こと。"""
+        vl = _FakeVL()
+        cp = _plane(vl, quiesce_sec=0.2)
+        cp.start()
+        cp.request("mic", False)
+        await _settle(cp)
+        starts = vl.input.starts
+
+        cp.request("pause", False)
+        await _settle(cp)
+        cp.request("pause", True)
+        await _settle(cp)
+        check("**再開してもマイクは OFF のまま**", vl.input.starts == starts and
+              vl.input.running is False, f"starts={vl.input.starts} running={vl.input.running}")
+        check("マイクの状態表示も OFF のまま", cp.is_on("mic") is False)
+
+        # マイク ON の状態なら再開で開く
+        cp.request("mic", True)
+        await _settle(cp)
+        cp.request("pause", False)
+        await _settle(cp)
+        cp.request("pause", True)
+        await _settle(cp)
+        check("マイク ON なら再開でちゃんと開く", vl.input.running is True)
+        await cp.stop()
+
+    asyncio.run(with_pause())
+
+
+def t_mic_icon() -> None:
+    print("\n[16] マイクアイコン: OFF は斜線が入る")
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    QApplication.instance() or QApplication([])
+    from eve.ui.icons import mic_icon
+
+    on = mic_icon(True, 24).pixmap(24, 24).toImage()
+    off = mic_icon(False, 24).pixmap(24, 24).toImage()
+    check("ON と OFF で絵が違う",
+          on.bits().tobytes() != off.bits().tobytes())
+
+    def reddish(img) -> int:
+        n = 0
+        for y in range(img.height()):
+            for x in range(img.width()):
+                c = img.pixelColor(x, y)
+                if c.alpha() > 60 and c.red() > 120 and c.red() > c.blue() + 50:
+                    n += 1
+        return n
+
+    check("**OFF には赤い斜線が入る**", reddish(off) > 10 and reddish(on) == 0,
+          f"OFF の赤い画素 {reddish(off)} / ON {reddish(on)}")
+
+    def diag_covered(img) -> bool:
+        """左下→右上の対角線上に、実際に描かれている画素があるか。"""
+        hits = 0
+        for i in range(4, img.width() - 4):
+            c = img.pixelColor(i, img.height() - 1 - i)
+            if c.alpha() > 60:
+                hits += 1
+        return hits > img.width() * 0.5
+
+    check("斜線は左下から右上へ引かれている", diag_covered(off), "対角線上の画素")
+
+
 def t_features_off_prompt() -> None:
     print("\n[12] プロンプト: 「機能が無い」ではなく「あるが今はオフ」")
     from eve.context_assembler import ContextAssembler
@@ -644,7 +743,7 @@ def t_features_off_prompt() -> None:
 
     for key, text in FEATURE_OFF_TEXT.items():
         check(f"{key} の文言が「今はオフ」だと分かる",
-              ("今はユーザがオフ" in text) or ("今はミュート" in text), text)
+              "今は" in text and ("オフ" in text or "ミュート" in text), text)
         check(f"{key} の文言が能力の不在を言っていない",
               "できない" not in text and "機能がない" not in text, text)
 
@@ -732,8 +831,12 @@ def t_ui_contract() -> None:
     check("pause は初期値 True（＝稼働中）", items["pause"][2] is True)
     from eve.control import KEYS
 
-    check("MenuBar と ControlPlane のキーが一致する",
-          sorted(items) == sorted(KEYS), f"{sorted(items)} vs {sorted(KEYS)}")
+    # `mic` だけはメニューではなく**入力欄の左のボタン**が持つ（ユーザ指定 2026-08-15）。
+    # それ以外のキーは MenuBar と1対1でなければならない（片方だけ増えると押せない機能が出る）。
+    check("MenuBar のキーは ControlPlane の一部",
+          set(items) <= set(KEYS), f"{sorted(set(items) - set(KEYS))}")
+    check("メニューに無いのは mic だけ",
+          set(KEYS) - set(items) == {"mic"}, f"{sorted(set(KEYS) - set(items))}")
 
     app_src = inspect.getsource(__import__("eve.ui.app", fromlist=["x"]))
     check("UI → loop は call_soon_threadsafe のみ（§9.3）",
@@ -742,6 +845,10 @@ def t_ui_contract() -> None:
           app_src.count("self.menu.set_state") == 1, str(app_src.count("self.menu.set_state")))
     check("押した時にログへ『切り替えます』と出す（受け付けたことは分かる）",
           "に切り替えます" in app_src)
+    check("**mic ボタンも自分で状態を変えない**（loop の確定を待つ）",
+          "self.mic_btn.clicked.connect" in app_src
+          and "self._menu_requested(\"mic\"" in app_src, "mic ボタンの配線")
+    check("mic の反映も control_state 経由", 'if key == "mic":' in app_src)
 
 
 if __name__ == "__main__":
@@ -756,6 +863,8 @@ if __name__ == "__main__":
     t_serialized()
     t_states()
     t_disabled()
+    t_mic()
+    t_mic_icon()
     t_features_off_prompt()
     t_tools_not_lying()
     t_ui_contract()

@@ -34,11 +34,15 @@ from .task.schema import CANCELLED, PENDING, RUNNING
 
 logger = logging.getLogger(__name__)
 
-KEYS = ("pause", "mute", "autospeech", "vision", "task")
+# `mic` はメニューではなく**入力欄の左のボタン**が持つ（キーボードで打つ時に押す物なので、
+# 手がある場所に置く）。切り替えの経路は他と同じ＝直列化も latest-wins も同じように効く。
+KEYS = ("pause", "mute", "mic", "autospeech", "vision", "task")
 
 # 応答LLM に見せる「今はオフ」の説明。**機能の不在ではなく一時的な停止**として書く
 # （「画面を見る機能がない」はハルシネーションに見える＝ユーザ裁定 2026-08-14）。
 FEATURE_OFF_TEXT = {
+    "mic": "声を聞く機能（今はマイクがオフ。相手はキーボードで打っている。"
+           "打たれた文字は普通に読めるので、聞こえないことを気にしすぎなくてよい）",
     "vision": "画面を見る機能（今はユーザがオフにしている。オンにすれば今の画面が見える）",
     "task": "調べ物や作業を引き受ける機能（今はユーザがオフにしている。オンにすれば頼まれごとができる）",
     "autospeech": "自分から話しかける機能（今はユーザがオフにしている。聞かれたら答えるのは普通にできる）",
@@ -76,6 +80,7 @@ class ControlPlane:
         self._available: dict[str, bool] = {
             "pause": True,
             "mute": True,
+            "mic": True,
             "autospeech": True,
             "vision": bool(Config.VLM_ENABLED),
             "task": bool(Config.TASK_ENABLED and vl.task_store is not None),
@@ -92,7 +97,7 @@ class ControlPlane:
     def features_off(self) -> list[str]:
         """応答LLM の system に入れる「今オフの機能」。ミュートは pause と重複しないよう単独で見る。"""
         off = []
-        for key in ("vision", "task", "autospeech"):
+        for key in ("mic", "vision", "task", "autospeech"):
             if self._available[key] and not self._on[key]:
                 off.append(FEATURE_OFF_TEXT[key])
         if self._on["mute"]:
@@ -172,6 +177,7 @@ class ControlPlane:
     async def _apply(self, key: str, on: bool) -> None:
         handler = {
             "mute": self._apply_mute,
+            "mic": self._apply_mic,
             "pause": self._apply_pause,
             "autospeech": self._apply_autospeech,
             "vision": self._apply_vision,
@@ -190,6 +196,27 @@ class ControlPlane:
         """
         self._vl.player.muted = bool(on)
         self._note("ミュートしました（喋った内容はログに出ます）" if on else "ミュートを解除しました")
+
+    async def _apply_mic(self, on: bool) -> None:
+        """ユーザの声を聞くのをやめる/再開する（キーボード入力はそのまま使える）。
+
+        ミュート（イブが黙る）とは**逆向き**の機能。こちらは**こちらの声を渡さない**。
+        止めるとマイクのデバイスも解放するので、他のアプリから使える。
+
+        **待たない**: マイクのボタンは「今すぐ聞くのをやめて」という意思表示なので、
+        押した瞬間に効くのが正しい。聞き取りの途中だった1発話は捨てられる（言い終える前に
+        切ったのだから、そのまま届く方が驚く）。停止/再開やタスクのように「正常終了を待つ」
+        対象ではない。
+        """
+        vl = self._vl
+        if on:
+            await vl.input.start()
+            # 止めていた間の沈黙で、再開直後に独り言を始めないようにする。
+            vl.speech_state.mark_eve_activity()
+            self._note("マイクを ON にしました")
+            return
+        vl.input.stop()
+        self._note("マイクを OFF にしました（キーボードでは話しかけられます）")
 
     async def _apply_pause(self, on: bool) -> None:
         """on=True が「稼働」。OFF にする＝停止。
@@ -215,8 +242,12 @@ class ControlPlane:
                 vl.speech_state.mark_eve_activity()
                 vl.speech_decider.start()
                 vl.silence_monitor.start()
-            await vl.input.start()
-            self._note("再開しました")
+            if self._on["mic"]:
+                # ユーザが自分でマイクを切っていたなら、再開でも切ったままにする
+                # （画面認識・自律発話と同じ扱い＝勝手に ON にしない）。
+                await vl.input.start()
+            self._note("再開しました" if self._on["mic"]
+                       else "再開しました（マイクは OFF のままです）")
             return
 
         vl.runner.pause()

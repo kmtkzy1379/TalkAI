@@ -24,7 +24,7 @@ import threading
 import time
 from typing import Optional
 
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
     QPushButton, QScrollArea, QSlider, QStackedWidget, QVBoxLayout, QWidget,
@@ -316,6 +316,14 @@ class MainWindow(QWidget):
 
         # キーボード入力: マイクを使わずに話しかける。実起動での確認が
         # 「喋って待つ」から「打って Enter」になるので検証がずっと軽くなる。
+        # **マイクの ON/OFF は入力欄の左**（打つ時に押す物なので、手がある場所に置く）。
+        self.mic_btn = QPushButton()
+        self.mic_btn.setFixedSize(34, 34)
+        self.mic_btn.setCursor(Qt.PointingHandCursor)
+        self.mic_btn.clicked.connect(
+            lambda: self._menu_requested("mic", not self._mic_on))
+        self._mic_on = True
+        self._set_mic_button("on", True)
         self.entry = QLineEdit()
         self.entry.setPlaceholderText("キーボードで話しかける（Enter で送信・マイクと同じ扱い）")
         self.entry.returnPressed.connect(self._send_text)
@@ -381,6 +389,7 @@ class MainWindow(QWidget):
         top.addWidget(self.task_line, 2)
 
         entry_row = QHBoxLayout()
+        entry_row.addWidget(self.mic_btn)   # 左端（ユーザ指定 2026-08-15）
         entry_row.addWidget(self.entry, 1)
         entry_row.addWidget(send)
 
@@ -580,8 +589,8 @@ class MainWindow(QWidget):
             return
         self.logs.add(tab, who, text)
 
-    _MENU_JA = {"pause": "停止/再開", "mute": "ミュート", "autospeech": "自律発話",
-                "vision": "画面認識", "task": "タスク"}
+    _MENU_JA = {"pause": "停止/再開", "mute": "ミュート", "mic": "マイク",
+                "autospeech": "自律発話", "vision": "画面認識", "task": "タスク"}
 
     def _menu_requested(self, key: str, want_on: bool) -> None:
         """押された → loop へ要求を出すだけ。**表示は変えない**。
@@ -599,7 +608,40 @@ class MainWindow(QWidget):
 
     def _on_control_state(self, key: str, state: str, on: bool) -> None:
         """loop が確定させた状態だけを表示に反映する（唯一の反映点）。"""
+        if key == "mic":
+            self._set_mic_button(state, on)
+            return
         self.menu.set_state(key, state, on=on)
+
+    def _set_mic_button(self, state: str, on: bool) -> None:
+        """マイクボタンの見た目。**OFF は斜線入り**（ユーザ指定 2026-08-15）。
+
+        `pending`（切替中）は色だけで示す。ここでもアイコンを変えてしまうと、
+        まだ切り替わっていないのに切り替わったように見える。
+        """
+        from .icons import mic_icon
+
+        self._mic_on = bool(on)
+        self.mic_btn.setIcon(mic_icon(on))
+        self.mic_btn.setIconSize(QSize(20, 20))
+        self.mic_btn.setEnabled(state != "disabled")
+        self.mic_btn.setToolTip(
+            "切替中…" if state == "pending"
+            else ("マイク ON（クリックで切る。キーボードはいつでも使えます）" if on
+                  else "マイク OFF（あなたの声は届いていません。クリックで戻す）"))
+        base = ("border-radius:9px; border:1px solid %s;" % LINE)
+        if state == "pending":
+            self.mic_btn.setStyleSheet(
+                f"QPushButton{{{base} background:#fff6de; border-color:#e8d08a;}}")
+        elif on:
+            self.mic_btn.setStyleSheet(
+                f"QPushButton{{{base} background:rgba(255,255,255,0.86);}}"
+                "QPushButton:hover{background:#eaf3ff;}")
+        else:
+            self.mic_btn.setStyleSheet(
+                f"QPushButton{{{base} background:rgba(179,38,30,0.10);"
+                "border-color:rgba(179,38,30,0.35);}"
+                "QPushButton:hover{background:rgba(179,38,30,0.18);}")
 
     def _on_sentence_started(self, text: str, meta) -> None:
         self.view.set_plan(meta)
