@@ -227,11 +227,31 @@ OFF ──要求ON──▶ STARTING ──完了──▶ ON ──要求OFF─
 |---|---|---|---|
 | **停止/再開** | 進行中の応答が**最後まで喋り終わる**（or ユーザが明示中断）＋マイクを解放 | `input.stop()` → 新規刺激の生成を止める | `input.start()`（`AudioInput` を作り直す・既に対応済） |
 | **自律発話** | 発話判定が**走っていない**（`decider._idle`）／判定中なら完了を待つ | `silence_monitor.stop()` → `speech_decider.stop()`（drain 実装済） | **`_stopping` のリセットが必要**（現状 restart 不可） |
-| **画面認識** | 進行中の VLM 呼び出しが**完了**するまで | `capture_thread.stop()`（join は `to_thread`）→ `vlm_worker.stop()` → `VisionState` をクリア | **`CaptureThread` を再生成**＋`_stopping` リセット |
-| **タスク** | **アクティブ0件かつ未配達の完了報告0件**（＝1件制の枠が空く）まで待つ | 待機中は既存の1件制ゲートで新規 `delegate_task` を断る → `registry.unregister()` で `delegate_task`/`cancel_task`/`search_web`/作業フォルダ系を**束で外す** | 同じ束を `voice_loop.__init__` と**同一順序**で再登録 |
+| **画面認識** | 進行中の VLM 呼び出しが**完了**するまで | `capture_thread.stop()`（join は `to_thread`）→ `vlm_worker.stop()` → **`VisionState`/`ChangeDetector`/`text_gate` をクリア**（下記） | `_stop.clear()` 済みなので**同じインスタンスを再 start**（前提工事で再生成不要になった） |
+| **タスク** | **アクティブ0件かつ未配達の完了報告0件**（＝1件制の枠が空く）**かつ `runner.is_busy()` が False かつ音声キューが空** | STOPPING 突入時に**新規受付を止める** → 枠が空くのを待つ → `registry.unregister()` で束を外す → サイドカー3本を stop | 同じ束を `voice_loop.__init__` と**同一順序**で再登録（登録関数は5本） |
 
-**タスク OFF は最長 `TASK_AGENT_TIMEOUT_SEC`=600秒待つことがある。**
-→ UI は「今のタスク（目標・経過秒）」と **［今すぐ取り消して OFF にする］** を並べて出す。放置で固まったように見せない。
+**タスク OFF の最大待ちは 600秒ではない（訂正 2026-08-14・一次ソース確認）**:
+Pending の予約猶予 `MAX_WHEN_SEC=3600`（`task/capabilities.py:31`）＋ TaskAgent 1ゴール
+`TASK_AGENT_TIMEOUT_SEC=600`（deadline 判定は step 冒頭のみなので `run_program` 60+10秒ぶん超過しうる）
+＝ **理論上 70分超**。→ **［今すぐ取り消して OFF にする］は必須**。
+
+**1件制ゲートだけでは OFF が収束しない**: `_delegate_task` は「枠が埋まっている間だけ」断るので、
+枠が空いた瞬間に次の依頼が受理されて STOPPING が終わらない（livelock）。
+→ ControlPlane が**独自の受付停止**を持つ（`delegate_task` を先に unregister するか、受付フラグを渡す）。
+なお `delegate_task` は**ユーザ発話ターンでしか呼べない**（tools は USER_UTTERANCE にのみ渡る）ので、
+入口はそこだけ塞げば閉じる。
+
+**「未配達の報告」はキュー在席で定義される**（`task/cancel_resolver.py:50-62`）。
+`PipelineRunner` が pop した時点でキューから消えるため、**報告を喋っている最中は枠が空いている**。
+1件制の定義「報告を発話し終えるまで」を守るには、上表のとおり `runner.is_busy()` と音声 drain を
+OFF 条件に足す必要がある。
+
+**画面認識 OFF→ON でクリアが要る状態**（クリアしないと**最大30分前の実況が
+「N秒前の画面。以降ずっと変化なし」として復活する**）: `VisionState` の
+`latest_vision` / `latest_vision_mono` / `latest_is_narration` / `last_frame_mono` /
+`last_change_mono` / `ring`、`ChangeDetector._reference`（None にすると次の1枚が必ず
+`changed=True` になり ON 直後に実況が入る）、`VlmWorker._last_narration`、`text_gate.reset()`。
+クリアは stop 完了後に `await asyncio.sleep(0)` を挟んでから行う（停止直後に着弾する1件を避ける）。
 
 **副次的な良い性質**: タスクを外すと `outward_actions()` が自動で縮むので、
 応答LLM の「実際に実行できる手段」ブロックが**勝手に整合する**（D3 の設計＝手書きしない、が効く）。

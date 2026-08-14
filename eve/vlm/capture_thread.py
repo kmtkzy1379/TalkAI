@@ -54,9 +54,22 @@ class CaptureThread:
             self._thread.start()
 
     def stop(self, timeout: float = 2.0) -> None:
+        """止める。**join に失敗したらハンドルを捨てない**（ゾンビの二重起動を防ぐ）。
+
+        以前は join がタイムアウトしても `_thread = None` にしていた。`start()` が
+        `_stop.clear()` するようになった（再開可能化）ため、そのままだと
+        **生き残った旧スレッドの `while not self._stop.is_set()` が復活し、
+        新スレッドと2本で同じ mss を叩く**（`capture.py:43` の「1スレッドに1インスタンス」
+        が破れる／VLM 呼び出しが倍＝課金も倍）。join できた時だけ手放す。
+        `capture.close()` も同じ理由で join 成功時のみ（生存スレッドの下で mss を閉じない）。
+        """
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout)
+            if self._thread.is_alive():
+                logger.warning("capture スレッドが %.1f秒で止まらなかった"
+                               "（ハンドルを保持し、再開は行わない）", timeout)
+                return
             self._thread = None
         self._capture.close()
 

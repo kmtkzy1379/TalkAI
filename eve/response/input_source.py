@@ -60,6 +60,13 @@ class MicSttInputSource(InputSource):
         self._task = None
 
     async def start(self) -> None:
+        # **冪等にする**: 二重 ON で PyAudio ストリームが2本になり、古い `_consume` が
+        # 参照を失って孤児化する（旧 `speech_queue` を永久に待つ）。UI の停止/再開は
+        # 何度も押されるので、守らないと確率的に必ず踏む。
+        # 他のサイドカーは `if self._task is None` ガードを持っているが、ここだけ無かった
+        # （`_stopping` を持たないため前提工事の構造テストの網からも漏れていた）。
+        if self._ai is not None or self._task is not None:
+            return
         from ..audio_input import AudioInput  # torch/pyaudio を要する→遅延 import
 
         # 発話開始の瞬間に barge-in（STT 完了を待たず即停止＝自然な割り込み）
@@ -96,7 +103,10 @@ class MicSttInputSource(InputSource):
             self._hook(self._on_stt_end, "on_stt_end")
 
     def stop(self) -> None:
+        """止める。**ハンドルを None に戻す**（戻さないと二重起動の検出ができない）。"""
         if self._task:
             self._task.cancel()
+            self._task = None
         if self._ai:
             self._ai.stop()
+            self._ai = None

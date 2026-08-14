@@ -191,6 +191,62 @@ def t_speech_decider_restart() -> None:
     asyncio.run(run())
 
 
+def t_idempotent_and_zombie() -> None:
+    """レッドチーム指摘（2026-08-14）で見つかった前提工事の漏れ2件。
+
+    どちらも「UI の ON/OFF を何度も押す」ようになって初めて踏む種類の欠陥。
+    """
+    print("\n[5] 二重 ON とゾンビスレッド")
+
+    # (a) マイク入力は冪等でなければならない（二重 ON でストリームが2本になる）
+    import inspect
+
+    from eve.response.input_source import MicSttInputSource
+
+    start_src = inspect.getsource(MicSttInputSource.start)
+    stop_src = inspect.getsource(MicSttInputSource.stop)
+    check("マイク start が冪等（既に動いていたら何もしない）",
+          "is not None" in start_src and "return" in start_src,
+          "→ 二重 ON で PyAudio ストリームが2本になり古い方が孤児化する")
+    check("マイク stop が _task を None に戻す", "_task = None" in stop_src)
+    check("マイク stop が _ai を None に戻す", "_ai = None" in stop_src)
+
+    # (b) capture スレッドは join 失敗時にハンドルを捨ててはいけない
+    from eve.vlm.capture_thread import CaptureThread
+
+    # docstring を除いた**実行される行だけ**を見る（説明文の中の語を拾わない）
+    body = "\n".join(ln for ln in inspect.getsource(CaptureThread.stop).splitlines()
+                     if ln.strip() and not ln.strip().startswith(("#", '"""', "'''"))
+                     and "。" not in ln)
+    check("capture stop が join 失敗を検出する", "is_alive()" in body,
+          "→ 生き残ったスレッドが start() の _stop.clear() で復活し二重起動する")
+    check("capture stop は join 失敗時に手放さない（早期 return）",
+          body.index("is_alive()") < body.index("_thread = None"),
+          "→ ハンドルを捨てると次の start() が新スレッドを作ってしまう")
+
+    class _Zombie:
+        """join しても死なないスレッドの模型。"""
+
+        def __init__(self) -> None:
+            self.joined = 0
+
+        def join(self, timeout=None):
+            self.joined += 1
+
+        def is_alive(self):
+            return True
+
+    ct = CaptureThread.__new__(CaptureThread)
+    ct._stop = __import__("threading").Event()
+    ct._thread = _Zombie()
+    closed = []
+    ct._capture = type("C", (), {"close": lambda self: closed.append(1)})()
+    ct.stop(timeout=0.01)
+    check("join 失敗時はハンドルを保持する", ct._thread is not None)
+    check("join 失敗時は capture を閉じない（生存スレッドの下で mss を壊さない）",
+          closed == [], f"{closed}")
+
+
 def t_unregister() -> None:
     print("\n[4] CapabilityRegistry.unregister")
     from eve.capability import CapabilityRegistry
@@ -233,6 +289,7 @@ if __name__ == "__main__":
     t_all_sidecars_reset_stopping()
     t_restart_actually_works()
     t_speech_decider_restart()
+    t_idempotent_and_zombie()
     t_unregister()
     print(f"\n合計: PASS {PASS} / FAIL {FAIL}")
     sys.exit(1 if FAIL else 0)
