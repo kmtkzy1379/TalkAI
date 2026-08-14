@@ -358,6 +358,18 @@ def t_vision() -> None:
 
     asyncio.run(scenario())
 
+    # VlmWorker.reset: 前回実況を残すと ON 直後の実況が重複判定で消える（点けたのに見えない）
+    from eve.vlm.worker import VlmWorker
+
+    w = VlmWorker.__new__(VlmWorker)
+    w._last_narration = "メモ帳が開いている"
+    w._last_call_ts = 12345.0
+    w._change_seq = 7
+    w.reset()
+    check("**VlmWorker の前回実況を捨てる**（残すと ON 直後の実況が重複で消える）",
+          w._last_narration == "")
+    check("pacing の起点も戻す（ON 直後の1回を待たせない）", w._last_call_ts < 0)
+
     # ChangeDetector.reset の単体（初回扱いに戻ること）
     cd = ChangeDetector()
     check("初回は必ず見る", cd.evaluate(0) is True)
@@ -432,6 +444,22 @@ def t_task_waits() -> None:
         await cp.stop()
 
     asyncio.run(scenario())
+
+    async def speaking_report() -> None:
+        """報告を喋っている最中は OFF を確定させない（1件制の定義＝発話し終えるまで）。"""
+        vl = _FakeVL()
+        vl.runner.busy = True  # 報告ターンを喋っている
+        cp = _plane(vl, quiesce_sec=0.6)
+        cp.start()
+        cp.request("task", False)
+        await asyncio.sleep(0.2)
+        check("**報告の発話中は OFF を確定させない**", cp.is_on("task") is True)
+        vl.runner.busy = False
+        await _settle(cp)
+        check("喋り終わったら OFF が確定する", cp.is_on("task") is False)
+        await cp.stop()
+
+    asyncio.run(speaking_report())
 
     async def timeout_case() -> None:
         vl = _FakeVL(tasks=[_Task("t1", "Running")])

@@ -516,10 +516,13 @@ class VoiceLoop:
         self.vision_state.last_change_mono = 0.0
         # 変化検出の内部状態（前回 pHash）も捨てる。持ち越すと OFF 中に起きた変化を
         # ON 直後の1枚目と比較して「今変わった」と誤って拾う。
-        try:
-            self.vlm_change_detector.reset()
-        except Exception:
-            logger.exception("ChangeDetector のリセットで例外（続行）")
+        # worker 側の前回実況も捨てる。残すと ON 直後の実況が重複判定で消える。
+        # （文字ゲートは start_vision() が毎回作り直すので持ち越さない。）
+        for name, obj in (("ChangeDetector", self.vlm_change_detector), ("VlmWorker", self.vlm_worker)):
+            try:
+                obj.reset()
+            except Exception:
+                logger.exception("%s のリセットで例外（続行）", name)
 
     async def run(self) -> None:
         self._progress("memory", "記憶を読み込み中…")

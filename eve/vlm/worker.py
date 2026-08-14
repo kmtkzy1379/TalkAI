@@ -76,6 +76,17 @@ class VlmWorker:
             self._idle.set()
             self._task = asyncio.create_task(self._run_forever())
 
+    def reset(self) -> None:
+        """画面の記憶を捨てて「作った直後」に戻す（UI で画面認識を OFF にした時）。
+
+        **`_last_narration` を消すのが要点**。残したまま ON に戻すと、最初の実況が
+        「前回と同じ」と重複判定されて捨てられ、画面が実際に変わるまで実況が出ない
+        （＝「点けたのに見えない」）。pacing の起点も戻して ON 直後の1回を待たせない。
+        """
+        self._last_narration = ""
+        self._last_call_ts = -1e9
+        self._change_seq = 0
+
     async def stop(self, drain_timeout: float = 2.0) -> None:
         self._stopping = True
         self._event.set()

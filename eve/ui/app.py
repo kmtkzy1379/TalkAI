@@ -268,7 +268,14 @@ class VoiceLoopThread(threading.Thread):
             logger.exception("VoiceLoop スレッドが異常終了")
         finally:
             self.started_ok.set()
-            self._bridge.loop_stopped.emit(reason)
+            try:
+                self._bridge.loop_stopped.emit(reason)
+            except RuntimeError:
+                # `Signal source has been deleted`: UI が先に畳まれると bridge の C++ 実体が
+                # 消えており、emit がここで例外になる。**スレッドの最後の1行**なので、
+                # 握らないと「Exception in thread eve-loop」がコンソールに出るだけで、
+                # 誰も受け取れない通知のために異常終了の見た目が残る（実起動で確認）。
+                pass
 
     def request_stop(self) -> None:
         """UI スレッドから安全に停止要求（§9.3 手段1: call_soon_threadsafe のみ）。"""

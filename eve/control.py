@@ -298,7 +298,10 @@ class ControlPlane:
         n = self._cancel_actives()
         if n:
             self._note(f"実行中/予約中のタスク {n} 件を取り消しています…")
-        left = await self._wait_quiet(response=False, audio=False, task=True)
+        # 応答と再生も待つ。1件制の定義は「依頼を受けてから**報告を発話し終えるまで**」で、
+        # 報告は `PipelineRunner` が pop した瞬間にキューから消える＝喋っている最中は
+        # キューを見ても分からない。ここで待たないと、報告の途中でタスクを OFF にできてしまう。
+        left = await self._wait_quiet(response=True, audio=True, task=True)
         if vl.cancel_resolver is not None:
             try:
                 await vl.cancel_resolver.stop()

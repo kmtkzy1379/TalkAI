@@ -57,7 +57,7 @@ VoiceLoop 稼働。話しかけてください。
 
 ## 2. テスト方法
 
-### Tier-1 決定論テスト（API不要・ネットワーク不要・全20ファイルで約30秒）
+### Tier-1 決定論テスト（API不要・ネットワーク不要・約1分）
 
 runner は無い（**pytest 未導入**＝`pytest tests/` は動かない）。各ファイルが独立スクリプト。
 
@@ -77,21 +77,19 @@ Get-ChildItem tests\test_*.py | ForEach-Object {
 "PASS $tot / FAIL $fail"
 ```
 
-**実測 2026-08-08: 20ファイル 495件 PASS / FAIL 0**（2回連続一致・flaky なし）
+**実測 2026-08-14: 862件 PASS / FAIL 0**（2回連続一致・flaky なし）。
+内訳の基準は 2026-08-08 の 20ファイル 495件で、そこへ UI 系を積み上げた:
 
-| ファイル | 件数 | ファイル | 件数 |
-|---|---|---|---|
-| test_callfunction_phase1.py | 45 | test_f4_feedback.py | 25 |
-| test_cancel_resolver_phase1.py | 15 | test_f5_speech.py | 61 |
-| **test_cleanup.py** | **8** | test_f6_vlm.py | 53 |
-| test_delivery_checker.py | 10 | test_search_phase1.py | 28 |
-| test_f0_foundation.py | 64 | test_stt_filter.py | 10 |
-| test_f1_pipeline.py | 26 | test_task_agent_phase1.py | 13 |
-| test_f2_5_integration.py | 4 | test_task_phase1.py | 18 |
-| test_f2_5_robustness.py | 5 | test_voiceloop_wiring.py | 34 |
-| test_f2_response.py | 18 | **test_workspace_phase1.py** | **23** |
-| test_f3_5_rag.py | 21 | | |
-| test_f3_memory.py | 14 | **合計** | **495** |
+| 追加ファイル | 件数 | 何を守るか |
+|---|---|---|
+| test_lipsync.py | 46 | モーラ長からの口の開閉（RMS 不採用の根拠ごと） |
+| test_ui_emotion.py | 65 | 感情ごとの揺れ・瞬き・視線 |
+| test_restartable.py | 55 | サイドカーの stop→start（欠陥クラス自体を走査して守る） |
+| test_capture_guard.py | 32 | キャプチャ除外の ON/OFF と共有状態 |
+| test_ui_input.py | 24 | キーボード入力と状態インジケータ |
+| test_task_window.py | 24 | 表示物のタスクウィンドウ集約 |
+| test_warmup.py | 28 | 並列ウォームアップと起動進捗 |
+| **test_control_plane.py** | **91** | **機能 ON/OFF・入口ゲート・ミュート・動的プロンプト** |
 
 （`test_cancel_resolver_phase1.py` が 19→15 に減ったのは、1件制で取消の照合LLM を撤去し
 到達不能になったテストを削ったため。死にコードを残さない方針。）
@@ -277,6 +275,44 @@ Tier-1 実測: 改修前 **495 PASS** → 改修後 **542 PASS / FAIL 0**（2回
 能力が欠けたまま復帰する（初回の実測で `run_program` / `show_on_screen` / `close_window` を
 取りこぼした）。**P4 の ControlPlane は「登録手順そのもの」を保持する必要がある**
 （名前の一覧を持つだけでは足りない）。
+
+#### UI 1-B: メニューの ON/OFF 実配線（2026-08-14・`eve/control.py`）
+
+前提工事の消費者がここで付いた（P4 完了）。`ControlPlane` が遷移を**直列化**して保持し、
+UI は「押された」を送るだけ・表示は loop が確定させた状態しか反映しない。
+**ヘッドレス（`tools/voice_chat.py`）は `vl.control = None` のまま＝挙動は完全に不変。**
+
+| キー | OFF でやること | 実測の所要 |
+|---|---|---|
+| `mute` | `player.muted` だけ。**世代を進めない**＝進行中ターンの残りも普通に流れる | 即時 |
+| `autospeech` | 沈黙監視と判定 worker の**両方**を止める＋未発話の下書きを破棄 | 即時 |
+| `vision` | capture→worker の順に停止 + VisionState と ChangeDetector を消す | 約2秒 |
+| `task` | 能力を外す→アクティブを Cancelled→executor が idle になるまで待つ→停止→未配達報告を破棄→掃除→表示窓を畳む | 空なら即時 |
+| `pause` | 入口→マイク→自律発話→画面認識 の順に断ち、進行中の応答と再生を**待つ**（殺さない） | 約2秒 |
+
+**設計上の要点（踏んだ穴と対策）**:
+- `PipelineRunner` に入口ゲートを足した（runner は殺さない＝作り直すと consumer 二重化）。
+  **`queue.get()` から戻った後にもゲートを見る**。見ないと「停止中も進み続けるタスクの
+  完了報告」が get 待ちを解いてそのまま喋る。刺激はローカル変数に持ったまま待つので
+  捨てないし順序も崩れない。
+- ミュートは**再生器のフラグ**で実装した。上位（世代）で止めると barge-in と同じになり、
+  「処理は正常終了させてから」というユーザ裁定を破る。チャンクループでも見るので文の途中でも黙る。
+- 自律発話は**両方**止めないと画面認識の `speak_trigger` 経由で喋り続ける。
+- `_tools_enabled_for` が `tool_schemas()` の空を見るようにした。タスク OFF 後に
+  `tools_active` だけ True が残る（tool は渡っていないのに使えるつもりで喋る）嘘を防ぐ。
+- 応答LLM には「**機能はあるが今はオフ**」と伝える（`ContextAssembler` の
+  「# 今オフにしている機能」）。「機能が無い」と言わせるとハルシネに見える（ユーザ裁定）。
+- 遷移の直列化は必須。stop 中の start は黙って no-op になる（上記 P2 の 1.）。
+- タスク能力の束は**登録手続きそのもの**を `_task_cap_registrars` に持つ（名前の一覧では
+  足りない＝上の実測どおり登録関数は5本ある）。実 VoiceLoop で `names` / `tool_schemas` /
+  `agent_tool_schemas` / `outward_actions` の4ビューが OFF→ON で**完全一致**するのを確認済み。
+
+**実起動での確認（2026-08-14・キャプチャ除外 OFF・約30秒）**: 本番 VoiceLoop で5項目すべてを
+OFF→ON し、`pending` → 確定 の順で状態が出ること・会話ログに確定が出ることを確認。
+このとき `VoiceLoopThread.run()` の最後の `loop_stopped.emit()` が UI 破棄後に
+`RuntimeError: Signal source has been deleted` を投げるのも見つけて修正した（握って終了）。
+
+テスト `tests/test_control_plane.py`（91件）。
 
 テスト `tests/test_restartable.py`（48件）。**欠陥クラスを守る作りにした**（E13 の反省）:
 `eve/` を走査して「stop() で停止フラグを立てる start/stop 持ちのクラス」を**実際に列挙**し
