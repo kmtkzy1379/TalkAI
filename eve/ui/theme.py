@@ -35,12 +35,37 @@ def _url(p: Path) -> str:
     return str(p).replace("\\", "/")
 
 
-def frame_qss(image: Path, border: int = 120, radius: int = 0) -> str:
-    """9スライスで枠画像を貼る QSS。`border` は四隅として固定する幅（素材の装飾サイズ）。"""
-    if not image.exists():
-        return f"background: white; border: 1px solid {LINE}; border-radius: 10px;"
-    return (f"border-image: url({_url(image)}) {border} {border} {border} {border} stretch stretch;"
-            f"border-width: {border // 8}px; border-radius: {radius}px;")
+def frame_qss(image: Path, *, scale: float = 0.35) -> tuple[str, tuple[int, int, int, int]]:
+    """枠画像を 9スライスで貼る QSS と、**中身を置くべき余白**を返す。
+
+    素材は実描画範囲で切り出してから使う（`assets.prepare`）。切り出さないと絵が
+    キャンバスの一部にしか来ず、内側の紙の縁が2本目の枠に見える（実測で確認）。
+
+    `scale` は「素材の余白 → 画面上の余白」の縮尺。素材は 1000px 級なので、そのまま
+    使うと枠だけで画面が埋まる。四隅の装飾が潰れない範囲で小さくする。
+    """
+    from .assets import prepare
+
+    f = prepare(image)
+    if not f.ok:
+        return (f"background: {BG}; border: 1px solid {LINE}; border-radius: 12px;",
+                (14, 12, 14, 12))
+    # border-width は「画面上で四隅に割く幅」。素材側の slice と比を合わせると歪まない。
+    bw = tuple(max(6, int(v * scale)) for v in (f.top, f.right, f.bottom, f.left))
+    qss = (f"border-image: url({_url(f.path)}) {f.top} {f.right} {f.bottom} {f.left} "
+           f"stretch stretch;"
+           f"border-style: solid;"
+           f"border-width: {bw[0]}px {bw[1]}px {bw[2]}px {bw[3]}px;")
+    pad = (bw[3] + 10, bw[0] + 8, bw[1] + 10, bw[2] + 8)  # 左,上,右,下
+    return qss, pad
+
+
+def panel_qss(paper: str = "#fdfcfa") -> str:
+    """枠素材が合わない場所（横に長い帯など）で使う、無地の落ち着いたパネル。
+
+    hallmark の「抑制」に従い、装飾を無理に引き伸ばすより無地で整える方を選ぶ。
+    """
+    return (f"background: {paper}; border: 1px solid {LINE}; border-radius: 14px;")
 
 
 def menu_button_qss(state: str) -> str:
@@ -70,7 +95,7 @@ def app_qss() -> str:
     """アプリ全体の下地。"""
     return f"""
     QWidget {{ color: {INK}; font-size: 13px; }}
-    QLabel#speech {{ font-size: 17px; color: {INK}; padding: 10px 16px; }}
+    QLabel#speech {{ font-size: 19px; line-height: 150%; color: {INK}; }}
     QLabel#hint {{ color: {SUB}; }}
     QTabBar::tab {{ padding: 5px 12px; }}
     QTabBar::tab:selected {{ color: {SPEAKER_COLORS['user']}; font-weight: bold; }}

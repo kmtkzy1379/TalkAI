@@ -37,7 +37,7 @@ from .log_bridge import LogBridge
 from .log_panel import LogPanel
 from .menu_bar import MenuBar
 from .task_window import TaskWindow
-from .theme import BG, LOG_FRAME, TEXT_FRAME, app_qss, frame_qss
+from .theme import BG, LOG_FRAME, app_qss, frame_qss, panel_qss
 
 logger = logging.getLogger(__name__)
 
@@ -358,37 +358,55 @@ class MainWindow(QWidget):
 
         # --- メインタブ: 左に Live2D、右にログ、下に発話テキスト（参考画像の構成）---
         self.logs = LogPanel()
+        # ログは縦長。素材も切り出すと縦長（1062x1780）なので枠がそのまま合う。
         log_box = QWidget()
-        # 枠画像は角に装飾がある。**スライス幅を小さく**して装飾の比率を保ち、
-        # 中身は装飾の内側に十分な余白を取って置く（大きすぎると文字が枠に重なる）。
-        # 枠画像は横長素材なので、縦長の枠に引き伸ばすと装飾と内側の白地がずれる。
-        # スライスを小さめにして「細い装飾枠」として使い、中身は素直に内側へ置く。
-        log_box.setStyleSheet(frame_qss(LOG_FRAME, border=60))
-        log_box.setMinimumWidth(240)
+        log_qss, log_pad = frame_qss(LOG_FRAME, scale=0.9)
+        log_box.setStyleSheet(log_qss)
+        log_box.setMinimumWidth(250)
         lb = QVBoxLayout(log_box)
-        lb.setContentsMargins(22, 26, 22, 26)
+        lb.setContentsMargins(*log_pad)
         lb.addWidget(self.logs)
 
         stage = QHBoxLayout()
-        stage.setSpacing(8)
+        stage.setSpacing(10)
         stage.addWidget(self.view, 5)
         stage.addWidget(log_box, 3)
 
+        # 発話テキストは**横に細長い帯**。縦横比 1.6:1 の枠素材を 10:1 に引き伸ばすと
+        # 装飾が潰れて「2重の枠」に見える（実測）。ここは無地パネルで整える
+        # （hallmark の「抑制」＝装飾を無理に伸ばすより素直に整える）。
         self.line.setObjectName("speech")
+        self.line.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         speech_box = QWidget()
-        speech_box.setStyleSheet(frame_qss(TEXT_FRAME, border=60))
+        speech_box.setStyleSheet(panel_qss())
         sb = QVBoxLayout(speech_box)
-        sb.setContentsMargins(34, 20, 34, 18)
+        sb.setContentsMargins(22, 10, 22, 10)
         sb.addWidget(self.line)
-        speech_box.setFixedHeight(84)   # 固定＝下の入力欄を押し出さない
+
+        entry_box = QWidget()
+        entry_box.setStyleSheet(panel_qss("#f3f1f6"))
+        eb = QVBoxLayout(entry_box)
+        eb.setContentsMargins(14, 6, 14, 8)
+        eb.setSpacing(6)
+        eb.addLayout(top)
+        eb.addLayout(entry_row)
+
+        # **縦比 発話テキスト 2 : 入力欄 1**（ユーザ指定 2026-08-14）
+        bottom_box = QWidget()
+        bottom = QVBoxLayout(bottom_box)
+        bottom.setContentsMargins(0, 0, 0, 0)
+        bottom.setSpacing(8)
+        bottom.addWidget(speech_box, 2)
+        bottom.addWidget(entry_box, 1)
+        bottom_box.setMinimumHeight(160)
+        bottom_box.setMaximumHeight(215)
 
         main = QWidget()
         ml = QVBoxLayout(main)
-        ml.setContentsMargins(6, 6, 6, 6)
+        ml.setContentsMargins(10, 8, 10, 8)
+        ml.setSpacing(10)
         ml.addLayout(stage, 1)
-        ml.addWidget(speech_box)
-        ml.addLayout(top)
-        ml.addLayout(entry_row)
+        ml.addWidget(bottom_box)
 
         # --- 設定タブ（1-A では枠だけ。中身と機能は Phase 2）---
         settings = QWidget()
