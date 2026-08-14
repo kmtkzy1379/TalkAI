@@ -32,7 +32,24 @@ class OpenAIEmbedder(Embedder):
     def _embed(self, texts: list[str]) -> list[list[float]]:
         client = self._get_client()
         r = client.embeddings.create(model=self.model, input=texts)
+        self._note_usage(r)
         return [d.embedding for d in r.data]
+
+    def _note_usage(self, response) -> None:
+        """使用量メーターへ（あれば）。RAG は件数が多いので合計に効く。"""
+        try:
+            from ...usage import meter
+
+            m = meter()
+            if m is None:
+                return
+            usage = getattr(response, "usage", None)
+            m.record(role="embed", model=self.model,
+                     prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                     completion_tokens=0,
+                     accuracy="exact" if usage is not None else "approx")
+        except Exception:
+            logger.debug("埋め込み使用量の記録に失敗（無視）", exc_info=True)
 
     async def embed_documents(self, texts: list[str]) -> list[list[float]]:
         if not texts:

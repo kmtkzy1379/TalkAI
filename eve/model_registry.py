@@ -9,8 +9,11 @@
 """
 from __future__ import annotations
 
+import logging
 import os
 from typing import AsyncIterator, Awaitable, Callable, Optional
+
+logger = logging.getLogger(__name__)
 
 # role -> (env キー, 既定モデルID)。既定は Claude 停止中の暫定代用値。
 ROLE_ENV: dict[str, tuple[str, str]] = {
@@ -71,6 +74,22 @@ def merge_tool_call_deltas(fragments) -> list[dict]:
     return out
 
 
+def _meter_record(fn) -> None:
+    """使用量メーターがあれば記録する。**無ければ何もしない＝挙動は完全に不変**。
+
+    ここは応答の主経路なので、記録の失敗で会話を止めない（`usage.record` 側も握るが、
+    メーター取得やラムダ自体が落ちる可能性まで含めてここで塞ぐ）。
+    """
+    try:
+        from .usage import meter
+
+        m = meter()
+        if m is not None:
+            fn(m)
+    except Exception:  # noqa: BLE001（計測のために本体を落とさない）
+        logger.debug("使用量の記録に失敗（無視）", exc_info=True)
+
+
 class ModelRegistry:
     """役割名から具体モデルIDを解決し、統一インターフェースで完了を呼ぶ。"""
 
@@ -110,25 +129,35 @@ class ModelRegistry:
             from litellm import acompletion  # 遅延 import（テストは不要）
 
             fn = acompletion
-        return await fn(model=model, messages=messages, **kwargs)
+        resp = await fn(model=model, messages=messages, **kwargs)
+        _meter_record(lambda m: m.record_response(role=role, model=model, response=resp))
+        return resp
 
     async def stream(self, role: str, messages: list[dict], **kwargs) -> AsyncIterator[str]:
         """解決済みモデルへストリーミング要求。文字列デルタを逐次 yield する。"""
         model = self.resolve(role)
-        if self._stream_fn is not None:
-            async for piece in self._stream_fn(model=model, messages=messages, **kwargs):
-                yield piece
-            return
-        from litellm import acompletion  # 遅延 import（テストは不要）
+        # 途中で barge-in に切られても、そこまでの分は数える（finally で記録）。
+        out: list[str] = []
+        try:
+            if self._stream_fn is not None:
+                async for piece in self._stream_fn(model=model, messages=messages, **kwargs):
+                    out.append(piece)
+                    yield piece
+                return
+            from litellm import acompletion  # 遅延 import（テストは不要）
 
-        resp = await acompletion(model=model, messages=messages, stream=True, **kwargs)
-        async for chunk in resp:
-            try:
-                delta = chunk.choices[0].delta.content
-            except (AttributeError, IndexError, KeyError, TypeError):
-                delta = None
-            if delta:
-                yield delta
+            resp = await acompletion(model=model, messages=messages, stream=True, **kwargs)
+            async for chunk in resp:
+                try:
+                    delta = chunk.choices[0].delta.content
+                except (AttributeError, IndexError, KeyError, TypeError):
+                    delta = None
+                if delta:
+                    out.append(delta)
+                    yield delta
+        finally:
+            _meter_record(lambda m: m.record_stream(
+                role=role, model=model, messages=messages, output="".join(out)))
 
     async def stream_with_tools(
         self, role: str, messages: list[dict], *, tools: list[dict], tool_sink: list, **kwargs
@@ -140,25 +169,33 @@ class ModelRegistry:
         Call-Function 有効ターンでのみ呼ぶ（content streaming は従来どおり＝発話順/barge-in 不変）。
         """
         model = self.resolve(role)
-        if self._stream_fn is not None:  # テスト注入（tool path は tools/tool_sink を受ける fn を渡す）
-            async for piece in self._stream_fn(
-                model=model, messages=messages, tools=tools, tool_sink=tool_sink, **kwargs
-            ):
-                yield piece
-            return
-        from litellm import acompletion  # 遅延 import
+        out: list[str] = []
+        try:
+            if self._stream_fn is not None:  # テスト注入（tool path は tools/tool_sink を受ける fn を渡す）
+                async for piece in self._stream_fn(
+                    model=model, messages=messages, tools=tools, tool_sink=tool_sink, **kwargs
+                ):
+                    out.append(piece)
+                    yield piece
+                return
+            from litellm import acompletion  # 遅延 import
 
-        resp = await acompletion(model=model, messages=messages, stream=True, tools=tools, **kwargs)
-        frags: list = []
-        async for chunk in resp:
-            try:
-                delta = chunk.choices[0].delta
-            except (AttributeError, IndexError, KeyError, TypeError):
-                continue
-            content = getattr(delta, "content", None)
-            if content:
-                yield content
-            tcs = getattr(delta, "tool_calls", None)
-            if tcs:
-                frags.extend(tcs)
-        tool_sink.extend(merge_tool_call_deltas(frags))
+            resp = await acompletion(model=model, messages=messages, stream=True, tools=tools, **kwargs)
+            frags: list = []
+            async for chunk in resp:
+                try:
+                    delta = chunk.choices[0].delta
+                except (AttributeError, IndexError, KeyError, TypeError):
+                    continue
+                content = getattr(delta, "content", None)
+                if content:
+                    out.append(content)
+                    yield content
+                tcs = getattr(delta, "tool_calls", None)
+                if tcs:
+                    frags.extend(tcs)
+            tool_sink.extend(merge_tool_call_deltas(frags))
+        finally:
+            # tools のスキーマも入力トークンに乗るので一緒に数える（無視すると過小評価になる）。
+            _meter_record(lambda m: m.record_stream(
+                role=role, model=model, messages=messages, output="".join(out), tools=tools))

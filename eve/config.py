@@ -7,7 +7,11 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-_ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+# 読み込む `.env`。`EVE_ENV_FILE` で差し替えられる。
+# **検証のため**に入れている: 設定が本当に効くかを見るには別の `.env` で起動する必要があり、
+# 本物を書き換えて戻す方式だと、途中で落ちた時にユーザの `.env` が壊れたまま残る。
+# 副次的に「用途ごとのプロファイル」にも使える。
+_ENV_PATH = Path(os.getenv("EVE_ENV_FILE") or (Path(__file__).resolve().parent.parent / ".env"))
 
 
 def _load_dotenv(path: Path) -> None:
@@ -191,6 +195,13 @@ class Config:
     UI_HIDE_FROM_CAPTURE = os.getenv("UI_HIDE_FROM_CAPTURE", "1") not in ("0", "false", "no")
     # ウィンドウを常に最前面に出す（既定 off）。作業しながら顔を見たい時に使う。
     UI_ALWAYS_ON_TOP = os.getenv("UI_ALWAYS_ON_TOP", "0") == "1"
+
+    # API 使用量と概算費用の記録（既定 off）。役割ごとに1呼び出し1行の JSONL を残す。
+    # 価格は litellm の内蔵表から引く（引けないモデルは費用 None＝0 と嘘をつかない）。
+    USAGE_LOG_ENABLED = os.getenv("USAGE_LOG_ENABLED", "0") == "1"
+    USAGE_LOG_FILE = os.getenv("USAGE_LOG_FILE", "usage.jsonl")
+    # litellm の価格表が古い/未収載の時の手動修正。"model=入力:出力"（USD/token）をカンマ区切り。
+    USAGE_PRICE_OVERRIDE = os.getenv("USAGE_PRICE_OVERRIDE", "")
 
     # Call-Function（J-0 即時 Call-Function・increment 1 は read-only 能力のみ）。
     CALLFUNCTION_ENABLED = os.getenv("CALLFUNCTION_ENABLED", "0") == "1"  # 既定 off（実機で明示 on）

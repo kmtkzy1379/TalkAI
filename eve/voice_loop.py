@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from pathlib import Path
 from typing import Callable, Optional
 
 from .clock import now_mono
@@ -63,6 +65,14 @@ class VoiceLoop:
         # UI の機能 ON/OFF（`eve/control.py`）。**ヘッドレスでは None のまま**＝挙動は不変。
         # UI が起動時に差し込む。応答文脈の `features_off` はこれを遅延参照する。
         self.control = None
+        # API 使用量メーター（既定 off）。ON の時だけ ModelRegistry/STT/埋め込みが記録する。
+        self.usage = None
+        if Config.USAGE_LOG_ENABLED:
+            from .usage import UsageMeter, install
+
+            self.usage = UsageMeter(Path(Config.USAGE_LOG_FILE), tag=os.getenv("USAGE_TAG", ""))
+            install(self.usage)
+            logger.info("API 使用量の記録 稼働（%s）", Config.USAGE_LOG_FILE)
         self.registry = ModelRegistry()
         self.player = RealAudioPlayer()
         self.audio = AudioPlayQueue(play_fn=self.player.play_fn)
@@ -685,3 +695,9 @@ class VoiceLoop:
         except Exception:
             pass
         self.player.close()
+        if self.usage is not None:
+            # 終了時に必ず総額を出す（ログを掘らなくても「今のランでいくら使ったか」が分かる）。
+            try:
+                logger.info("💰 このランの API 使用量\n%s", self.usage.format_summary())
+            except Exception:
+                logger.exception("使用量の集計に失敗（無視）")

@@ -26,7 +26,9 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ENV_PATH = REPO_ROOT / ".env"
+# `eve/config.py` と**同じファイル**を見る（`EVE_ENV_FILE` で差し替え可）。
+# ここがズレると「設定タブで保存したのに読み込まれない」が起きる。
+ENV_PATH = Path(os.getenv("EVE_ENV_FILE") or (REPO_ROOT / ".env"))
 ENV_EXAMPLE_PATH = REPO_ROOT / ".env.example"
 
 

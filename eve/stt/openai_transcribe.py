@@ -58,7 +58,30 @@ class OpenAITranscribeStt(Stt):
         except Exception as e:  # 一時失敗は起こりうる → ログして空（落とさない）
             logger.warning("STT(openai) 失敗、空を返す: %s", e)
             return ""
+        self._note_usage(r, len(audio_bytes))
         return clean_transcript(getattr(r, "text", "") or "")
+
+    def _note_usage(self, response, pcm_bytes: int) -> None:
+        """使用量メーターへ（あれば）。**音声の秒数も残す**（課金はトークンではなく尺の
+        こともあるので、後から別の価格体系で計算し直せるようにしておく）。"""
+        try:
+            from ..usage import meter
+
+            m = meter()
+            if m is None:
+                return
+            usage = getattr(response, "usage", None)
+            get = (lambda k: getattr(usage, k, None)) if usage is not None else (lambda k: None)
+            sec = pcm_bytes / 2.0 / max(1, Config.SAMPLE_RATE)  # int16 モノラル前提
+            m.record(
+                role="stt", model=self.model,
+                prompt_tokens=get("input_tokens") or get("prompt_tokens") or 0,
+                completion_tokens=get("output_tokens") or get("completion_tokens") or 0,
+                accuracy="exact" if usage is not None else "approx",
+                extra={"audio_sec": round(sec, 2)},
+            )
+        except Exception:
+            logger.debug("STT 使用量の記録に失敗（無視）", exc_info=True)
 
     async def warmup(self) -> None:
         try:
