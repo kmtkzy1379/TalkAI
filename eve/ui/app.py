@@ -53,6 +53,7 @@ class LoopBridge(QObject):
     open_item = Signal(str, str, str)       # タスクウィンドウに開く (path, 表示名, window_id)
     close_item = Signal(str)                # タスクウィンドウから閉じる (window_id)
     loop_stopped = Signal(str)              # 異常終了時の理由（正常終了は空文字）
+    control_state = Signal(str, str, bool)  # 機能 ON/OFF の**確定**通知 (key, state, on)
 
 
 class _ItemHandle:
@@ -89,6 +90,7 @@ class VoiceLoopThread(threading.Thread):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._task: Optional[asyncio.Task] = None
         self._vl = None  # 実体は loop スレッドが持つ。UI からは submit_text 経由でしか触らない
+        self._control = None  # ControlPlane（loop 所有・UI からは request_control 経由のみ）
         self._handles: dict = {}   # window_id -> _ItemHandle（loop 所有）
         self._aggregate = Config.WS_VIEWER_MODE != "external"
         self.started_ok = threading.Event()
@@ -199,12 +201,36 @@ class VoiceLoopThread(threading.Thread):
         except RuntimeError:
             pass  # 既に閉じている
 
+    def request_control(self, key: str, on: bool) -> None:
+        """UI スレッドから機能 ON/OFF を要求（§9.3 手段1: call_soon_threadsafe のみ）。
+
+        **切り替えるのは loop 側**。UI は要求を出すだけで、表示は `control_state` で
+        戻ってきた確定状態しか反映しない（押した瞬間に表示を変えると嘘になる）。
+        """
+        loop, ctl = self._loop, self._control
+        if loop is None or ctl is None:
+            return
+        try:
+            loop.call_soon_threadsafe(ctl.request, key, bool(on))
+        except RuntimeError:
+            pass  # 既に閉じている
+
     async def _main(self) -> None:
+        from ..control import ControlPlane
         from ..voice_loop import VoiceLoop
 
         self._loop = asyncio.get_running_loop()
         vl = VoiceLoop()
         self._vl = vl
+        # 機能 ON/OFF の実体。`on_state` は loop 上から同期で呼ばれるので emit だけして戻る。
+        self._control = ControlPlane(vl, on_state=lambda k, s, on: self._bridge.control_state.emit(k, s, on))
+        # 経過（何を待っているか）は `logger` 経由で会話ログへ出る（LogBridge の eve.control 経路）
+        # ＝ここで別の通り道を作らない。
+        vl.control = self._control
+        self._control.start()
+        # 構成で使えない機能（`.env` で無効なもの）を最初に灰色にする。
+        for key, (state, on) in self._control.snapshot().items():
+            self._bridge.control_state.emit(key, state, on)
         # 起動の進み具合（案B: 2分間なにも分からない状態をやめる）。emit するだけで戻る。
         vl.on_progress = lambda key, text: self._bridge.progress.emit(key, text)
         # 再生開始/終了フック（既定 None のところへ差し込む＝本体の挙動は変えない）
@@ -223,6 +249,11 @@ class VoiceLoopThread(threading.Thread):
             pass
         finally:
             mood.cancel()  # 見た目用のポーラを先に止める（drain 中に UI を触らせない）
+            if self._control is not None:
+                try:
+                    await self._control.stop()  # 遷移中に落とさない（stop() と競合させない）
+                except Exception:
+                    logger.exception("ControlPlane.stop() で例外")
             try:
                 await vl.stop()
             except Exception:
@@ -290,6 +321,7 @@ class MainWindow(QWidget):
         self.bridge.status.connect(self._on_status)
         self.bridge.progress.connect(self._on_progress)
         self.bridge.loop_stopped.connect(self._on_loop_stopped)
+        self.bridge.control_state.connect(self._on_control_state)
         self.view.ready.connect(lambda ok, msg: self.status.setText(("✅ " if ok else "❌ ") + msg))
 
         self.thread_ = VoiceLoopThread(self.bridge)
@@ -549,23 +581,22 @@ class MainWindow(QWidget):
                 "vision": "画面認識", "task": "タスク"}
 
     def _menu_requested(self, key: str, want_on: bool) -> None:
-        """押された → 切替中 → 切替完了、を**目に見える形で**進める。
+        """押された → loop へ要求を出すだけ。**表示は変えない**。
 
-        **1-A の時点では実体（パイプライン）はまだ切り替わらない**。表示だけが変わる。
-        黙って見た目だけ変えると「OFF にしたのに動いている」と誤解させるので、
-        ログに「表示のみ・実体は次の段階」と明記する（嘘の状態を作らない）。
+        表示を変えるのは `_on_control_state`（loop が「実際に切り替わった」と言った時だけ）。
+        押した瞬間に見た目を変えると、実体が切り替わる前に ON/OFF を表示することになり、
+        「OFF にしたのに普通に稼働している」という嘘になる（1-A で実際に起きた）。
         """
         name = self._MENU_JA.get(key, key)
-        self.menu.set_state(key, "pending")
-        self.logs.add("chat", "system", f"{name} を {'ON' if want_on else 'OFF'} に切替中…")
+        verb = "ON" if want_on else "OFF"
+        if key == "mute":  # ミュートだけは ON=黙る なので語を反転させないと読み違える
+            verb = "ミュート" if want_on else "ミュート解除"
+        self.logs.add("chat", "system", f"{name} を {verb} に切り替えます…")
+        self.thread_.request_control(key, want_on)
 
-        def done() -> None:
-            self.menu.set_state(key, "on" if want_on else "off", on=want_on)
-            self.logs.add("chat", "system",
-                          f"{name} を {'ON' if want_on else 'OFF'} にしました"
-                          "（※表示のみ。実際に止める配線は次の段階で入ります）")
-
-        QTimer.singleShot(700, done)
+    def _on_control_state(self, key: str, state: str, on: bool) -> None:
+        """loop が確定させた状態だけを表示に反映する（唯一の反映点）。"""
+        self.menu.set_state(key, state, on=on)
 
     def _on_sentence_started(self, text: str, meta) -> None:
         self.view.set_plan(meta)

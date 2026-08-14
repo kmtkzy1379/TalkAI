@@ -14,9 +14,18 @@ from typing import Optional
 
 
 class RealAudioPlayer:
+    """実再生。**ミュートはここだけで完結させる**（UI「ミュート」用）。
+
+    なぜ再生器で止めるか: 上位（AudioPlayQueue の世代/seq）で止めると barge-in と同じ
+    経路になり、進行中ターンの残りの文が捨てられる。ユーザ裁定は「速攻黙って、**処理は
+    正常に終了させて**から Pause」なので、止めるのは音だけでよい。seq/generation・
+    再生開始/終了フック・会話記憶はすべて通常どおり進む（ログには発話が残る＝読める）。
+    """
+
     def __init__(self, channels: int = 1) -> None:
         self._pa = None
         self._channels = channels
+        self.muted = False  # 単一書込（loop 上の ControlPlane のみ）・読みは再生中の同期参照
 
     def _pyaudio(self):
         if self._pa is None:
@@ -28,6 +37,8 @@ class RealAudioPlayer:
     async def play_fn(self, audio: Optional[bytes], should_stop=None) -> None:
         if not audio:
             return
+        if self.muted:
+            return  # 音は出さない（デバイスも開かない）。呼び出し側から見れば「再生し終えた」
         import pyaudio
         import soundfile as sf
 
@@ -43,6 +54,8 @@ class RealAudioPlayer:
             for i in range(0, len(data), chunk):
                 if should_stop is not None and should_stop():
                     break  # B3: barge-in → 文の途中でも即停止（チャンク粒度で数十ms以内）
+                if self.muted:
+                    break  # 再生中にミュートされた → 文の途中でも即黙る（barge-in と同じ粒度）
                 buf = data[i : i + chunk].tobytes()
                 await loop.run_in_executor(None, stream.write, buf)
         finally:

@@ -59,6 +59,22 @@ class PipelineRunner:
         self._max_consecutive_errors = max_consecutive_errors
         self.processed = 0
         self._active: Optional[asyncio.Task] = None
+        # UI「停止/再開」用の入口ゲート。**既定は開いている**＝ヘッドレスの挙動は不変。
+        # runner タスク自体は止めない（作り直すと consumer が二重化する/刺激を取りこぼす）。
+        self._gate = asyncio.Event()
+        self._gate.set()
+
+    # --- 停止/再開（ControlPlane から loop 上で呼ぶ）-------------------------
+
+    def pause(self) -> None:
+        """新しい刺激の処理を止める。**進行中の応答は止めない**（正常終了させる）。"""
+        self._gate.clear()
+
+    def resume(self) -> None:
+        self._gate.set()
+
+    def is_paused(self) -> bool:
+        return not self._gate.is_set()
 
     async def _next(self) -> Stimulus:
         s = await self._queue.get()
@@ -71,7 +87,14 @@ class PipelineRunner:
         return s
 
     async def run_once(self) -> Stimulus:
+        await self._gate.wait()  # 停止中は queue から取り出さない（溜めておく）
         s = await self._next()
+        # **取り出した後**にもう一度見る。取り出しは `queue.get()` で待っている最中に届いた
+        # 刺激（停止中でも進み続けるタスクの完了報告など）で解けるため、ここで見ないと
+        # 「停止したのに喋る」が残る。刺激はローカル変数に持ったまま待つ＝捨てないし順序も崩れない。
+        if not self._gate.is_set():
+            logger.info("⏸ 停止中のため刺激を保留（再開時に処理）: %s", s.kind.name)
+            await self._gate.wait()
         # handle はキャンセル可能なタスクで走らせる（barge-in で中断するため）
         self._active = asyncio.create_task(self._orch.handle(s))
         await asyncio.wait({self._active})  # 完了 or barge-in キャンセルで戻る

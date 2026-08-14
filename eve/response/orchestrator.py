@@ -97,6 +97,7 @@ class ResponseOrchestrator:
         redeliver_fn: Optional[Callable[[Stimulus], None]] = None,  # 任意: 潰れた報告の再投入（同期・非ブロッキング）
         delivery_checker=None,  # J-2 P1-1 任意: barge-in なしで完了した報告ターンの配達確認サイドカー
         is_suppressed: Optional[Callable[[Optional[str]], bool]] = None,  # D2 任意: 取消済み報告の判定（同期）
+        features_off_provider: Optional[Callable[[], list[str]]] = None,  # UI 任意: 今オフの機能
     ) -> None:
         self._audio = audio
         self._stream_fn = stream_fn
@@ -130,18 +131,29 @@ class ResponseOrchestrator:
         # 任意注入(D2): この dedup_key の報告が取消済みかを同期判定（StimulusQueue.is_suppressed）。
         # 依存の向きは tasks_provider と同型のクロージャ注入＝response 層は task 層を import しない。
         self._is_suppressed = is_suppressed
+        # 任意注入(UI): 今オフにしている機能の名前。ヘッドレスでは None＝ブロック自体が出ない。
+        self._features_off_provider = features_off_provider
         self.last_response = ""  # 生成済み全文（自然さの目視・テスト用。記憶には使わない＝C5）
 
     def _tools_enabled_for(self, stimulus: Stimulus) -> bool:
         """この刺激の応答で tool（Call-Function）を有効にするか。
 
         USER 発話のみ＝CALLFUNCTION_RESULT/自発発話には渡さない（1ホップ抑制＝二次注入/無限ループ防止）。
+
+        **提示できる tool が1つも無い時は False**（UI でタスクを OFF にすると
+        `delegate_task`/`cancel_task` が unregister され `tool_schemas()` が空になる）。
+        ここを見ないと system プロンプトの `tools_active` だけが True のまま残り、
+        「使える tool があるつもりで喋るのに実際には渡っていない」という嘘の状態になる。
         """
-        return (
-            self._dispatcher is not None
-            and Config.CALLFUNCTION_ENABLED
-            and stimulus.kind == StimulusKind.USER_UTTERANCE
-        )
+        if self._dispatcher is None or not Config.CALLFUNCTION_ENABLED:
+            return False
+        if stimulus.kind != StimulusKind.USER_UTTERANCE:
+            return False
+        try:
+            return bool(self._dispatcher.tool_schemas())
+        except Exception:
+            logger.exception("tool_schemas の取得に失敗（tool なしで応答）")
+            return False
 
     def _vision_for(self, stimulus: Stimulus) -> Optional[str]:
         """この刺激の応答文脈に入れる画面情報（層分離の唯一の分岐点）。
@@ -229,6 +241,14 @@ class ResponseOrchestrator:
                 capabilities = self._capabilities_provider()
             except Exception:
                 logger.exception("能力一覧の取得に失敗（注入なしで継続）")
+        # UI で今オフにしている機能。**全刺激種別で出す**（自発発話でも「見えないから」と
+        # 言い出す場面があり、そこで「機能が無い」と言われるのが最も紛らわしいため）。
+        features_off = None
+        if self._features_off_provider is not None:
+            try:
+                features_off = self._features_off_provider() or None
+            except Exception:
+                logger.exception("オフ機能一覧の取得に失敗（注入なしで継続）")
         # native ロール messages（system + user/assistant ターン列 + 最終 user発話/自発指示）。
         return self._ctx.assemble(
             user_text=user_text,
@@ -245,6 +265,7 @@ class ResponseOrchestrator:
             active_tasks=active_tasks,
             capabilities=capabilities,
             prev_session_gap_sec=prev_gap,
+            features_off=features_off,
         )
 
     def _notify_complete(self) -> None:

@@ -31,6 +31,7 @@ _ROUTES: tuple[tuple[str, str, str], ...] = (
     ("eve.feedback.feedback_llm", "mind", "system"),    # 内省（感情・予測差）
     ("eve.feedback.worker", "mind", "system"),
     ("eve.speech.monitor", "mind", "system"),           # 🔔 発話判定・🔇 抑制
+    ("eve.control", "chat", "system"),                  # 🎛 機能 ON/OFF の確定と待ち（会話タブに出す）
 )
 
 

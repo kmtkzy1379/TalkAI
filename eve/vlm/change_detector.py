@@ -25,6 +25,15 @@ class ChangeDetector:
         self._reference: int | None = None
         self._idle = 0
 
+    def reset(self) -> None:
+        """参照を捨てて「作った直後」に戻す（UI で画面認識を OFF→ON した時）。
+
+        持ち越すと、OFF 中に起きた画面変化を ON 直後の1枚目と比較して「たった今変わった」
+        として拾う。捨てれば初回扱いで1枚見に行くだけで済む。
+        """
+        self._reference = None
+        self._idle = 0
+
     def evaluate(self, phash: int) -> bool:
         """True = この pHash は VLM 呼び出しに値する（変化 or periodic 強制）。"""
         if self._reference is None:

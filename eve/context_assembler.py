@@ -78,11 +78,24 @@ class ContextAssembler:
 
     def _build_system(self, *, rag_chunks, last_feedback, vision, speech_decision_reason, now,
                       callfunction_result=None, tools_active=False, active_tasks=None,
-                      last_feedback_iso=None, session_gap_sec=None, capabilities=None) -> str:
+                      last_feedback_iso=None, session_gap_sec=None, capabilities=None,
+                      features_off=None) -> str:
         parts: list[str] = []
         if self.system_prompt:
             parts.append(self.system_prompt)
         parts.append(ROLE_ANCHOR)
+        if features_off:
+            # UI で機能を OFF にしている間の断り書き（ユーザ裁定 2026-08-14）。
+            # **「機能が無い」と言わせない**: 「画面を見る機能がない」は事実と違い、
+            # ユーザにはハルシネーションに見える。正しくは「機能はあるが今は切ってある」。
+            # 一時的だと分かれば「じゃあ点けて」と言える＝会話が前に進む。
+            parts.append(
+                "# 今オフにしている機能\n"
+                + "\n".join(f"- {f}" for f in features_off)
+                + "\n（**「その機能が無い」とは言わない**。備わってはいるが今は切ってある、"
+                  "という言い方をする。切り替えるのはユーザなので、必要そうなら"
+                  "「点けてくれたらできるよ」と伝えてよい。勝手に点けることはできない。）"
+            )
         if rag_chunks:
             lines = [
                 f"[{'話題の種' if c.as_topic_seed else '過去の記憶'}/"
@@ -273,6 +286,7 @@ class ContextAssembler:
         last_feedback_iso: str | None = None,  # D1: 内省が対象にした会話スパンの末尾(watermark)
         capabilities: list[str] | None = None,  # D3: 外の世界に手を出せる手段（registry 導出）
         prev_session_gap_sec: float | None = None,  # D1: 前セッション最終発話からの経過秒
+        features_off: list[str] | None = None,  # UI: 今オフにしている機能（「無い」とは言わせない）
         now: Stamp | None = None,
     ) -> list[dict]:
         now = now or Stamp.now()
@@ -293,6 +307,7 @@ class ContextAssembler:
                     callfunction_result=callfunction_result, tools_active=tools_active,
                     active_tasks=active_tasks, last_feedback_iso=last_feedback_iso,
                     session_gap_sec=gap, capabilities=capabilities,
+                    features_off=features_off,
                 ),
             }
         ]

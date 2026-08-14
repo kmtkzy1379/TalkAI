@@ -187,6 +187,14 @@ class AudioPlayQueue:
         else:
             await self._play_fn(audio)
 
+    def is_quiet(self) -> bool:
+        """再生待ちが無いか（待機キューも順不同 buffer も空）。
+
+        `join()` と違って**待たない**。UI の停止処理は「上限つきで様子を見る」ので、
+        待ち切る `join()` は使えない（1件でも詰まると永久に戻らない）。
+        """
+        return self._queue.empty() and not self._buffer
+
     async def join(self) -> None:
         """投入済みの全項目が処理されるまで待つ（テスト用）。"""
         await self._queue.join()

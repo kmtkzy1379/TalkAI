@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 from .clock import now_mono
 from .config import Config
@@ -60,6 +60,9 @@ def _preimport_sdks() -> None:
 
 class VoiceLoop:
     def __init__(self) -> None:
+        # UI の機能 ON/OFF（`eve/control.py`）。**ヘッドレスでは None のまま**＝挙動は不変。
+        # UI が起動時に差し込む。応答文脈の `features_off` はこれを遅延参照する。
+        self.control = None
         self.registry = ModelRegistry()
         self.player = RealAudioPlayer()
         self.audio = AudioPlayQueue(play_fn=self.player.play_fn)
@@ -145,6 +148,17 @@ class VoiceLoop:
         self.search_client = None  # J-2（SEARCH_ENABLED かつ TASK_ENABLED 時のみ生成）
         self.workspace = None  # J-3（WS_ENABLED かつ TASK_ENABLED 時のみ生成）
         tasks_provider = None  # Fix#2: TASK_ENABLED 時のみ配線（None ならブロック自体を注入しない）
+        # UI「タスク ON/OFF」用: **登録し直すための手続き**を覚えておく（`registry.unregister` の
+        # docstring の指針どおり、束＝タスク+検索+作業フォルダ をまとめて出し入れする）。
+        # 手書きの名前リストにしないのは、構成（SEARCH/WS/EXEC/VIEWER）で束が変わるため。
+        self._task_cap_registrars: "list[Callable[[], None]]" = []
+        _caps_before = set(self.capabilities.names())
+
+        def _reg(fn: "Callable[[], None]") -> None:
+            """今すぐ登録し、あとで**同じ登録をやり直せる**ように覚えておく。"""
+            self._task_cap_registrars.append(fn)
+            fn()
+
         if Config.TASK_ENABLED:
             self.task_store = TaskStore(
                 task_file=Config.TASK_FILE, max_tasks=Config.TASK_MAX,
@@ -153,8 +167,9 @@ class VoiceLoop:
             # 取消はタスク側で解決（別コルーチン・executor と並行）: 応答LLM は reference を渡すだけ。
             self.cancel_resolver = CancelResolver(store=self.task_store, queue=self.queue)
             # queue は1件制ゲートが「未配達の完了報告」を数えるのに要る（`capabilities.py`）。
-            register_task_capabilities(self.capabilities, self.task_store,
-                                       cancel_resolver=self.cancel_resolver, queue=self.queue)
+            _reg(lambda: register_task_capabilities(
+                self.capabilities, self.task_store,
+                cancel_resolver=self.cancel_resolver, queue=self.queue))
             # TaskAgent（inc2）: delegate_task の自然文ゴールを賢い task LLM が境界つきループで完遂。
             task_agent = TaskAgent(
                 registry=self.capabilities, model_registry=self.registry, store=self.task_store,
@@ -186,7 +201,7 @@ class VoiceLoop:
                     from .search.deep import DeepResearcher
                     self.search_client = SearchClient(
                         deep_researcher=DeepResearcher(self.registry))  # inc2: 隔離要約はツールなしロール
-                    register_search_capability(self.capabilities, self.search_client)
+                    _reg(lambda: register_search_capability(self.capabilities, self.search_client))
             # J-3 作業フォルダ（既定 off・search と同じ理由で TASK_ENABLED ブロック内に置く）。
             if Config.WS_ENABLED:
                 from .workspace import Workspace, register_workspace_capabilities, resolve_workspace_root
@@ -202,7 +217,7 @@ class VoiceLoop:
                         max_read_chars=Config.WS_READ_MAX_CHARS,
                         max_files=Config.WS_MAX_FILES, rescan_sec=Config.WS_RESCAN_SEC,
                     )
-                    register_workspace_capabilities(self.capabilities, self.workspace)
+                    _reg(lambda: register_workspace_capabilities(self.capabilities, self.workspace))
                     # プログラム実行（別フラグ）。setup_sandbox.py apply 済みが前提だが、
                     # 未セットアップでも起動は続ける（実行時に SandboxUnavailable で
                     # 「サンドボックスが使えない」と正直に返る＝fail-soft）。
@@ -213,7 +228,7 @@ class VoiceLoop:
                         logger.warning("WS_EXEC_ENABLED=1 だが実行を無効化: %s", exec_why)
                     elif Config.WS_EXEC_ENABLED:
                         from .workspace import register_exec_capability
-                        register_exec_capability(
+                        _reg(lambda: register_exec_capability(
                             self.capabilities, self.workspace,
                             allow=Config.WS_EXEC_ALLOW.split(","),
                             timeout_sec=Config.WS_RUN_TIMEOUT_SEC,
@@ -221,17 +236,19 @@ class VoiceLoop:
                             mem_mb=Config.WS_RUN_MEM_MB,
                             max_procs=Config.WS_RUN_MAX_PROCS,
                             max_output_chars=Config.WS_MAX_OUTPUT_CHARS,
-                        )
+                        ))
                     if Config.WS_VIEWER_ENABLED:
                         from .workspace import register_viewer_capability
-                        register_viewer_capability(
+                        _reg(lambda: register_viewer_capability(
                             self.capabilities, self.workspace,
-                            max_windows=Config.WS_VIEWER_MAX_WINDOWS)
+                            max_windows=Config.WS_VIEWER_MAX_WINDOWS))
         elif Config.SEARCH_ENABLED or Config.WS_ENABLED:
             if Config.SEARCH_ENABLED:
                 logger.warning("SEARCH_ENABLED=1 だが TASK_ENABLED=0 のため検索は無効（TaskAgent 専用能力）")
             if Config.WS_ENABLED:
                 logger.warning("WS_ENABLED=1 だが TASK_ENABLED=0 のため作業フォルダは無効（TaskAgent 専用能力）")
+        # 束の実体は「登録の前後で増えた名前」。手書きしないので構成差で腐らない。
+        self._task_cap_names: "list[str]" = sorted(set(self.capabilities.names()) - _caps_before)
 
         async def stream_fn(messages, *, tools=None, tool_sink=None):
             if tools:
@@ -261,6 +278,10 @@ class VoiceLoop:
             redeliver_fn=self._redeliver_stimulus,  # barge-in で潰れたタスク報告の再配達（WHEN はこちらが所有）
             delivery_checker=self.delivery_checker,  # J-2 P1-1: barge-in なし完了ターンの配達確認
             is_suppressed=self.queue.is_suppressed,  # D2: 取消済み報告は発話前に捨てる（put の第2関門）
+            # UI: 今オフの機能を毎ターン system に入れる（「機能が無い」と言わせないため）。
+            # ヘッドレスでは control が None なので空＝ブロック自体が出ない。
+            features_off_provider=lambda: (self.control.features_off()
+                                           if self.control is not None else []),
         )
         self.runner = PipelineRunner(self.queue, self.orchestrator, self.audio)
         # 沈黙監視は応答中(runner busy)/ユーザ発話中は発火しない（is_busy をガードに使う）。
@@ -425,6 +446,81 @@ class VoiceLoop:
         logger.info("ウォームアップ完了 %.1fs", now_mono() - t0)
         self._progress("warmup", f"ウォームアップ完了 {now_mono() - t0:.1f}秒")
 
+    # --- 画面認識の起動/停止（起動時と UI の ON/OFF の両方から使う）------------
+
+    def _build_text_gate(self):
+        """文字ゲートを作る（OCR が使えなければ None）。
+
+        pHash は枠内の文字変化を拾えない（実測 pHash 一致 15/15 ペアで画素完全一致 0/15）。
+        OCR の読み取りは **LLM に一切渡さない**（外に出るのは bool だけ＝誤読がハルシネの元）。
+        `WindowsOcr()` の初期化は winsdk を触るので **loop 上で**行う（キャプチャスレッドに
+        持ち込まない）。ON/OFF のたびに作り直すのは、前回テキストを持ち越すと OFF 中の変化を
+        ON 直後に「今変わった」として拾ってしまうため。
+        """
+        if not Config.VLM_OCR_ENABLED:
+            return None
+        from .vlm.text_gate import ScreenTextGate, WindowsOcr
+
+        ocr = WindowsOcr()
+        if not ocr.available:
+            # fail-soft（ddgs 未導入時と同流儀）: 文字ゲートだけ無効化して続行。
+            logger.warning("VLM_OCR_ENABLED=1 だが OCR を初期化できないため文字ゲートを"
+                           "無効化（pip install winsdk / OCR 言語パックを確認）")
+            return None
+        cap = self.vlm_capture
+        gate = ScreenTextGate(
+            ocr=ocr,
+            grab_png=lambda: cap.grab_png(Config.VLM_OCR_DOWNSCALE),
+            diff_threshold_pct=Config.VLM_OCR_DIFF_PCT,
+            interval_sec=Config.VLM_OCR_INTERVAL_SEC,
+        )
+        logger.info("文字ゲート 稼働（%s・%.0f%%以上の変化・最短%.0f秒間隔）",
+                    ocr.lang, Config.VLM_OCR_DIFF_PCT, Config.VLM_OCR_INTERVAL_SEC)
+        return gate
+
+    def start_vision(self) -> None:
+        """VLM worker + capture スレッドを起動する（loop 上から呼ぶ・二重起動しない）。"""
+        if self.capture_thread is not None:
+            return
+        self.vlm_worker.start()
+        self.capture_thread = CaptureThread(
+            capture=self.vlm_capture, change_detector=self.vlm_change_detector,
+            deliver=self.vlm_worker.on_frame, loop=asyncio.get_running_loop(),
+            target_fps=Config.VLM_TARGET_FPS, text_gate=self._build_text_gate(),
+        )
+        self.capture_thread.start()
+        logger.info("画面認識(VLM) 稼働")
+
+    async def stop_vision(self) -> None:
+        """capture スレッド → worker の順で止め、**画面の記憶を消す**。
+
+        順序は `stop()` と同じ理由: 閉じるループへフレームを送らせない。
+        state を消すのは、OFF 後も `latest_vision` が残ると「今の画面」として古い実況を
+        語り続けるため（VisionState 自体にも鮮度ガードはあるが、OFF は即座に効かせる）。
+        """
+        th, self.capture_thread = self.capture_thread, None
+        if th is not None:
+            try:
+                await asyncio.to_thread(th.stop)  # join をループ外で
+            except Exception:
+                logger.exception("capture スレッドの停止で例外（続行）")
+        try:
+            await self.vlm_worker.stop()
+        except Exception:
+            logger.exception("VLM worker の停止で例外（続行）")
+        self.vision_state.ring.clear()
+        self.vision_state.latest_vision = None
+        self.vision_state.latest_vision_mono = 0.0
+        self.vision_state.latest_is_narration = False
+        self.vision_state.last_frame_mono = 0.0
+        self.vision_state.last_change_mono = 0.0
+        # 変化検出の内部状態（前回 pHash）も捨てる。持ち越すと OFF 中に起きた変化を
+        # ON 直後の1枚目と比較して「今変わった」と誤って拾う。
+        try:
+            self.vlm_change_detector.reset()
+        except Exception:
+            logger.exception("ChangeDetector のリセットで例外（続行）")
+
     async def run(self) -> None:
         self._progress("memory", "記憶を読み込み中…")
         await self.cache.initialize()  # 既存ログ復元 + 書き込み worker 起動
@@ -477,35 +573,7 @@ class VoiceLoop:
                     logger.info("画面表示 稼働（show_on_screen・別ウィンドウ）")
         # F6: 画面認識を起動（既定 off）。capture スレッドは loop 確定後に生成し on_frame を橋渡し。
         if Config.VLM_ENABLED:
-            self.vlm_worker.start()
-            # 文字ゲート（既定 off）: pHash は枠内の文字変化を拾えない（実測 pHash 一致
-            # 15/15 ペアで画素完全一致 0/15）。OCR の読み取りは **LLM に渡さない**。
-            # 生成はキャプチャスレッド開始前だが、winsdk の初期化はここ（loop 上）で1回だけ。
-            text_gate = None
-            if Config.VLM_OCR_ENABLED:
-                from .vlm.text_gate import ScreenTextGate, WindowsOcr
-                ocr = WindowsOcr()
-                if ocr.available:
-                    cap = self.vlm_capture
-                    text_gate = ScreenTextGate(
-                        ocr=ocr,
-                        grab_png=lambda: cap.grab_png(Config.VLM_OCR_DOWNSCALE),
-                        diff_threshold_pct=Config.VLM_OCR_DIFF_PCT,
-                        interval_sec=Config.VLM_OCR_INTERVAL_SEC,
-                    )
-                    logger.info("文字ゲート 稼働（%s・%.0f%%以上の変化・最短%.0f秒間隔）",
-                                ocr.lang, Config.VLM_OCR_DIFF_PCT, Config.VLM_OCR_INTERVAL_SEC)
-                else:
-                    # 起動時 fail-soft（ddgs 未導入時と同流儀）: 文字ゲートだけ無効化して続行。
-                    logger.warning("VLM_OCR_ENABLED=1 だが OCR を初期化できないため文字ゲートを"
-                                   "無効化（pip install winsdk / OCR 言語パックを確認）")
-            self.capture_thread = CaptureThread(
-                capture=self.vlm_capture, change_detector=self.vlm_change_detector,
-                deliver=self.vlm_worker.on_frame, loop=asyncio.get_running_loop(),
-                target_fps=Config.VLM_TARGET_FPS, text_gate=text_gate,
-            )
-            self.capture_thread.start()
-            logger.info("画面認識(VLM) 稼働")
+            self.start_vision()
         self._progress("mic", "マイクを開いています…")
         await self.input.start()  # mic + STT 消費タスクを起動
         logger.info("VoiceLoop 稼働。話しかけてください。")
