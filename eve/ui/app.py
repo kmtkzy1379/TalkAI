@@ -27,7 +27,7 @@ from typing import Optional
 from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
-    QPushButton, QSlider, QStackedWidget, QVBoxLayout, QWidget,
+    QPushButton, QScrollArea, QSlider, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from .. import capture_guard
@@ -37,7 +37,7 @@ from .log_bridge import LogBridge
 from .log_panel import LogPanel
 from .menu_bar import MenuBar
 from .task_window import TaskWindow
-from .theme import LOG_FRAME, TEXT_FRAME, app_qss, frame_qss
+from .theme import BG, LOG_FRAME, TEXT_FRAME, app_qss, frame_qss
 
 logger = logging.getLogger(__name__)
 
@@ -255,7 +255,10 @@ class MainWindow(QWidget):
         super().__init__()
         self.setWindowTitle("イブ — Live2D（リップシンク接続）")
         self.view = Live2DView()
-        self.view.setMinimumSize(640, 427)
+        # **小さく縮められるようにする**。最小を大きく取ると、画面の狭い環境で
+        # ウィンドウが画面高にクランプされ、下の入力欄が画面外へ押し出される
+        # （実起動で発生: 論理 1120x700 の環境で 1280x860 が入らなかった）。
+        self.view.setMinimumSize(320, 214)
         self.status = QLabel("起動中…（VOICEVOX とマイクを確認しています）")
         self.status.setWordWrap(True)
         self.line = QLabel("")
@@ -358,10 +361,12 @@ class MainWindow(QWidget):
         log_box = QWidget()
         # 枠画像は角に装飾がある。**スライス幅を小さく**して装飾の比率を保ち、
         # 中身は装飾の内側に十分な余白を取って置く（大きすぎると文字が枠に重なる）。
-        log_box.setStyleSheet(frame_qss(LOG_FRAME, border=90))
-        log_box.setMinimumWidth(300)
+        # 枠画像は横長素材なので、縦長の枠に引き伸ばすと装飾と内側の白地がずれる。
+        # スライスを小さめにして「細い装飾枠」として使い、中身は素直に内側へ置く。
+        log_box.setStyleSheet(frame_qss(LOG_FRAME, border=60))
+        log_box.setMinimumWidth(240)
         lb = QVBoxLayout(log_box)
-        lb.setContentsMargins(34, 40, 34, 40)
+        lb.setContentsMargins(22, 26, 22, 26)
         lb.addWidget(self.logs)
 
         stage = QHBoxLayout()
@@ -371,11 +376,11 @@ class MainWindow(QWidget):
 
         self.line.setObjectName("speech")
         speech_box = QWidget()
-        speech_box.setStyleSheet(frame_qss(TEXT_FRAME, border=90))
+        speech_box.setStyleSheet(frame_qss(TEXT_FRAME, border=60))
         sb = QVBoxLayout(speech_box)
-        sb.setContentsMargins(46, 30, 46, 26)
+        sb.setContentsMargins(34, 20, 34, 18)
         sb.addWidget(self.line)
-        speech_box.setMinimumHeight(96)
+        speech_box.setFixedHeight(84)   # 固定＝下の入力欄を押し出さない
 
         main = QWidget()
         ml = QVBoxLayout(main)
@@ -388,17 +393,22 @@ class MainWindow(QWidget):
         # --- 設定タブ（1-A では枠だけ。中身と機能は Phase 2）---
         settings = QWidget()
         sl = QVBoxLayout(settings)
+        # **戻るボタンは一番上**に置く。下に置くと、ウィンドウが小さい時に画面外へ押し出されて
+        # メインに戻れなくなる（実起動で実際に起きた）。
+        head_row = QHBoxLayout()
+        back = QPushButton("← メインに戻る")
+        back.clicked.connect(self._show_main)
         head = QLabel("設定")
         head.setStyleSheet("font-size:17px; font-weight:bold;")
+        head_row.addWidget(back)
+        head_row.addWidget(head, 1)
         note = QLabel("（この画面の項目は次の段階で実装します。"
                       "設定は原則、保存して再起動してから反映されます）")
         note.setObjectName("hint")
-        back = QPushButton("メインに戻る")
-        back.clicked.connect(lambda: self.pages.setCurrentIndex(0))
-        sl.addWidget(head)
+        note.setWordWrap(True)
+        sl.addLayout(head_row)
         sl.addWidget(note)
-        # 開発用の調整つまみ。Phase 2 で設定タブの正式な項目へ移す
-        adj = QLabel("調整（開発用・のちに設定へ移動）")
+        adj = QLabel("調整（開発用・のちに設定の正式項目へ移動）")
         adj.setObjectName("hint")
         sl.addWidget(adj)
         sl.addLayout(row)
@@ -406,11 +416,13 @@ class MainWindow(QWidget):
         sl.addWidget(self.hide_cb)
         sl.addWidget(self.hide_state)
         sl.addStretch(1)
-        sl.addWidget(back)
+        settings_scroll = QScrollArea()      # 小さい窓でも全項目に手が届く
+        settings_scroll.setWidgetResizable(True)
+        settings_scroll.setWidget(settings)
 
         self.pages = QStackedWidget()
         self.pages.addWidget(main)
-        self.pages.addWidget(settings)
+        self.pages.addWidget(settings_scroll)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 6, 6)
@@ -418,6 +430,42 @@ class MainWindow(QWidget):
         root.addWidget(self.pages, 1)
         root.addWidget(self.status)
         self.setStyleSheet(app_qss())
+
+        # --- 読み込み中の覆い（ウィンドウは即座に出す）---
+        # Cubism の初期化だけで約5秒 UI スレッドが止まる（実起動で確認）。
+        # 何も出ないと固まったように見えるので、**先に覆いを描いてから**重い初期化に入る。
+        self.loading = QWidget(self)
+        ll = QVBoxLayout(self.loading)
+        ll.addStretch(1)
+        self.loading_title = QLabel("イブを起動しています…")
+        self.loading_title.setAlignment(Qt.AlignCenter)
+        self.loading_title.setStyleSheet("font-size:20px; font-weight:bold;")
+        self.loading_note = QLabel("Live2D と記憶を読み込んでいます")
+        self.loading_note.setAlignment(Qt.AlignCenter)
+        self.loading_note.setObjectName("hint")
+        ll.addWidget(self.loading_title)
+        ll.addWidget(self.loading_note)
+        ll.addStretch(1)
+        self.loading.setStyleSheet(f"background:{BG};")
+        self.loading.setGeometry(self.rect())
+        self.loading.raise_()
+
+    def _show_main(self) -> None:
+        self.pages.setCurrentIndex(0)
+
+    def resizeEvent(self, ev) -> None:
+        super().resizeEvent(ev)
+        # **isVisible() で判定しない**: 子は親が show() されるまで不可視なので、
+        # show() 前の resize が素通りし、覆いが構築時の小さいサイズのまま残る
+        # （実起動で発生: メニューボタンが覆いの下に隠れた）。
+        if getattr(self, "loading", None) is not None:
+            self.loading.setGeometry(self.rect())
+
+    def showEvent(self, ev) -> None:
+        super().showEvent(ev)
+        if getattr(self, "loading", None) is not None:
+            self.loading.setGeometry(self.rect())
+            self.loading.raise_()
 
         self._poll = QTimer(self)
         self._poll.timeout.connect(self._refresh)
@@ -483,18 +531,27 @@ class MainWindow(QWidget):
             return
         self.logs.add(tab, who, text)
 
-    def _menu_requested(self, key: str, want_on: bool) -> None:
-        """1-A では**まだ何も止めない**。押されたことだけを見せる。
+    _MENU_JA = {"pause": "停止/再開", "mute": "ミュート", "autospeech": "自律発話",
+                "vision": "画面認識", "task": "タスク"}
 
-        実際にパイプラインを止める配線は 1-B（ControlPlane）。ここで先に
-        「押した瞬間には切り替わらない」動きを作っておく（要件がこの形を要求している）。
+    def _menu_requested(self, key: str, want_on: bool) -> None:
+        """押された → 切替中 → 切替完了、を**目に見える形で**進める。
+
+        **1-A の時点では実体（パイプライン）はまだ切り替わらない**。表示だけが変わる。
+        黙って見た目だけ変えると「OFF にしたのに動いている」と誤解させるので、
+        ログに「表示のみ・実体は次の段階」と明記する（嘘の状態を作らない）。
         """
+        name = self._MENU_JA.get(key, key)
         self.menu.set_state(key, "pending")
-        self.logs.add("chat", "system",
-                      f"「{key}」の切替を要求（安全なタイミングで反映されます）"
-                      "※この配線は次の段階で入ります")
-        # 1-A: すぐ元の状態へ戻す（嘘の状態を残さない）
-        QTimer.singleShot(900, lambda: self.menu.set_state(key, "on" if not want_on else "off"))
+        self.logs.add("chat", "system", f"{name} を {'ON' if want_on else 'OFF'} に切替中…")
+
+        def done() -> None:
+            self.menu.set_state(key, "on" if want_on else "off", on=want_on)
+            self.logs.add("chat", "system",
+                          f"{name} を {'ON' if want_on else 'OFF'} にしました"
+                          "（※表示のみ。実際に止める配線は次の段階で入ります）")
+
+        QTimer.singleShot(700, done)
 
     def _on_sentence_started(self, text: str, meta) -> None:
         self.view.set_plan(meta)
@@ -521,10 +578,13 @@ class MainWindow(QWidget):
 
     def _on_progress(self, key: str, text: str) -> None:
         self._progress_rows[key] = text
+        self.loading_note.setText(text)
         if key == "ready":
             self._ready = True
             # 起動中は描画を落として CPU をモデルのロードに譲っていた（§起動時間）。戻す。
             self.view.set_full_speed()
+            self.loading.hide()          # 覆いを外してメインへ
+            self.logs.add("chat", "system", "準備完了。話しかけてください")
         rows = [self._progress_rows[k] for k in self._PROGRESS_ORDER
                 if k in self._progress_rows]
         self.status.setText("　/　".join(rows[-4:]))  # 直近4件だけ出す（横に伸びすぎない）
@@ -634,11 +694,17 @@ def main() -> int:
     try:
         app = QApplication.instance() or QApplication([])
         win = MainWindow()
-        win.resize(960, 760)
+        # **画面に収まる大きさで開く**。大きすぎると Windows が画面高にクランプし、
+        # 下の入力欄が切れる（実起動で発生）。作業領域の 92% を上限にする。
+        screen = app.primaryScreen().availableGeometry()
+        win.resize(min(1280, int(screen.width() * 0.92)),
+                   min(860, int(screen.height() * 0.92)))
         win.show()
+        # **先に覆いを描いてから**重い初期化に入る（Cubism の init だけで約5秒 UI が止まる）。
+        app.processEvents()
         # show() の直後は HWND が確定していないことがあるので1拍おいて適用する
         QTimer.singleShot(50, win.apply_capture_guard)
-        win.start_loop()
+        QTimer.singleShot(80, win.start_loop)
         if os.environ.get("UI_AUTOCLOSE_SEC"):  # スモークテスト用
             QTimer.singleShot(int(float(os.environ["UI_AUTOCLOSE_SEC"]) * 1000), win.close)
         return app.exec()

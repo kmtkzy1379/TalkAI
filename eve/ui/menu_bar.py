@@ -50,6 +50,9 @@ class MenuBar(QWidget):
         self.settings.setStyleSheet(menu_button_qss("on"))
         row.addWidget(self.settings)
 
+    def is_on(self, key: str) -> bool:
+        return bool(self._on.get(key, True))
+
     def _clicked(self, key: str) -> None:
         if self._state.get(key) in ("pending", "disabled"):
             return  # 切替中の連打は無視（意図は loop 側で latest-wins）

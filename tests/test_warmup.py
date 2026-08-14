@@ -57,8 +57,16 @@ class _Fake:
     _progress = VoiceLoop._progress
 
 
+def _stub_preimport():
+    """重い SDK の事前 import をテストでは差し替える（計測にネットワーク/ディスクを混ぜない）。"""
+    import eve.voice_loop as vl
+
+    vl._preimport_sdks = lambda: None
+
+
 def t_parallel() -> None:
     print("\n[1] 4つのウォームアップが並列に走る")
+    _stub_preimport()
     f = _Fake({"stt": 0.05, "rag": 0.30, "llm": 0.10, "tts": 0.08})
     t0 = time.monotonic()
     asyncio.run(f.warmup())
@@ -119,6 +127,25 @@ def t_wiring() -> None:
     check("4種すべてを含む",
           all(s in src for s in ("self.stt.warmup", "self.rag.warmup",
                                  "self.registry.complete", "self.tts.generate")))
+    # 並列化が持ち込んだ import 競合の再発防止（実起動で踏んだ）:
+    # litellm と openai SDK が別スレッドから同時に pydantic を触ると
+    # partially-initialized module になり、応答モデルと STT のウォームアップが両方失敗した。
+    # docstring/コメントを除いた**実行される行だけ**で順序を見る（説明文の語を拾わない）。
+    # `_preimport_sdks` はテストがスタブに差し替えているので、**ファイルの原文**を読む。
+    code = "\n".join(ln for ln in src.splitlines()
+                     if ln.strip() and not ln.strip().startswith("#") and "。" not in ln)
+    check("重い SDK を gather の**前**に直列で import している",
+          "_preimport_sdks" in code and code.index("_preimport_sdks") < code.index("gather"),
+          "→ 並列 import で pydantic が壊れる")
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "eve", "voice_loop.py")
+    with open(path, encoding="utf-8") as f:
+        body = f.read()
+    pre = body[body.index("def _preimport_sdks"):][:900]
+    for mod in ("pydantic", "openai", "litellm"):
+        check(f"事前 import に {mod} が含まれる", f'"{mod}"' in pre)
+    check("事前 import の失敗は握る（provider 未導入でも起動する）", "except Exception" in pre)
+
     run_src = inspect.getsource(VoiceLoop.run)
     for key in ("memory", "features", "mic", "ready"):
         check(f"run() が {key} の進捗を出す", f'"{key}"' in run_src)

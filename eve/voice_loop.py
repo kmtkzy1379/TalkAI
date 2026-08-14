@@ -44,6 +44,20 @@ from .vlm.capture_thread import CaptureThread
 logger = logging.getLogger(__name__)
 
 
+def _preimport_sdks() -> None:
+    """LLM 系 SDK を**1スレッドで順に** import しておく（並列ウォームアップの前提）。
+
+    どれが失敗しても続行する（オフライン構成や未導入の provider があり得る）。
+    ここで温めた import は各 SDK 側でキャッシュされるので、後段の並列呼び出しは
+    ネットワーク待ちだけになる。
+    """
+    for mod in ("pydantic", "openai", "litellm"):
+        try:
+            __import__(mod)
+        except Exception:
+            logger.debug("事前 import に失敗（続行）: %s", mod, exc_info=True)
+
+
 class VoiceLoop:
     def __init__(self) -> None:
         self.registry = ModelRegistry()
@@ -376,6 +390,14 @@ class VoiceLoop:
         """
         logger.info("ウォームアップ開始（並列）")
         t0 = now_mono()
+        # **重い import だけは先に直列で済ませる**（実起動で踏んだ）。
+        # litellm と openai SDK はどちらも pydantic を遅延 import するため、別スレッドから
+        # 同時に触ると partially-initialized module の競合になる:
+        #   「cannot import name 'import_string' from partially initialized module
+        #     pydantic._internal._validators (most likely due to a circular import)」
+        #   「module 'pydantic' has no attribute 'BaseModel'」
+        # 直列だった頃は起きなかった＝並列化が持ち込んだ問題なので、並列化の内側で塞ぐ。
+        await asyncio.to_thread(_preimport_sdks)
 
         async def step(key: str, label: str, coro_factory) -> None:
             s = now_mono()
