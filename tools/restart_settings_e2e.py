@@ -1,17 +1,23 @@
-r"""設定タブで**保存 → 再起動 → 新しい値で動く**の通し（実起動）。
+r"""設定タブで**保存 → 再起動 → 新しい値で動く**の通し。
 
     $env:PYTHONIOENCODING="utf-8"
     & .\.venv\Scripts\python.exe tools\restart_settings_e2e.py
 
-**実 API 課金あり（ウォームアップ2回ぶん・実測でおよそ 0.09 USD）。**
-Phase 2/3 の全体がここに懸かっている: 画面で変えた値が `.env` に落ち、再起動した
-プロセスがそれを読み、消費者まで届くこと。途中のどれが欠けても「設定したのに効かない」。
+**API 課金なし。**確かめたいのは「画面で変えた値が `.env` に落ち、再起動したプロセスが
+それを読み、消費者まで届く」という連鎖であって、会話パイプラインの稼働ではない。
+そこで**loop を起動しない**（`start_loop` を呼ばない）。UI・設定タブ・保存・
+`closeEvent` からの drain・`spawn()` はすべて本物を通る。
+
+この設計に至った経緯（同じ失敗を繰り返さないために残す）: 最初は loop ごと起動して
+いたが、比較用の「変更前の値」に `SILENCE_THRESHOLD_SEC=1` を入れてしまい、
+**11分間ずっと2秒ごとに発話判定LLM が走った**（概算 0.6-1.0 USD の無駄）。
+比較のために設定を極端な値にする時は、**課金に効く設定かどうかを先に見る**こと。
 
 **本物の `.env` には触らない**（`EVE_ENV_FILE` で一時ファイルを見せる）。
 子プロセスも同じ `EVE_ENV_FILE` を引き継ぐ（`.env` のキーではないので落とされない）。
 
 流れ:
-  1回目: 一時 `.env` で起動 → 設定タブで値を変えて保存 → ［⟳ 再起動］を押す
+  1回目: 一時 `.env` で UI を出す → 設定タブで値を変えて保存 → ［⟳ 再起動］を押す
   2回目: 自動で立ち上がったプロセスが、新しい値を読めているかを書き出して終わる
 """
 from __future__ import annotations
@@ -75,27 +81,39 @@ def phase1() -> int:
     win.resize(1100, 700)
     win.show()
     app.processEvents()
-    QTimer.singleShot(80, win.start_loop)
+    # **`start_loop` は呼ばない**（API を1回も叩かない）。設定の保存も再起動も
+    # loop の稼働を必要としない。`closeEvent` はスレッド未起動でも同じ道を通る。
+    try:
+        win.loading.hide()
+    except Exception:
+        pass
 
     state = {"saved": False, "t0": time.monotonic()}
 
     def step() -> None:
         el = time.monotonic() - state["t0"]
-        if state["saved"]:
+        # **時間切れの判定は最初に置く**（下の早期 return より後ろだと、途中で例外が出た時に
+        # 永久に抜けられなくなる。実際 1 回踏んだ）。
+        if el > 60:
+            print("1回目: 時間切れ", flush=True)
+            timer.stop()
+            app.quit()
             return
-        if int(el) % 10 < 1:  # どこで待っているかを出す（黙って時間切れにしない）
-            print(f"1回目: {el:5.0f}秒 ready={getattr(win, '_ready', False)} "
-                  f"進捗={win.status.text()[:70]}", flush=True)
-        # **準備完了を待ち切らない**: 設定の保存も再起動も loop の完成を必要としない。
-        # 待つのは「ウォームアップ中でも drain して再起動できる」を確かめたいからで、
-        # 上限を置かないと環境要因（マイク占有など）でここに張り付く。
-        if not getattr(win, "_ready", False) and el < 90:
+        if state["saved"]:
             return
         state["saved"] = True
         page = win.settings_page
         win.pages.setCurrentIndex(1)
         page.reload()
         for key, (val, _expr) in CHANGES.items():
+            if key == "SILENCE_THRESHOLD_SEC":
+                # この設定だけウィジェットが無い（「頻度」の抽象化コンボが2キーに割る）。
+                # ここを素通りさせると、抽象化そのものが未検証で残る。
+                from eve.ui.settings_page import FREQUENCY
+
+                idx = next(i for i, (_l, sec, _n) in enumerate(FREQUENCY) if sec == val)
+                page.freq.setCurrentIndex(idx)
+                continue
             w = page._widgets[key]
             if hasattr(w, "setValue"):
                 w.setValue(float(val))
@@ -143,9 +161,16 @@ def main() -> int:
     from eve.ui.restart import child_env
 
     # 1回目の起動: 変える前の値を入れておく（差が出るように既定と違う値から始める）
+    # 変更前の値。**課金に効く設定を極端にしない**（`SILENCE_THRESHOLD_SEC=1` にして
+    # 発話判定を2秒ごとに走らせた失敗がある）。差が見えれば十分なので、既定の近くに置く。
+    BEFORE = {"VV_SPEED": "1.00", "VV_INTONATION": "1.00",
+              "VLM_PHASH_THRESHOLD": "12", "RAG_TOP_K": "3",
+              "SILENCE_THRESHOLD_SEC": "5.00"}
     base = store.read_env(env_file)
     for key, (val, _expr) in CHANGES.items():
-        base[key] = "1.0" if "." in val else "1"
+        base[key] = BEFORE[key]
+        if base[key] == val:
+            raise SystemExit(f"変更前と後が同じでは差が見えません: {key}")
     env_file.write_text("\n".join(f"{k}={v}" for k, v in base.items()) + "\n",
                         encoding="utf-8")
     before = store.read_env(env_file)

@@ -151,6 +151,48 @@ def t_example() -> None:
     check("BOM なし", not p.read_bytes().startswith(b"\xef\xbb\xbf"))
     check("2回目は何もしない", ss.sync_example({"A": "9", "C": "3"}, p) == [])
 
+    # **コメントで説明済みのキーを二重に足さない**（本物の .env.example を汚した欠陥）
+    p2 = d / "commented.example"
+    p2.write_text("# 以下はコード既定で運用中（.env に書かなくても動く）\n"
+                  "# TASK_MODEL=openai/gpt-5.5\n"
+                  "#   VLM_OCR_ENABLED=1\n"
+                  "REAL=1\n", encoding="utf-8")
+    added2 = ss.sync_example({"TASK_MODEL": "openai/gpt-4o", "VLM_OCR_ENABLED": "0",
+                              "NEW_ONE": "x"}, p2)
+    check("**コメント行のキーは「記載済み」とみなす**", added2 == ["NEW_ONE"], f"{added2}")
+    t2 = p2.read_text(encoding="utf-8")
+    check("  実行時の値で上書きしない", "TASK_MODEL=openai/gpt-4o" not in t2, t2)
+    check("  本当に新しいものは足す", "NEW_ONE=x" in t2)
+    doc = ss.documented_keys(p2)
+    check("  目録はコメント行も拾う",
+          {"TASK_MODEL", "VLM_OCR_ENABLED", "REAL"} <= doc, f"{sorted(doc)}")
+    check("  説明文の日本語をキーと誤認しない",
+          not any("以下" in k for k in doc), f"{sorted(doc)}")
+
+
+def t_example_sandboxed() -> None:
+    print("\n[9] EVE_ENV_FILE 中は目録もサンドボックスを見る")
+    import importlib
+
+    d = Path(tempfile.mkdtemp(prefix="eve_sbx_"))
+    (d / ".env").write_text("A=1\n", encoding="utf-8")
+    old = os.environ.get("EVE_ENV_FILE")
+    os.environ["EVE_ENV_FILE"] = str(d / ".env")
+    try:
+        mod = importlib.reload(ss)
+        check("**`.env` を差し替えたら `.env.example` も同じ場所**",
+              mod.ENV_EXAMPLE_PATH.parent == d, f"{mod.ENV_EXAMPLE_PATH}")
+        check("  リポジトリの本物を指していない",
+              mod.ENV_EXAMPLE_PATH != mod.REPO_ROOT / ".env.example")
+    finally:
+        if old is None:
+            os.environ.pop("EVE_ENV_FILE", None)
+        else:
+            os.environ["EVE_ENV_FILE"] = old
+        importlib.reload(ss)
+    check("環境変数が無ければリポジトリの本物を見る",
+          ss.ENV_EXAMPLE_PATH == ss.REPO_ROOT / ".env.example", f"{ss.ENV_EXAMPLE_PATH}")
+
 
 def t_key_status() -> None:
     print("\n[9] API キーは値を出さない")
@@ -204,6 +246,7 @@ if __name__ == "__main__":
     t_reject()
     t_atomic()
     t_example()
+    t_example_sandboxed()
     t_key_status()
     t_no_secret_logging()
     print(f"\n合計: PASS {PASS} / FAIL {FAIL}")

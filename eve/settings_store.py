@@ -29,7 +29,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # `eve/config.py` と**同じファイル**を見る（`EVE_ENV_FILE` で差し替え可）。
 # ここがズレると「設定タブで保存したのに読み込まれない」が起きる。
 ENV_PATH = Path(os.getenv("EVE_ENV_FILE") or (REPO_ROOT / ".env"))
-ENV_EXAMPLE_PATH = REPO_ROOT / ".env.example"
+# `EVE_ENV_FILE` で `.env` を差し替えている間は、**目録も同じ場所を見る**。
+# ここをリポジトリ固定にしていたため、検証ランが本物の `.env.example` にテスト値を
+# 書き込んだ（`VLM_PHASH_THRESHOLD=7` 等）。サンドボックスは丸ごとサンドボックスにする。
+ENV_EXAMPLE_PATH = (ENV_PATH.parent / ".env.example" if os.getenv("EVE_ENV_FILE")
+                    else REPO_ROOT / ".env.example")
 
 
 class InvalidValue(ValueError):
@@ -157,14 +161,39 @@ def _atomic_write(p: Path, text: str) -> None:
         raise
 
 
+def documented_keys(path: Path) -> set:
+    """`.env.example` に**書かれている**キー（コメントアウト行も含む）。
+
+    `.env.example` は「設定の目録」であって設定ファイルではない。既定のままでよい項目は
+    `# TASK_MODEL=...` のように**コメントで説明されている**のが正しい形。
+    有効行だけを見ると、それらを「未記載」と誤判定して同じキーを二重に足してしまう
+    （実際に `.env.example` を汚した）。
+    """
+    out: set = set()
+    for raw in _read_raw(path).splitlines():
+        line = raw.strip()
+        if line.startswith("#"):
+            line = line.lstrip("#").strip()
+        if "=" not in line:
+            continue
+        key = line.partition("=")[0].strip()
+        if key and key.replace("_", "").isalnum() and key.isupper():
+            out.add(key)
+    return out
+
+
 def sync_example(keys: dict[str, str], path: Path | None = None) -> list[str]:
-    """`.env.example` に**欠けているキーだけ**を既定値付きで足す（値の上書きはしない）。
+    """`.env.example` に**まだ一度も出てこないキーだけ**を足す（値の上書きはしない）。
 
     CLAUDE.md の「`.env.example` に必ず全フラグを明記する」を機械的に守るための口。
     **秘密は載せない**（呼び出し側が API キーを渡さない契約）。
+
+    足すのは「目録に載っていない」ものだけ。コメントで説明済みのキーは載っているとみなす
+    （そうしないと、既定で運用中の項目が**実行時の値つきで**追記され、`.env.example` が
+    「サンプル」ではなく「誰かの実環境のコピー」になる）。
     """
     p = path or ENV_EXAMPLE_PATH
-    have = set(read_env(p))
+    have = documented_keys(p)
     missing = {k: v for k, v in keys.items() if k not in have}
     if not missing:
         return []
