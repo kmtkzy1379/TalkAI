@@ -36,6 +36,7 @@ from .live2d_view import Live2DView, assets_ready
 from .log_bridge import LogBridge
 from .log_panel import LogPanel
 from .menu_bar import MenuBar
+from .settings_page import SettingsPage
 from .task_window import TaskWindow
 from .theme import BG, LINE, app_qss
 
@@ -443,26 +444,18 @@ class MainWindow(QWidget):
         ml.addLayout(stage, 1)
         ml.addWidget(bottom_box)
 
-        # --- 設定タブ（1-A では枠だけ。中身と機能は Phase 2）---
+        # --- 設定タブ（Phase 2）---
+        # **戻るボタンは一番上**に置く（`SettingsPage._head`）。下に置くと、ウィンドウが
+        # 小さい時に画面外へ押し出されてメインに戻れなくなる（実起動で実際に起きた）。
+        self.settings_page = SettingsPage()
+        self.settings_page.back_clicked.connect(self._show_main)
+        self.settings_page.restart_requested.connect(self._restart)
         settings = QWidget()
         sl = QVBoxLayout(settings)
-        # **戻るボタンは一番上**に置く。下に置くと、ウィンドウが小さい時に画面外へ押し出されて
-        # メインに戻れなくなる（実起動で実際に起きた）。
-        head_row = QHBoxLayout()
-        back = QPushButton("← メインに戻る")
-        back.clicked.connect(self._show_main)
-        head = QLabel("設定")
-        head.setStyleSheet("font-size:17px; font-weight:bold;")
-        head_row.addWidget(back)
-        head_row.addWidget(head, 1)
-        note = QLabel("（この画面の項目は次の段階で実装します。"
-                      "設定は原則、保存して再起動してから反映されます）")
-        note.setObjectName("hint")
-        note.setWordWrap(True)
-        sl.addLayout(head_row)
-        sl.addWidget(note)
-        adj = QLabel("調整（開発用・のちに設定の正式項目へ移動）")
+        sl.addWidget(self.settings_page)
+        adj = QLabel("開発用の即時調整（設定ではありません。保存されず、この起動のあいだだけ効きます）")
         adj.setObjectName("hint")
+        adj.setWordWrap(True)
         sl.addWidget(adj)
         sl.addLayout(row)
         sl.addLayout(task_row)
@@ -527,6 +520,9 @@ class MainWindow(QWidget):
         self._spoken = 0
         self._closing = False
         self._close_deadline = 0.0
+        self._restart_after_close = False  # ［⟳ 再起動］が立てる（drain 完了後に新プロセス）
+        if Config.UI_ALWAYS_ON_TOP:  # 設定タブの「常に最前面」（次の起動から効く＝ここで1回だけ）
+            self.setWindowFlag(Qt.WindowStaysOnTopHint, True)
         self._emotion_text = ""
         self._speaking = False
         self._progress_rows: dict = {}
@@ -698,6 +694,19 @@ class MainWindow(QWidget):
             f" ／ 感情={self.view.emotion_label}"
             f"（{self._emotion_text or '—'}） ／ surprise={self.view.surprise}")
 
+    def _restart(self) -> None:
+        """［⟳ 再起動］: **普通の終了と同じ手順で止めてから**、新しいプロセスを起こす。
+
+        いきなり殺すと `cleanup.sweep(phase="shutdown")` が走らず、タスクとビューア窓が
+        残ったまま次のプロセスが立ち上がる。終了処理は `closeEvent` が既に持っているので、
+        フラグを立てて**そこに合流する**（新プロセスの起動は drain 完了後・`_check_closed`）。
+        """
+        if self._closing:
+            return
+        self._restart_after_close = True
+        self.settings_page.status.setText("再起動します（パイプラインを安全に停止しています）…")
+        self.close()
+
     def closeEvent(self, ev) -> None:
         """×を押した時: **UI を固めずに** drain を待ってから閉じる。
 
@@ -728,6 +737,12 @@ class MainWindow(QWidget):
         self.log_bridge.uninstall()  # 破棄後の Qt オブジェクトへ emit しない
         self.taskwin.force_close()  # ×は隠すだけなので明示的に閉じる
         self.view.release()
+        if self._restart_after_close:
+            # **drain が終わってから**起こす（マイクと VOICEVOX を離した後・タスクは掃除済み）。
+            # 数秒だけ2プロセスが重なるが、新しい方はここからウォームアップに入る。
+            from .restart import spawn
+
+            spawn()
         self.close()
 
 

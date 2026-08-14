@@ -49,6 +49,9 @@ class Config:
     VV_SPEAKER = int(os.getenv("VV_SPEAKER", "1"))
     VV_SPEED = float(os.getenv("VV_SPEED", "1.0"))
     VV_PITCH = float(os.getenv("VV_PITCH", "0.0"))
+    # 抑揚（VOICEVOX の intonationScale・0=平坦 / 1=標準 / 大きいほど起伏が強い）。
+    # 1.0 が VOICEVOX の既定なので、明示しない限り**今までと同じ音**になる。
+    VV_INTONATION = float(os.getenv("VV_INTONATION", "1.0"))
 
     # 音声入力 / VAD（値は v1 実績設定を踏襲）
     SAMPLE_RATE = int(os.getenv("SAMPLE_RATE", "16000"))
@@ -105,6 +108,9 @@ class Config:
     # ユーザ 5秒無言で発話判定LLM を回す（企画書準拠）。trigger 兼フラット再評価カデンス。
     # ＝バックオフで間隔を伸ばさず 5秒ごとに連続評価し続ける（実世界を細かく観測する意図）。
     SILENCE_THRESHOLD_SEC = float(os.getenv("SILENCE_THRESHOLD_SEC", "5.0"))
+    # 自律発話を**起動時に**有効にするか（既定 on＝これまでの挙動）。UI メニューの ON/OFF は
+    # 「今このセッションだけ」で、こちらは「次の起動時の初期値」。両者は別物（UI_DESIGN 裁定 A）。
+    AUTOSPEECH_ENABLED = os.getenv("AUTOSPEECH_ENABLED", "1") == "1"
     # surprise は数値で発話を絶対決定しない（指標）。発話判定LLM が surprise+感情+内容を総合判断する
     # （ユーザ裁定）。よって SURPRISE_SPEAK_FORCE/FLOOR の数値ゲートは廃止。
     # 自律発話の「関連記憶」枠から、これより新しいチャンクを除外する[秒]（記憶の自己参照を断つ）。
@@ -183,6 +189,8 @@ class Config:
     # 有効な間は OBS 等の画面キャプチャからも消えるので、配信時は OFF にする
     # （裁定 2026-08-13: 配信中は画面認識を使わない想定なので実運用で衝突しない）。
     UI_HIDE_FROM_CAPTURE = os.getenv("UI_HIDE_FROM_CAPTURE", "1") not in ("0", "false", "no")
+    # ウィンドウを常に最前面に出す（既定 off）。作業しながら顔を見たい時に使う。
+    UI_ALWAYS_ON_TOP = os.getenv("UI_ALWAYS_ON_TOP", "0") == "1"
 
     # Call-Function（J-0 即時 Call-Function・increment 1 は read-only 能力のみ）。
     CALLFUNCTION_ENABLED = os.getenv("CALLFUNCTION_ENABLED", "0") == "1"  # 既定 off（実機で明示 on）

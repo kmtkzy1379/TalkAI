@@ -540,9 +540,13 @@ class VoiceLoop:
         self._tasks.append(asyncio.create_task(self.audio.play_worker()))
         self._tasks.append(asyncio.create_task(self.runner.run()))
         # F5: 発話判定 worker + 沈黙監視を起動（沈黙時計の baseline をここでリセット）。
+        # `AUTOSPEECH_ENABLED=0` なら起動しない（UI メニューから後で ON にできる）。
         self.speech_state.mark_eve_activity()
-        self.speech_decider.start()
-        self.silence_monitor.start()
+        if Config.AUTOSPEECH_ENABLED:
+            self.speech_decider.start()
+            self.silence_monitor.start()
+        else:
+            logger.info("自律発話は起動時 OFF（AUTOSPEECH_ENABLED=0）")
         # J: Call-Function 実行サイドカー（既定 off）。read-only 能力のみ。
         if Config.CALLFUNCTION_ENABLED:
             self.dispatcher.start()

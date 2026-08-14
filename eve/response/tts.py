@@ -20,11 +20,14 @@ class VoicevoxTTS:
         speaker: Optional[int] = None,
         speed: Optional[float] = None,
         pitch: Optional[float] = None,
+        intonation: Optional[float] = None,
     ) -> None:
         self.base_url = base_url or Config.VOICEVOX_URL
         self.speaker = Config.VV_SPEAKER if speaker is None else speaker
         self.speed = Config.VV_SPEED if speed is None else speed
         self.pitch = Config.VV_PITCH if pitch is None else pitch
+        # 抑揚（intonationScale）。VOICEVOX の既定が 1.0 なので、既定値のままなら音は変わらない。
+        self.intonation = Config.VV_INTONATION if intonation is None else intonation
         self._session = None
 
     async def _get_session(self):
@@ -70,6 +73,7 @@ class VoicevoxTTS:
                 query = await resp.json()
             query["speedScale"] = self.speed
             query["pitchScale"] = self.pitch
+            query["intonationScale"] = self.intonation
             async with session.post(
                 f"{self.base_url}/synthesis", json=query, params={"speaker": self.speaker}
             ) as resp:

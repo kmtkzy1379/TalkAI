@@ -62,6 +62,9 @@ class ControlPlane:
         self._quiesce = float(quiesce_sec if quiesce_sec is not None else DEFAULT_QUIESCE_SEC)
         self._on: dict[str, bool] = {k: True for k in KEYS}
         self._on["mute"] = False  # ミュートだけは「オンにする＝黙らせる」なので初期は解除
+        # 起動時の初期値は `.env`（設定タブの「起動時の初期値」）に従う。ここを見ないと
+        # 「設定で切ったのにメニューは ON と表示される」という嘘になる。
+        self._on["autospeech"] = bool(Config.AUTOSPEECH_ENABLED)
         self._want: dict[str, bool] = {}
         self._wake = asyncio.Event()
         # 「積まれた要求が全部片付いた」印（他サイドカーの `_idle` と同じ流儀）。
