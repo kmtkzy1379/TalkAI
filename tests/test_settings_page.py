@@ -260,6 +260,204 @@ def t_split_policy() -> None:
         check(f"実測校正済みの {tuned} は出さない", tuned not in keys)
 
 
+def t_spec_is_real() -> None:
+    print("\n[8] 高級設定: **存在しない設定を出していない**")
+    from eve.config import Config
+    from eve.model_registry import ROLE_ENV
+    from eve.ui.settings_spec import ADVANCED, BASIC, all_items
+
+    role_keys = {env_key for _r, (env_key, _d) in ROLE_ENV.items()}
+    ghosts = [it.key for it in all_items()
+              if not hasattr(Config, it.key) and it.key not in role_keys]
+    check("**全項目が実在する設定**（Config か ROLE_ENV にある）", ghosts == [], f"{ghosts}")
+
+    basic = [it.key for g in BASIC for it in g.items]
+    adv = [it.key for g in ADVANCED for it in g.items]
+    check("設定と高級設定で項目が重複しない",
+          not (set(basic) & set(adv)), f"{sorted(set(basic) & set(adv))}")
+    check("キーが全体で重複しない", len(basic + adv) == len(set(basic + adv)))
+
+    # 消費者ゼロの設定を高級設定にも出していないこと（出すと効かない設定になる）
+    for gone in ("VLM_MERGE_MODEL", "YOUTUBE_MODEL", "YOUTUBE_API_KEY",
+                 "TARGET_CHANNEL_ID", "VTS_PATH", "HISTORY_FILE", "RAG_FILE", "TASK_FILE"):
+        check(f"{gone} はどちらにも出さない", gone not in basic + adv)
+    # 実測で校正した値も出さない
+    for tuned in ("RAG_W_REL", "RAG_W_IMP", "RAG_W_REC", "RAG_MMR_LAMBDA",
+                  "RAG_RECENCY_TAU", "RAG_DUP_HARDCUT", "RAG_REL_BASELINE",
+                  "RAG_RELEVANCE_FLOOR", "SPEECH_DUP_EMB_THRESHOLD",
+                  "VLM_DEDUP_RATIO", "VLM_BLANK_STD_THRESHOLD", "SILENCE_TICK_SEC"):
+        check(f"実測校正済みの {tuned} は出さない", tuned not in basic + adv)
+
+    # 数値項目の範囲に現在の既定値が入っていること（入っていないと開いた瞬間に値が動く）
+    bad = []
+    for it in all_items():
+        if it.kind in ("int", "float") and hasattr(Config, it.key):
+            v = float(getattr(Config, it.key))
+            if not (it.lo <= v <= it.hi):
+                bad.append(f"{it.key}={v} ∉ [{it.lo}, {it.hi}]")
+    check("**既定値が範囲内**（外れていると開いただけで値が変わる）", bad == [], f"{bad}")
+
+
+def t_defaults_from_config() -> None:
+    print("\n[9] 既定値は Config から実行時に引く（書き写して腐らせない）")
+    from eve.config import Config
+
+    _sandbox("A=1\n")   # `.env` に何も無い状態
+    page = _page()
+    check("`.env` に無ければ Config の値を出す",
+          page._widgets["VLM_TARGET_FPS"].value() == float(Config.VLM_TARGET_FPS),
+          f"{page._widgets['VLM_TARGET_FPS'].value()} vs {Config.VLM_TARGET_FPS}")
+    check("真偽も Config から",
+          page._widgets["VLM_ENABLED"].isChecked() == bool(Config.VLM_ENABLED))
+    check("文字列も Config から",
+          page._widgets["VOICEVOX_URL"].text() == Config.VOICEVOX_URL,
+          page._widgets["VOICEVOX_URL"].text())
+    check("モデルは ROLE_ENV の既定から",
+          page._widgets["FEEDBACK_MODEL"].currentText() != "",
+          page._widgets["FEEDBACK_MODEL"].currentText())
+
+    import inspect
+
+    from eve.ui import settings_page as sp
+
+    src = inspect.getsource(sp.SettingsPage._default_of)
+    check("Config を実行時に引いている（数値を書き写していない）",
+          "getattr(Config, key)" in src and "ROLE_ENV" in src)
+
+
+def t_broken_env_survives() -> None:
+    print("\n[10] `.env` が壊れていても設定タブは開ける")
+    _sandbox("VLM_TARGET_FPS=abc\nRAG_TOP_K=\nVV_SPEED=x1\n")
+    try:
+        page = _page()
+        check("壊れた値があっても開く（直す手段を奪わない）", True)
+        from eve.config import Config
+
+        check("壊れた項目は既定で表示",
+              page._widgets["VLM_TARGET_FPS"].value() == float(Config.VLM_TARGET_FPS),
+              f"{page._widgets['VLM_TARGET_FPS'].value()}")
+        out = page.collect()
+        check("保存すると正しい表記に直る", out["VLM_TARGET_FPS"] not in ("abc", ""),
+              out["VLM_TARGET_FPS"])
+    except Exception as e:
+        check(f"壊れた値があっても開く（例外 {type(e).__name__}）", False, str(e))
+
+
+def t_dependencies() -> None:
+    print("\n[11] 前提が OFF の組み合わせを保存前に言う")
+    from eve.ui.settings_spec import check_consistency
+
+    warn = check_consistency({"TASK_ENABLED": "1", "CALLFUNCTION_ENABLED": "0"})
+    check("前提が OFF なら警告する", len(warn) == 1, f"{warn}")
+    check("何が前提かを言う", "機能呼び出し" in warn[0], warn[0])
+    check("どうなるかを言う", "無効化" in warn[0], warn[0])
+    check("整合していれば黙る",
+          check_consistency({"TASK_ENABLED": "1", "CALLFUNCTION_ENABLED": "1"}) == [])
+    check("子が OFF なら親が OFF でも言わない",
+          check_consistency({"TASK_ENABLED": "0", "CALLFUNCTION_ENABLED": "0"}) == [])
+    multi = check_consistency({"SEARCH_ENABLED": "1", "TASK_ENABLED": "0",
+                               "WS_ENABLED": "1", "CALLFUNCTION_ENABLED": "1"})
+    check("複数まとめて言う", len(multi) == 2, f"{multi}")
+
+    # 実際に保存した時に画面へ出る
+    _sandbox("A=1\n")
+    page = _page()
+    page._widgets["CALLFUNCTION_ENABLED"].setChecked(False)
+    page._widgets["TASK_ENABLED"].setChecked(True)
+    page.save()
+    check("保存時に画面へ出る", "⚠" in page.status.text(), page.status.text())
+    check("**それでも保存はする**（直す前に閉じても値は残る）",
+          "保存しました" in page.status.text() or "変更はありません" in page.status.text(),
+          page.status.text())
+    opened = [a.head.text() for a in page.accordions if a.is_opened()]
+    check("直す場所（機能の起動時 ON/OFF）を開く", "機能の起動時 ON/OFF" in opened, f"{opened}")
+
+
+def t_accordion() -> None:
+    print("\n[12] 高級設定は折りたたむ")
+    from eve.ui.settings_spec import ADVANCED
+
+    _sandbox("A=1\n")
+    page = _page()
+    check("グループ数が定義表と一致", len(page.accordions) == len(ADVANCED),
+          f"{len(page.accordions)} vs {len(ADVANCED)}")
+    check("**既定は全部閉じている**（基本設定が埋もれないように）",
+          all(not a.is_opened() for a in page.accordions))
+    check("中身は隠れている", all(not a.body.isVisible() for a in page.accordions))
+    a = page.accordions[0]
+    a.set_opened(True)
+    check("開くと中身が出る", a.body.isVisibleTo(page))
+    a.set_opened(False)
+    check("閉じると隠れる", not a.body.isVisibleTo(page))
+    check("閉じていても値は集められる（保存で消えない）",
+          "VLM_TARGET_FPS" in page.collect())
+
+
+def t_advanced_roundtrip() -> None:
+    print("\n[13] 高級設定の保存と読み戻し")
+    p = _sandbox("# メモ\nVLM_TARGET_FPS=2.0\n")
+    page = _page()
+    page._widgets["VLM_TARGET_FPS"].setValue(0.60)
+    page._widgets["WS_EXEC_ALLOW"].setText("python,git")
+    page._widgets["EMBED_BACKEND"].setCurrentText("openai")
+    page._widgets["STT_BACKEND"].setCurrentText("groq")
+    page.save()
+    text = p.read_text(encoding="utf-8")
+    check("小数が保存される", "VLM_TARGET_FPS=0.60" in text, text)
+    check("文字列が保存される", "WS_EXEC_ALLOW=python,git" in text)
+    check("選択肢が保存される", "EMBED_BACKEND=openai" in text and "STT_BACKEND=groq" in text)
+    check("コメントが残る", "# メモ" in text)
+
+    page2 = _page()
+    check("読み戻せる（小数）", abs(page2._widgets["VLM_TARGET_FPS"].value() - 0.60) < 1e-9)
+    check("読み戻せる（文字列）", page2._widgets["WS_EXEC_ALLOW"].text() == "python,git")
+    check("読み戻せる（選択肢）", page2._widgets["EMBED_BACKEND"].currentText() == "openai")
+
+
+def t_defaults_not_pinned() -> None:
+    print("\n[15] 既定のままの項目を .env に焼き付けない")
+    from eve.config import Config
+
+    p = _sandbox("# メモ\nVV_SPEED=1.0\n")
+    page = _page()
+    page.save()
+    text = p.read_text(encoding="utf-8")
+    keys = {ln.split("=")[0] for ln in text.splitlines()
+            if "=" in ln and not ln.strip().startswith("#")}
+    check("**触っていない既定値は書かれない**（後で既定を改善しても古い値が残らない）",
+          "VLM_PHASH_THRESHOLD" not in keys and "SEARCH_MAX_RESULTS" not in keys,
+          f"{sorted(keys)}")
+    check("元からあるキーは残る", "VV_SPEED" in keys)
+    check("書かれた件数が現実的", len(keys) <= 6, f"{len(keys)}: {sorted(keys)}")
+
+    # 既定から動かしたものは書かれる
+    page2 = _page()
+    page2._widgets["VLM_PHASH_THRESHOLD"].setValue(int(Config.VLM_PHASH_THRESHOLD) + 3)
+    page2.save()
+    check("動かしたら書かれる", "VLM_PHASH_THRESHOLD" in p.read_text(encoding="utf-8"))
+
+    # 一度書いたら、既定に戻しても .env には残す（勝手に消さない）
+    page3 = _page()
+    page3._widgets["VLM_PHASH_THRESHOLD"].setValue(int(Config.VLM_PHASH_THRESHOLD))
+    page3.save()
+    check("**一度書いたキーは既定に戻しても消さない**（ユーザの持ち物を消さない）",
+          "VLM_PHASH_THRESHOLD" in p.read_text(encoding="utf-8"))
+
+
+def t_warnings_shown() -> None:
+    print("\n[14] 危ない項目には注意書きが付く")
+    from eve.ui.settings_spec import all_items
+
+    warned = {it.key for it in all_items() if it.warn}
+    check("プログラム実行に注意がある", "WS_EXEC_ENABLED" in warned, f"{warned}")
+    check("実行許可コマンドに注意がある", "WS_EXEC_ALLOW" in warned, f"{warned}")
+    vlm = [it for it in all_items() if it.key == "VLM_ENABLED"][0]
+    check("画面認識は「Gemini に送られる」と明示する", "Gemini" in vlm.note, vlm.note)
+    allow = [it for it in all_items() if it.key == "WS_EXEC_ALLOW"][0]
+    check("実行許可は「セキュリティ境界ではない」と明示する",
+          "セキュリティ境界ではありません" in allow.note, allow.note)
+
+
 if __name__ == "__main__":
     t_collect()
     t_frequency()
@@ -268,5 +466,13 @@ if __name__ == "__main__":
     t_save_failure()
     t_restart_env()
     t_split_policy()
+    t_spec_is_real()
+    t_defaults_from_config()
+    t_broken_env_survives()
+    t_dependencies()
+    t_accordion()
+    t_advanced_roundtrip()
+    t_defaults_not_pinned()
+    t_warnings_shown()
     print(f"\n合計: PASS {PASS} / FAIL {FAIL}")
     sys.exit(1 if FAIL else 0)

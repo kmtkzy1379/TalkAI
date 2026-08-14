@@ -77,7 +77,7 @@ Get-ChildItem tests\test_*.py | ForEach-Object {
 "PASS $tot / FAIL $fail"
 ```
 
-**実測 2026-08-14: 862件 PASS / FAIL 0**（2回連続一致・flaky なし）。
+**実測 2026-08-15: 1041件 PASS / FAIL 0**（2回連続一致・flaky なし）。
 内訳の基準は 2026-08-08 の 20ファイル 495件で、そこへ UI 系を積み上げた:
 
 | 追加ファイル | 件数 | 何を守るか |
@@ -89,7 +89,9 @@ Get-ChildItem tests\test_*.py | ForEach-Object {
 | test_ui_input.py | 24 | キーボード入力と状態インジケータ |
 | test_task_window.py | 24 | 表示物のタスクウィンドウ集約 |
 | test_warmup.py | 28 | 並列ウォームアップと起動進捗 |
-| **test_control_plane.py** | **91** | **機能 ON/OFF・入口ゲート・ミュート・動的プロンプト** |
+| **test_control_plane.py** | **95** | **機能 ON/OFF・入口ゲート・ミュート・動的プロンプト** |
+| **test_settings_store.py** | **51** | **`.env` の読み書き（BOM/改行/引用符/アトミック/秘密）** |
+| **test_settings_page.py** | **124** | **設定タブ（実ウィジェット）・高級設定・再起動の環境** |
 
 （`test_cancel_resolver_phase1.py` が 19→15 に減ったのは、1件制で取消の照合LLM を撤去し
 到達不能になったテストを削ったため。死にコードを残さない方針。）
@@ -312,7 +314,45 @@ OFF→ON し、`pending` → 確定 の順で状態が出ること・会話ロ�
 このとき `VoiceLoopThread.run()` の最後の `loop_stopped.emit()` が UI 破棄後に
 `RuntimeError: Signal source has been deleted` を投げるのも見つけて修正した（握って終了）。
 
-テスト `tests/test_control_plane.py`（91件）。
+テスト `tests/test_control_plane.py`（95件）。
+
+#### UI Phase 2/3: 設定タブ（2026-08-15・`eve/settings_store.py` / `eve/ui/settings_*.py`）
+
+**設定は保存では反映しない**（ユーザ要件）。`.env` に書くだけで次の起動から効き、
+設定タブ右上の［⟳ 再起動］でその場で入れ直す。項目は全 57（基本12＋高級45＋API キー4）。
+何を出すか・**何を出さないか**は `eve/ui/settings_spec.py` の宣言表に集約した。
+
+**`.env` 書き出しで守っていること**（`eve/settings_store.py`・どれも壊れ方が静か）:
+- **BOM を付けない**: 付けると `config.py` の最小パーサで1行目のキーだけ黙って効かなくなる
+- **改行コードを保つ**: `.env` は CRLF。`Path.read_text()` は universal newlines で LF に
+  化けるので `newline=""` で読む（実測でここを踏んだ）
+- **引用符を付けない / `#` を含む値を拒否**: python-dotenv は外す・切るが最小パーサはしない
+  ＝環境によって値が変わる
+- 行・順序・コメント・空行を保つ / `os.replace` でアトミック / **値をログにも例外にも載せない**
+- **既定のままの項目は書かない**: 素の `.env` で初回保存すると **32件**が焼き付き、後で
+  コード側の既定を改善しても古い値が残る（実測 → 修正後は変更した4件のみ）。
+  数値は**数として**比較する（`2.0` と `2.00` を別物と見て15件余計に書いた）
+
+**再起動の落とし穴（実プロセスで確認済み）**: 起動時に `.env` の全キーが `os.environ` へ
+入るため、素直に子プロセスを起こすと `setdefault` で**古い値が全部勝ち、保存した設定が
+1つも効かないのにエラーも出ない**。→ `eve/ui/restart.py` が `.env` のキーを子の環境から
+落とす。起動は**通常の終了処理に合流してから**（`cleanup.sweep` を飛ばさない）。
+
+**API キーは書き込み専用**: 保存済みの値を一度も表示しない（状態と末尾4文字のみ）。
+空欄で保存しても既存キーを消さない。OS 環境変数が優先されている場合は入力欄を無効化し、
+その旨を表示する（書いても効かないため）。
+
+**新設した設定**: `VV_INTONATION`（抑揚・**未実装だったので `tts.py` に
+`intonationScale` を配線**。既定 1.0＝音は不変）/ `UI_ALWAYS_ON_TOP` /
+`AUTOSPEECH_ENABLED`（自律発話の**起動時の初期値**。メニューの ON/OFF とは別物）。
+
+テスト `tests/test_settings_store.py`（51件）/ `tests/test_settings_page.py`（124件・
+Qt を `QT_QPA_PLATFORM=offscreen` で起動して**本物のウィジェット**を回す）。
+`test_settings_page` は「**画面に出している設定が実在するか**」を `Config`/`ROLE_ENV` と
+突き合わせて構造で守る（消費者ゼロの設定を出すと落ちる）。
+
+**未確認**: ［⟳ 再起動］ボタンを押して UI が実際に起動し直す経路は、まだ実起動で通していない
+（ウォームアップ2回分の API 課金になるため）。`spawn()` 単体は実プロセスで確認済み。
 
 テスト `tests/test_restartable.py`（48件）。**欠陥クラスを守る作りにした**（E13 の反省）:
 `eve/` を走査して「stop() で停止フラグを立てる start/stop 持ちのクラス」を**実際に列挙**し
