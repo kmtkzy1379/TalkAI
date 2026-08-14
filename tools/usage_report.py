@@ -4,6 +4,13 @@ r"""API 使用量ログ（`usage.jsonl`）を集計する。**料金指標の読
     & .\.venv\Scripts\python.exe tools\usage_report.py                # 既定のログ全体
     & .\.venv\Scripts\python.exe tools\usage_report.py usage.jsonl --tag live
     & .\.venv\Scripts\python.exe tools\usage_report.py --recalc       # 今の価格表で計算し直す
+    & .\.venv\Scripts\python.exe tools\usage_report.py --warmup-sec 90  # 起動とみなす秒数
+
+## 短い計測から1時間を見積もるとき
+**単純な ×6 はずれる。**起動（ウォームアップ）は1回きりなので、それを含めたまま掛けると
+6回起動したことになる。本ツールは起動ぶんを分離して「起動1回 + 定常1時間」で出す。
+逆に**過小**になる要因もある（自発発話の同内容抑制の窓が既定600秒＝10分の計測は
+その効果を見ていない／RAG は育つのでプロンプトが伸びる）。幅つきで読むこと。
 
 ## 何が分かるか
 - **役割ごと**の回数・トークン・費用（どの機能が高いのか）
@@ -50,10 +57,67 @@ def load(path: Path, tag: str = "") -> list:
     return rows
 
 
+def _cost_of(r: dict, recalc: bool):
+    if not recalc:
+        return r.get("cost_usd")
+    p = price_of(r.get("model", "?"))
+    if p is None:
+        return None
+    return r.get("prompt_tokens", 0) * p[0] + r.get("completion_tokens", 0) * p[1]
+
+
+def _steady(rows: list, recalc: bool, warmup_sec: float) -> None:
+    """**起動ぶんを除いた**定常レートを出す。
+
+    短い計測を単純に×6すると2方向にずれる:
+      1. **起動は1回きり**（ウォームアップの STT/LLM/TTS と Ruri ロード）。含めたまま
+         掛けると、6回起動したことになって**過大**になる。ここではそれを除く。
+      2. 逆に**過小**になる要因もある: 自発発話の同内容抑制の窓は既定 600秒
+         （`SPEECH_DUP_WINDOW_SEC`）。10分の計測はちょうどその境目に座るので、
+         それ以降に効いてくる抑制（＝発話が減る＝安くなる）を見ていない。
+         また RAG は育つのでプロンプトが少しずつ伸びる。
+    したがって定常レートも**上下の幅つき**で読むこと。桁を掴む用途には十分。
+    """
+    stamps = []
+    for r in rows:
+        try:
+            stamps.append((datetime.fromisoformat(r["ts"]), r))
+        except (KeyError, ValueError):
+            continue
+    if len(stamps) < 3:
+        return
+    stamps.sort(key=lambda x: x[0])
+    t0 = stamps[0][0]
+    tail = [(t, r) for t, r in stamps if (t - t0).total_seconds() >= warmup_sec]
+    if len(tail) < 2:
+        print(f"　定常レート     : 起動後（{warmup_sec:.0f}秒以降）の呼び出しが少なく計算できません")
+        return
+    span = (tail[-1][0] - tail[0][0]).total_seconds() / 3600.0
+    if span <= 0:
+        return
+    usd = sum(c for c in (_cost_of(r, recalc) for _t, r in tail) if c is not None)
+    warm = len(stamps) - len(tail)
+    warm_usd = sum(c for c in (_cost_of(r, recalc)
+                               for t, r in stamps if (t - t0).total_seconds() < warmup_sec)
+                   if c is not None)
+    print(f"　定常レート     : {usd / span:.4f} USD/時"
+          f"（最初の{warmup_sec:.0f}秒＝起動 {warm} 呼び出し・{warm_usd:.5f} USD を除いた {span * 60:.1f} 分から）")
+    print(f"　起動1回ぶん    : {warm_usd:.5f} USD（何回起動しても1回だけかかる）")
+    print(f"　→ 1時間の目安  : {warm_usd + usd / span:.4f} USD（起動1回 + 定常1時間）")
+
+
 def main() -> int:
     args = [a for a in sys.argv[1:]]
     recalc = "--recalc" in args
     args = [a for a in args if a != "--recalc"]
+    warmup_sec = 60.0
+    if "--warmup-sec" in args:
+        i = args.index("--warmup-sec")
+        try:
+            warmup_sec = float(args[i + 1])
+        except (IndexError, ValueError):
+            pass
+        args = args[:i] + args[i + 2:]
     tag = ""
     if "--tag" in args:
         i = args.index("--tag")
@@ -123,7 +187,8 @@ def main() -> int:
 
     print("\n--- 指標 ---")
     if span_h > 0.01:
-        print(f"1時間あたり     : {total_usd / span_h:.4f} USD")
+        print(f"1時間あたり     : {total_usd / span_h:.4f} USD（起動ぶんを含む素の割り算）")
+        _steady(rows, recalc, warmup_sec)
     resp = by_role.get("response", {}).get("calls", 0)
     if resp:
         print(f"1応答あたり     : {total_usd / resp:.5f} USD（応答 {resp} 回で割った全体費用）")
