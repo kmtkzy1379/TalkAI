@@ -37,7 +37,7 @@ from .log_bridge import LogBridge
 from .log_panel import LogPanel
 from .menu_bar import MenuBar
 from .task_window import TaskWindow
-from .theme import BG, LOG_FRAME, TEXT_FRAME, app_qss, frame_qss
+from .theme import BG, LINE, app_qss
 
 logger = logging.getLogger(__name__)
 
@@ -261,9 +261,7 @@ class MainWindow(QWidget):
         self.view.setMinimumSize(320, 214)
         self.status = QLabel("起動中…（VOICEVOX とマイクを確認しています）")
         self.status.setWordWrap(True)
-        self.line = QLabel("")
-        self.line.setWordWrap(True)
-        self.line.setStyleSheet("font-size: 15px;")
+        self.line = QLabel("")   # 見た目は theme.app_qss の QLabel#speech に一本化する
 
         # 状態インジケータ: 音声だけだと「今こっちの声が届いているのか」が分からない。
         # 値はすべて loop 側スナップショット由来（UI は loop 所有 state を読まない）。
@@ -358,13 +356,12 @@ class MainWindow(QWidget):
 
         # --- メインタブ: 左に Live2D、右にログ、下に発話テキスト（参考画像の構成）---
         self.logs = LogPanel()
-        # ログは縦長。素材も切り出すと縦長（1062x1780）なので枠がそのまま合う。
+        # **枠素材は使わない**（ユーザ裁定 2026-08-14）。Live2D 以外は仮置きの素の配置。
         log_box = QWidget()
-        log_qss, log_pad = frame_qss(LOG_FRAME, scale=0.9)
-        log_box.setStyleSheet(log_qss)
+        log_box.setStyleSheet(f"background: {BG}; border-left: 1px solid {LINE};")
         log_box.setMinimumWidth(250)
         lb = QVBoxLayout(log_box)
-        lb.setContentsMargins(*log_pad)
+        lb.setContentsMargins(12, 8, 10, 8)
         lb.addWidget(self.logs)
 
         stage = QHBoxLayout()
@@ -372,19 +369,17 @@ class MainWindow(QWidget):
         stage.addWidget(self.view, 5)
         stage.addWidget(log_box, 3)
 
-        # 発話テキストは**用意された枠素材をそのまま使う**。最初に崩れたのは素材の
-        # 透明余白が原因で、比率のせいではなかった（切り出し後は 9スライスで四隅を
-        # 保ったまま横に伸ばせる）。素材を使わず無地で代替するのは仕様を下げること。
+        # 発話テキストも枠素材は使わない（仮置き）。読めることだけを優先する。
         self.line.setObjectName("speech")
         self.line.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.line.setWordWrap(True)
         speech_box = QWidget()
-        speech_qss, speech_pad = frame_qss(TEXT_FRAME, scale=0.5, inner_only=True)
-        speech_box.setStyleSheet(speech_qss)
+        speech_box.setStyleSheet(f"background: {BG}; border-top: 1px solid {LINE};")
         sb = QVBoxLayout(speech_box)
-        sb.setContentsMargins(speech_pad[0] + 8, speech_pad[1], speech_pad[2] + 8, speech_pad[3])
+        sb.setContentsMargins(16, 10, 16, 10)
         sb.addWidget(self.line)
 
-        # 入力欄は**面を持たせない**（枠素材の隣にもう一枚パネルを置くと箱が増える）。
+        # 入力欄は面を持たせない（発話テキストの直下にもう一枚置くと箱が増える）。
         entry_box = QWidget()
         eb = QVBoxLayout(entry_box)
         eb.setContentsMargins(10, 0, 10, 0)
