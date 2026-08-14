@@ -35,7 +35,8 @@ def _url(p: Path) -> str:
     return str(p).replace("\\", "/")
 
 
-def frame_qss(image: Path, *, scale: float = 0.35) -> tuple[str, tuple[int, int, int, int]]:
+def frame_qss(image: Path, *, scale: float = 0.35,
+              inner_only: bool = False) -> tuple[str, tuple[int, int, int, int]]:
     """枠画像を 9スライスで貼る QSS と、**中身を置くべき余白**を返す。
 
     素材は実描画範囲で切り出してから使う（`assets.prepare`）。切り出さないと絵が
@@ -46,7 +47,7 @@ def frame_qss(image: Path, *, scale: float = 0.35) -> tuple[str, tuple[int, int,
     """
     from .assets import prepare
 
-    f = prepare(image)
+    f = prepare(image, inner_only=inner_only)
     if not f.ok:
         return (f"background: {BG}; border: 1px solid {LINE}; border-radius: 12px;",
                 (14, 12, 14, 12))
@@ -95,11 +96,21 @@ def app_qss() -> str:
     """アプリ全体の下地。"""
     return f"""
     QWidget {{ color: {INK}; font-size: 13px; }}
-    QLabel#speech {{ font-size: 19px; line-height: 150%; color: {INK}; }}
-    QLabel#hint {{ color: {SUB}; }}
-    QTabBar::tab {{ padding: 5px 12px; }}
-    QTabBar::tab:selected {{ color: {SPEAKER_COLORS['user']}; font-weight: bold; }}
+    QLabel#speech {{ font-size: 19px; line-height: 155%; color: {INK}; background: transparent; }}
+    QLabel#hint {{ color: {SUB}; background: transparent; }}
+    /* **枠素材の上に置くものは面を持たない**（持たせると「箱の中の箱」になる） */
+    QTabWidget::pane {{ border: none; background: transparent; }}
+    QTabBar {{ background: transparent; }}
+    QTabBar::tab {{ padding: 4px 11px; background: transparent; color: {SUB};
+                    border: none; margin-right: 2px; }}
+    QTabBar::tab:selected {{ color: {SPEAKER_COLORS['user']}; font-weight: bold;
+                             border-bottom: 2px solid {SPEAKER_COLORS['user']}; }}
     QTextEdit, QPlainTextEdit {{ background: transparent; border: none; }}
-    QLineEdit {{ border: 1px solid {LINE}; border-radius: 8px; padding: 7px 10px;
-                 background: white; }}
+    QScrollBar:vertical {{ background: transparent; width: 7px; margin: 0; }}
+    QScrollBar::handle:vertical {{ background: rgba(120,115,130,0.30); border-radius: 3px; }}
+    QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
+    QLineEdit {{ border: 1px solid {LINE}; border-radius: 9px; padding: 8px 12px;
+                 background: rgba(255,255,255,0.86); }}
+    QProgressBar {{ background: rgba(120,115,130,0.16); border: none; border-radius: 4px; }}
+    QProgressBar::chunk {{ background: {SPEAKER_COLORS['user']}; border-radius: 4px; }}
     """

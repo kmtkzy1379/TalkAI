@@ -42,8 +42,14 @@ class Frame:
         return self.path is not None and self.path.exists()
 
 
-def prepare(src: Path) -> Frame:
-    """素材を切り出してキャッシュし、9スライス余白と紙色を測って返す。失敗しても落ちない。"""
+def prepare(src: Path, *, inner_only: bool = False) -> Frame:
+    """素材を切り出してキャッシュし、9スライス余白と紙色を測って返す。失敗しても落ちない。
+
+    `inner_only=True` は**内側のパネルだけ**を取り出す。`text_background.png` は
+    「♥♥♥ text の見出し帯（高さ128px 固定）＋ 内側パネル」の二段構成で、帯より低い枠に
+    9スライスで貼ると**見出しが二重に見える**（実測 2026-08-14）。1行の発話テキストは
+    低い帯なので、内側パネルだけを使えば高さに関わらず素直に伸びる。
+    """
     fallback = Frame(None, 0, 0, 0, 0, "#ffffff")
     if not src.exists():
         return fallback
@@ -52,7 +58,7 @@ def prepare(src: Path) -> Frame:
         from PIL import Image
 
         CACHE.mkdir(parents=True, exist_ok=True)
-        out = CACHE / (src.stem + ".png")
+        out = CACHE / (src.stem + ("_inner" if inner_only else "") + ".png")
         if out.exists() and out.stat().st_mtime >= src.stat().st_mtime:
             meta = _measure(out)
             if meta is not None:
@@ -64,7 +70,19 @@ def prepare(src: Path) -> Frame:
         ys, xs = np.nonzero(solid)
         if not len(xs):
             return fallback
-        im.crop((int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)).save(out)
+        box = [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
+        if inner_only:
+            rgb = a[:, :, :3].astype(int)
+            paper = (a[:, :, 3] > 200) & (rgb.min(axis=2) > 236) & \
+                    (rgb.max(axis=2) - rgb.min(axis=2) < 12)
+            py, px = np.nonzero(paper)
+            if len(px):
+                # 内側パネル＋その縁（bleed）だけを取る
+                bleed = 26
+                box = [max(box[0], int(px.min()) - bleed), max(box[1], int(py.min()) - bleed),
+                       min(box[2], int(px.max()) + 1 + bleed),
+                       min(box[3], int(py.max()) + 1 + bleed)]
+        im.crop(tuple(box)).save(out)
         meta = _measure(out)
         return meta if meta is not None else fallback
     except Exception:

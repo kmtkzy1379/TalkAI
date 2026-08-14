@@ -37,7 +37,7 @@ from .log_bridge import LogBridge
 from .log_panel import LogPanel
 from .menu_bar import MenuBar
 from .task_window import TaskWindow
-from .theme import BG, LOG_FRAME, app_qss, frame_qss, panel_qss
+from .theme import BG, LOG_FRAME, TEXT_FRAME, app_qss, frame_qss
 
 logger = logging.getLogger(__name__)
 
@@ -372,21 +372,22 @@ class MainWindow(QWidget):
         stage.addWidget(self.view, 5)
         stage.addWidget(log_box, 3)
 
-        # 発話テキストは**横に細長い帯**。縦横比 1.6:1 の枠素材を 10:1 に引き伸ばすと
-        # 装飾が潰れて「2重の枠」に見える（実測）。ここは無地パネルで整える
-        # （hallmark の「抑制」＝装飾を無理に伸ばすより素直に整える）。
+        # 発話テキストは**用意された枠素材をそのまま使う**。最初に崩れたのは素材の
+        # 透明余白が原因で、比率のせいではなかった（切り出し後は 9スライスで四隅を
+        # 保ったまま横に伸ばせる）。素材を使わず無地で代替するのは仕様を下げること。
         self.line.setObjectName("speech")
         self.line.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         speech_box = QWidget()
-        speech_box.setStyleSheet(panel_qss())
+        speech_qss, speech_pad = frame_qss(TEXT_FRAME, scale=0.5, inner_only=True)
+        speech_box.setStyleSheet(speech_qss)
         sb = QVBoxLayout(speech_box)
-        sb.setContentsMargins(22, 10, 22, 10)
+        sb.setContentsMargins(speech_pad[0] + 8, speech_pad[1], speech_pad[2] + 8, speech_pad[3])
         sb.addWidget(self.line)
 
+        # 入力欄は**面を持たせない**（枠素材の隣にもう一枚パネルを置くと箱が増える）。
         entry_box = QWidget()
-        entry_box.setStyleSheet(panel_qss("#f3f1f6"))
         eb = QVBoxLayout(entry_box)
-        eb.setContentsMargins(14, 6, 14, 8)
+        eb.setContentsMargins(10, 0, 10, 0)
         eb.setSpacing(6)
         eb.addLayout(top)
         eb.addLayout(entry_row)
@@ -395,11 +396,11 @@ class MainWindow(QWidget):
         bottom_box = QWidget()
         bottom = QVBoxLayout(bottom_box)
         bottom.setContentsMargins(0, 0, 0, 0)
-        bottom.setSpacing(8)
+        bottom.setSpacing(6)
         bottom.addWidget(speech_box, 2)
         bottom.addWidget(entry_box, 1)
-        bottom_box.setMinimumHeight(160)
-        bottom_box.setMaximumHeight(215)
+        bottom_box.setMinimumHeight(170)
+        bottom_box.setMaximumHeight(230)
 
         main = QWidget()
         ml = QVBoxLayout(main)
