@@ -17,19 +17,27 @@
 壊れた画像のデコードで落ちても本体が生き残る、という性質はここでは失われる。
 そのため (a) 判定と上限は `viewer.py` のものを**再実装せず import して共有**し、
 (b) デコードは必ず try で囲み、(c) `external` モードに戻せる逃げ道を残す。
+
+## ユーザが触っている窓は閉じない（2026-08-15 ユーザ指定）
+HTML を動かせるようになった＝**ユーザが操作している最中の窓**が生まれる（電卓を叩いて
+いる途中に消えると困る）。子ウィンドウを `TASKWIN_PROTECT_CLICKS` 回（既定3）クリック
+したら「操作中」と見なし、イブの `close_window` や機能 OFF 時の一括クローズから守る。
+**1回にしない**のは誤クリックで居座らせないため（ユーザ指定）。
+守るのは*イブ側からの*クローズだけで、ユーザ自身の×と「全部閉じる」は常に通す。
 """
 from __future__ import annotations
 
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import QEvent, Qt, Signal
 from PySide6.QtGui import QImageReader, QPixmap
 from PySide6.QtWidgets import (
-    QHBoxLayout, QLabel, QMdiArea, QMdiSubWindow, QPlainTextEdit, QPushButton,
-    QScrollArea, QVBoxLayout, QWidget,
+    QApplication, QHBoxLayout, QLabel, QMdiArea, QMdiSubWindow, QPlainTextEdit,
+    QPushButton, QScrollArea, QVBoxLayout, QWidget,
 )
 
+from ..config import Config
 # **安全規律は viewer.py と共有する**（拡張子を信じない種類判定・サイズ上限・画素数上限）。
 # ここで書き直すと、片方だけ直して片方が古いままになる。
 from ..workspace.viewer import MAX_BYTES, MAX_PIXELS, TEXT_MAX_CHARS, _hexdump, sniff
@@ -76,6 +84,7 @@ class TaskWindow(QWidget):
     """イブの表示物を集約する窓。中の子ウィンドウは枠外へ出られない。"""
 
     closed_by_user = Signal(str)  # 子ウィンドウがユーザに閉じられた（window_id）
+    user_engaged = Signal(str)    # ユーザが操作中と判定した（window_id）→ loop 側の台帳へ
 
     def __init__(self) -> None:
         super().__init__()
@@ -87,6 +96,15 @@ class TaskWindow(QWidget):
         self.mdi.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.mdi.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._subs: dict[str, QMdiSubWindow] = {}
+        self._clicks: dict[str, int] = {}     # window_id -> クリック数
+        self._protected: set[str] = set()     # 「ユーザが操作中」と確定した window_id
+        # **アプリ全体のイベントを覗く**。子ウィンドウ自身に付けても届かない:
+        # HTML ビュー（QWebEngineView）のマウス入力は Chromium が作る内部ウィジェットが
+        # 受け取るので、親のフィルタには上がってこない。アプリ側で拾って、受け取った
+        # ウィジェットから親を辿ってどの子ウィンドウかを特定する（**握り潰さない**）。
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)
 
         self.note = QLabel("イブがここに画像やテキストを出します")
         self.note.setStyleSheet("color:#666;")
@@ -146,30 +164,97 @@ class TaskWindow(QWidget):
         y = (n * step) % (max_y + 1) if max_y else 0
         sub.move(x, y)
 
-    def close_file(self, window_id: str) -> None:
-        """イブ側（`close_window` / 終了処理）からの閉じる要求。
+    def close_file(self, window_id: str, force: bool = False) -> bool:
+        """イブ側（`close_window` / 終了処理）からの閉じる要求。閉じたら True。
 
         **「ユーザが閉じた」通知は出さない**（台帳は既に呼び出し側が更新している。
         ここで通知すると閉鎖が二重に伝わる）。
+
+        ユーザが操作中の窓（3クリック以上）は `force` でない限り閉じない。台帳側
+        （`store.close_viewers`）でも同じ判定をしているので普通はここまで来ないが、
+        「守りは両側」にしておく（判定の間に人が触った場合の取りこぼしを塞ぐ）。
         """
+        if not force and window_id in self._protected:
+            logger.info("🔒 ユーザが操作中の窓なので閉じなかった（%s）", window_id)
+            return False
         sub = self._subs.pop(window_id, None)
+        self._clicks.pop(window_id, None)
+        self._protected.discard(window_id)
         if sub is not None:
             try:
                 sub.silent_close()
             except Exception:
                 logger.debug("子ウィンドウを閉じられなかった", exc_info=True)
         self._refresh_note()
+        return sub is not None
+
+    # ------------------------------------------------------------ 操作中の判定
+    def eventFilter(self, obj, ev) -> bool:
+        """マウスの押下だけを数える。**必ず False を返す**（イベントは素通しする）。"""
+        try:
+            if ev.type() == QEvent.MouseButtonPress:
+                wid = self._owner_of(obj)
+                if wid is not None:
+                    self._count_click(wid)
+        except Exception:  # 数え損ねても表示は止めない
+            logger.debug("クリック計数で例外（無視）", exc_info=True)
+        return False
+
+    def _owner_of(self, obj) -> str | None:
+        """イベントを受け取ったウィジェットから、どの子ウィンドウの中かを辿る。"""
+        if not isinstance(obj, QWidget):
+            return None
+        subs = {id(s): wid for wid, s in self._subs.items()}
+        w = obj
+        for _ in range(24):   # 深さは有限（無限親子ループへの保険）
+            if w is None:
+                return None
+            got = subs.get(id(w))
+            if got is not None:
+                return got
+            w = w.parentWidget()
+        return None
+
+    def _count_click(self, window_id: str) -> None:
+        need = int(Config.TASKWIN_PROTECT_CLICKS)
+        if need <= 0 or window_id in self._protected:
+            return
+        n = self._clicks.get(window_id, 0) + 1
+        self._clicks[window_id] = n
+        if n < need:
+            return
+        self._protected.add(window_id)
+        sub = self._subs.get(window_id)
+        if sub is not None:
+            try:
+                sub.setWindowTitle(f"🔒 {sub.windowTitle()}")
+            except Exception:
+                logger.debug("題名に錠前を付けられなかった", exc_info=True)
+        logger.info("🔒 ユーザが操作中と判定（%d クリック）→ イブからは閉じない", n)
+        self._refresh_note()
+        self.user_engaged.emit(window_id)
+
+    def is_protected(self, window_id: str) -> bool:
+        return window_id in self._protected
 
     def _on_sub_closed(self, window_id: str) -> None:
         self._subs.pop(window_id, None)
+        self._clicks.pop(window_id, None)
+        self._protected.discard(window_id)
         self._refresh_note()
         self.closed_by_user.emit(window_id)
 
     def _refresh_note(self) -> None:
         n = len(self._subs)
+        locked = len(self._protected)
         try:
-            self.note.setText("イブがここに画像やテキストを出します" if not n
-                              else f"表示中 {n} 件（枠の中で自由に動かせます）")
+            if not n:
+                self.note.setText("イブがここに画像やテキストを出します")
+            elif locked:
+                self.note.setText(f"表示中 {n} 件（うち {locked} 件は操作中🔒＝"
+                                  "あなたが閉じるまでイブは消しません）")
+            else:
+                self.note.setText(f"表示中 {n} 件（枠の中で自由に動かせます）")
         except RuntimeError:
             # 終了時: 親が破棄された後に子の closeEvent が走ると、C++ 側の QLabel は
             # 既に消えている（実測: `Internal C++ object already deleted`）。
@@ -186,6 +271,11 @@ class TaskWindow(QWidget):
         if size > MAX_BYTES:
             return _message(f"{name} は大きすぎて表示できません（{size} バイト）")
         kind = sniff(target)
+        if kind == "HTML":
+            view = TaskWindow._build_html(target, name)
+            if view is not None:
+                return view
+            # 落ちた時は下のテキスト表示へ流す（ソースを見せる＝嘘をつかない）
         if kind in ("PNG", "JPEG", "GIF", "BMP", "WEBP"):
             reader = QImageReader(str(target))
             dim = reader.size()
@@ -204,13 +294,35 @@ class TaskWindow(QWidget):
             return area
         text = QPlainTextEdit()
         text.setReadOnly(True)
-        if kind == "TEXT":
+        if kind == "HTML":
+            text.setPlainText("（HTML を動かせる表示機能が使えないので、ソースを出します。"
+                              "`pip install PySide6-Addons` で押せる状態になります）\n\n"
+                              + target.read_text(encoding="utf-8",
+                                                 errors="replace")[:TEXT_MAX_CHARS])
+        elif kind == "TEXT":
             text.setPlainText(target.read_text(encoding="utf-8", errors="replace")[:TEXT_MAX_CHARS])
         else:
             # 表示できない形式は**勝手に別の解釈をせず**正直にそう言う（viewer.py と同じ）
             text.setPlainText(f"（{name} はテキストとしても画像としても読めませんでした。"
                               f"先頭を16進で表示します）\n\n" + _hexdump(target.read_bytes()))
         return text
+
+    @staticmethod
+    def _build_html(target: Path, name: str):
+        """HTML を**動かせる状態**で出す。使えなければ None（呼び出し側がソース表示へ）。"""
+        if not Config.TASKWIN_HTML_ENABLED:
+            logger.info("TASKWIN_HTML_ENABLED=0 なので %s はソース表示にする", name)
+            return None
+        try:
+            from . import web_view
+
+            if not web_view.available():
+                return None
+            return web_view.build(target)
+        except Exception:
+            # WebEngine の初期化は環境依存で落ちうる（GPU/権限）。表示機能ごと死なせない。
+            logger.exception("HTML ビューを作れなかった（ソース表示に落とす）")
+            return None
 
     def force_close(self) -> None:
         """アプリ終了時に本当に閉じる（×は隠すだけなので明示の口を用意する）。"""

@@ -88,6 +88,58 @@ def _kill_viewers(proc) -> None:
         pass
 
 
+def _scope_matrix(app, check) -> None:
+    """[6] メインとタスクウィンドウを**独立に**隠せるか（2026-08-15 ユーザ要望の核心）。
+
+    「イブに自分の UI は見せたくないが、作らせた電卓は見せたい」が成立するかを、
+    4通りの組み合わせを実際に撮って確かめる。片方の設定がもう片方に漏れていたら落ちる。
+    """
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QLabel
+
+    print("\n[6] メイン / タスクウィンドウを独立に隠せる")
+    main_w = QLabel("EVE UI（メイン）")
+    main_w.setStyleSheet("background:#ff00ff; color:white; font-size:28px;")
+    main_w.setAlignment(Qt.AlignCenter)
+    main_w.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+    main_w.resize(460, 300)
+    main_w.move(120, 120)
+    main_w.show()
+
+    task_w = QLabel("タスクウィンドウ（表示物）")
+    task_w.setStyleSheet("background:#00ffff; color:black; font-size:28px;")
+    task_w.setAlignment(Qt.AlignCenter)
+    task_w.setWindowFlag(Qt.WindowStaysOnTopHint, True)
+    task_w.resize(460, 300)
+    task_w.move(640, 120)
+    task_w.show()
+    for _ in range(40):
+        app.processEvents()
+        time.sleep(0.02)
+
+    r_main = window_rect(int(main_w.winId()))
+    r_task = window_rect(int(task_w.winId()))
+    _, mon = grab()
+
+    for hide_ui, hide_task in ((False, False), (True, False), (False, True), (True, True)):
+        capture_guard.set_window(int(main_w.winId()), hide_ui)
+        capture_guard.set_window(int(task_w.winId()), hide_task)
+        time.sleep(0.6)
+        app.processEvents()
+        m_mark = ratios(r_main, mon)[0]     # メインはマゼンタ
+        t_behind = ratios(r_task, mon)[1]   # タスクはシアン
+        want_m, want_t = (m_mark < 20) == hide_ui, (t_behind < 20) == hide_task
+        label = (f"メイン{'隠' if hide_ui else '見'} / タスク{'隠' if hide_task else '見'}")
+        check(f"{label} が指定どおり", want_m and want_t,
+              f"メインの目印 {m_mark:.1f}% / タスクの目印 {t_behind:.1f}%")
+
+    capture_guard.set_window(int(main_w.winId()), False)
+    capture_guard.set_window(int(task_w.winId()), False)
+    main_w.hide()
+    task_w.hide()
+    app.processEvents()
+
+
 def main() -> int:
     if not capture_guard.available():
         print("この環境ではキャプチャ除外を使えない（Windows 以外）")
@@ -157,8 +209,12 @@ def main() -> int:
         f.write("キャプチャ除外の確認用\n" * 40)
 
     def run_viewer(hide: bool):
-        capture_guard.publish(hide)  # 共有ファイルも起動前に揃える（起動直後の追従を見る）
-        env = dict(os.environ, UI_HIDE_FROM_CAPTURE=("1" if hide else "0"))
+        # ビューアは**イブの表示物**＝`TASK` scope に従う（2026-08-15 に分離）。
+        # ここを `UI` のままにすると、共有ファイルもフラグも別の口を叩くことになり、
+        # 「切り替えたのに追従しない」という**ハーネス側の嘘**になる（実際に踏んだ）。
+        capture_guard.publish(hide, capture_guard.TASK)  # 起動前に揃える（直後の追従を見る）
+        env = dict(os.environ,
+                   **{capture_guard.env_name(capture_guard.TASK): ("1" if hide else "0")})
         p = subprocess.Popen([sys.executable, "-m", "eve.workspace.viewer", sample,
                               os.path.dirname(sample)], cwd=root, env=env,
                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -222,7 +278,7 @@ def main() -> int:
     else:
         seen = []
         for want in (False, True, False):
-            capture_guard.publish(want)
+            capture_guard.publish(want, capture_guard.TASK)
             time.sleep(2.0)  # ビューアは1秒ごとに見る
             r = window_rect(h_on)
             img, mon2 = grab()
@@ -234,7 +290,10 @@ def main() -> int:
               f"{['見' if s else '隠' for s in seen]}")
 
     _kill_viewers(p_on)
-    capture_guard.publish(True)  # 既定（ON）に戻す
+    _scope_matrix(app, check)
+
+    capture_guard.publish(True, capture_guard.UI)    # 既定（ON）に戻す
+    capture_guard.publish(True, capture_guard.TASK)
     try:
         os.remove(sample)
     except OSError:

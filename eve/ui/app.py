@@ -70,6 +70,10 @@ class _ItemHandle:
         self.window_id = window_id
         self._closed = False
         self._request_close = request_close
+        # ユーザが操作中（3クリック以上）。`store.close_viewers()` はこの属性を
+        # `getattr(..., False)` で見るので、`Popen`（別プロセスのビューア）は自然に
+        # 「保護なし」になる。書くのは loop スレッドだけ（UI からは call_soon_threadsafe）。
+        self.protected = False
 
     def poll(self):
         return None if not self._closed else 0
@@ -175,6 +179,26 @@ class VoiceLoopThread(threading.Thread):
             h = self._handles.pop(window_id, None)
             if h is not None:
                 h.mark_closed()
+
+        try:
+            loop.call_soon_threadsafe(_apply)
+        except RuntimeError:
+            pass
+
+    def notify_user_engaged(self, window_id: str) -> None:
+        """UI スレッドから: ユーザが操作中と判定 → loop 側の台帳に印を付ける。
+
+        印を **loop 側にも**置くのが要点。UI だけで守ると、イブの `close_window` は
+        「閉じた」と言いながら窓が残る（台帳と画面がズレて嘘の報告になる）。
+        """
+        loop = self._loop
+        if loop is None:
+            return
+
+        def _apply() -> None:
+            h = self._handles.get(window_id)
+            if h is not None:
+                h.protected = True
 
         try:
             loop.call_soon_threadsafe(_apply)
@@ -361,15 +385,24 @@ class MainWindow(QWidget):
 
         # キャプチャ除外の ON/OFF。**この設定だけ即時反映**（OS API を直接叩くだけで
         # `Config` を読み直さないため。配信の直前に切り替えられる方が実用的）。
-        self.hide_cb = QCheckBox("イブの画面認識からこのウィンドウを隠す")
+        # **2枚に分ける**（2026-08-15 ユーザ指定）: 以前は1つの設定でメインウィンドウも
+        # 表示物もまとめて隠していたため、「自分の UI は見せずに、作らせた電卓だけ
+        # イブにも見せる」ができなかった。
+        self.hide_cb = QCheckBox("イブの画面認識からこのウィンドウ（メイン）を隠す")
         self.hide_cb.setChecked(Config.UI_HIDE_FROM_CAPTURE)
         self.hide_cb.setEnabled(capture_guard.available())
         self.hide_cb.toggled.connect(self._toggle_hide)
         self.hide_state = QLabel("")
+        self.hide_task_cb = QCheckBox("イブの画面認識からタスクウィンドウ（表示物）を隠す")
+        self.hide_task_cb.setChecked(Config.TASKWIN_HIDE_FROM_CAPTURE)
+        self.hide_task_cb.setEnabled(capture_guard.available())
+        self.hide_task_cb.toggled.connect(self._toggle_hide_task)
+        self.hide_task_state = QLabel("")
 
         # イブの表示物をタスクウィンドウ内に閉じ込めるか（OFF なら従来どおり画面の好きな位置）
         self.taskwin = TaskWindow()
         self.taskwin.closed_by_user.connect(self.thread_.notify_user_closed)
+        self.taskwin.user_engaged.connect(self.thread_.notify_user_engaged)
         self.bridge.open_item.connect(self._open_item)
         self.bridge.close_item.connect(self.taskwin.close_file)
         self.aggregate_cb = QCheckBox("イブの表示をタスクウィンドウ内に集約する")
@@ -470,6 +503,8 @@ class MainWindow(QWidget):
         sl.addLayout(task_row)
         sl.addWidget(self.hide_cb)
         sl.addWidget(self.hide_state)
+        sl.addWidget(self.hide_task_cb)
+        sl.addWidget(self.hide_task_state)
         sl.addStretch(1)
         settings_scroll = QScrollArea()      # 小さい窓でも全項目に手が届く
         settings_scroll.setWidgetResizable(True)
@@ -544,6 +579,7 @@ class MainWindow(QWidget):
     def apply_capture_guard(self) -> None:
         """自分の窓に適用する。**窓が実際に出てから**でないと HWND が確定しない。"""
         self._toggle_hide(self.hide_cb.isChecked())
+        self._toggle_hide_task(self.hide_task_cb.isChecked())
 
     def _open_item(self, path: str, name: str, wid: str) -> None:
         self.taskwin.open_file(path, name, wid)
@@ -564,22 +600,39 @@ class MainWindow(QWidget):
             self.aggregate_state.setText("ON: タスクウィンドウの中だけに出します")
 
     def _apply_hide_to_task_window(self) -> None:
-        """タスクウィンドウは**イブ自身の窓**なので、UI と同じ設定で隠す。"""
+        """タスクウィンドウは**メインとは別の設定**で隠す（2026-08-15）。
+
+        「イブに自分の UI は見せないが、自分が出した表示物は見せる」を成立させるため。
+        """
         if self.taskwin.isVisible():
-            capture_guard.set_window(int(self.taskwin.winId()), self.hide_cb.isChecked())
+            capture_guard.set_window(int(self.taskwin.winId()),
+                                     self.hide_task_cb.isChecked())
 
     def _toggle_hide(self, hide: bool) -> None:
-        self._apply_hide_to_task_window()
         ok = capture_guard.set_window(int(self.winId()), hide)
-        # ビューア（別プロセス）へは**状態だけ**を渡し、向こうが自分で掛け直す。
-        # 他プロセスの窓へ直接は適用できない（実測 ERROR_ACCESS_DENIED）ため。
-        # 環境変数はこれから起動する子の初期値、共有ファイルは**既に開いている窓**用。
-        os.environ["UI_HIDE_FROM_CAPTURE"] = "1" if hide else "0"
-        capture_guard.publish(hide)
+        os.environ[capture_guard.env_name(capture_guard.UI)] = "1" if hide else "0"
+        capture_guard.publish(hide, capture_guard.UI)
         mark = "✅" if ok else ("—" if not capture_guard.available() else "⚠")
-        self.hide_state.setText(f"{mark} {capture_guard.describe(hide)}"
-                                + ("" if ok or not capture_guard.available()
-                                   else "（適用に失敗）"))
+        self.hide_state.setText(
+            f"{mark} {capture_guard.describe(hide, capture_guard.UI)}"
+            + ("" if ok or not capture_guard.available() else "（適用に失敗）"))
+
+    def _toggle_hide_task(self, hide: bool) -> None:
+        """タスクウィンドウと**別プロセスのビューア**の設定。
+
+        ビューア（別プロセス）へは**状態だけ**を渡し、向こうが自分で掛け直す。
+        他プロセスの窓へ直接は適用できない（実測 ERROR_ACCESS_DENIED）ため。
+        環境変数はこれから起動する子の初期値、共有ファイルは**既に開いている窓**用。
+        """
+        ok = True
+        if self.taskwin.isVisible():
+            ok = capture_guard.set_window(int(self.taskwin.winId()), hide)
+        os.environ[capture_guard.env_name(capture_guard.TASK)] = "1" if hide else "0"
+        capture_guard.publish(hide, capture_guard.TASK)
+        mark = "✅" if ok else ("—" if not capture_guard.available() else "⚠")
+        self.hide_task_state.setText(
+            f"{mark} {capture_guard.describe(hide, capture_guard.TASK)}"
+            + ("" if ok or not capture_guard.available() else "（適用に失敗）"))
 
     # --- UI スレッド（queued connection で呼ばれる） ---
     def _on_log_line(self, tab: str, who: str, text: str) -> None:
@@ -798,6 +851,14 @@ def main() -> int:
         print("eve_ui/ に Live2D モデルと背景画像を置いてください（gitignore 対象）。")
         return 2
     import live2d.v3 as live2d
+
+    # **`QApplication` より前**に QtWebEngine を読み込む（`AA_ShareOpenGLContexts` を
+    # 立てる必要があり、後からでは Qt が警告を出して Live2D と GL 文脈を共有できない）。
+    # 入っていない環境では False が返るだけで、HTML はソース表示に落ちる。
+    if Config.TASKWIN_HTML_ENABLED:
+        from . import web_view
+
+        web_view.preinit()
 
     live2d.init()
     try:

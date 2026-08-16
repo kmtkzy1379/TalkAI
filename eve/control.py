@@ -367,9 +367,14 @@ class ControlPlane:
         # として画面認識が拾い、自分の過去の出力を相手の作業画面として実況する）。
         if vl.workspace is not None:
             try:
+                # ユーザが操作中の窓は残す（force を付けない）。機能 OFF は「これ以上
+                # 動かない」の宣言であって、ユーザが触っている物を取り上げる操作ではない。
                 closed = vl.workspace.close_viewers()
+                busy = vl.workspace.protected_names()
                 if closed:
                     logger.info("表示ウィンドウを %d 個閉じた（タスク OFF）", closed)
+                if busy:
+                    logger.info("🔒 操作中の表示は残した（タスク OFF）: %s", "・".join(busy))
             except Exception:
                 logger.exception("表示ウィンドウを閉じるのに失敗（続行）")
         msg = "タスクを OFF にしました"

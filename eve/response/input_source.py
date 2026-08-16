@@ -15,6 +15,7 @@ from abc import ABC, abstractmethod
 from ..pipeline.stimulus import Stimulus, StimulusKind
 from ..pipeline.stimulus_queue import StimulusQueue
 from ..stt import Stt
+from ..stt.askback import is_unintelligible
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +46,8 @@ class MicSttInputSource(InputSource):
     """
 
     def __init__(self, queue: StimulusQueue, stt: Stt, on_speech_start=None, on_utterance=None,
-                 on_stt_start=None, on_stt_end=None) -> None:
+                 on_stt_start=None, on_stt_end=None, on_unintelligible=None,
+                 on_understood=None) -> None:
         super().__init__(queue)
         self._stt = stt
         self._on_speech_start = on_speech_start
@@ -56,6 +58,11 @@ class MicSttInputSource(InputSource):
         # （E2E S8 実測）。start=transcribe 直前 / end=投入完了（失敗・空認識含む）後に呼ぶ。
         self._on_stt_start = on_stt_start
         self._on_stt_end = on_stt_end
+        # 日本語として受け取れない認識結果（発音が崩れて別言語になった等）を渡す非同期フック。
+        # 未配線なら従来どおりそのまま刺激にする（既存挙動を変えない）。
+        self._on_unintelligible = on_unintelligible
+        # 逆に「ちゃんと聞き取れた」時の同期フック（連続聞き返しのカウントを戻す用）。
+        self._on_understood = on_understood
         self._ai = None
         self._task = None
 
@@ -95,8 +102,17 @@ class MicSttInputSource(InputSource):
                 text = await self._stt.transcribe(pcm)
             except Exception:  # STT 失敗はこの発話を捨てて継続（起こりうる）
                 logger.exception("STT 失敗（この発話を捨てて継続）")
-            if text:
+            if text and self._on_unintelligible is not None and is_unintelligible(text):
+                # 日本語として受け取れない（発音が崩れて別言語として認識された等）。
+                # 応答LLM に渡すと知ったかぶりの元になるので、刺激にせず聞き返しへ回す。
+                logger.info("🧑? 聞き取れず（%d文字・別言語として認識）", len(text))
+                try:
+                    await self._on_unintelligible(text)
+                except Exception:
+                    logger.exception("聞き返しフックで例外（この発話は捨てて継続）")
+            elif text:
                 logger.info("🧑 %s", text)
+                self._hook(self._on_understood, "on_understood")  # 連続聞き返しのカウントを戻す
                 await self._queue.put(Stimulus(StimulusKind.USER_UTTERANCE, payload=text))
             # J-2 ③-A: 窓を閉じるのは**投入完了後**（put 前に閉じると put の await 中に
             # 自発発話が滑り込む微小窓が残る）。失敗/空認識でも必ず閉じる（固着防止）。

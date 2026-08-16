@@ -44,8 +44,17 @@ _IMAGE_MAGIC = (
 )
 
 
+_HTML_HEAD = ("<!doctype html", "<html")
+
+
 def sniff(path: Path) -> str:
-    """**拡張子を信用せず**先頭バイトで種類を決める（`.png` を騙る `.exe` を弾く）。"""
+    """**拡張子を信用せず**先頭バイトで種類を決める（`.png` を騙る `.exe` を弾く）。
+
+    返り値: 画像形式名 / `HTML` / `TEXT` / `BINARY`。
+
+    HTML は**テキストの一種**なので、判定順は 画像 → HTML → TEXT。逆にすると
+    「HTML と名乗る PNG」が HTML 扱いになる（拡張子を信じないという規律が崩れる）。
+    """
     head = path.open("rb").read(16)
     for magic, name in _IMAGE_MAGIC:
         if head.startswith(magic):
@@ -59,7 +68,20 @@ def sniff(path: Path) -> str:
     except (UnicodeDecodeError, OSError):
         return "BINARY"
     ctrl = sum(1 for c in text if ord(c) < 32 and c not in "\r\n\t")
-    return "TEXT" if not text or ctrl / max(1, len(text)) < 0.05 else "BINARY"
+    if text and ctrl / max(1, len(text)) >= 0.05:
+        return "BINARY"
+    # BOM と先頭の空白・コメントを飛ばしてから見る（LLM が書く HTML は素直だが、
+    # 先頭にライセンスコメントが付くことはある）。**中身で決める**＝`.txt` でも HTML。
+    probe = text.lstrip("﻿ \t\r\n")
+    while probe.startswith("<!--"):
+        end = probe.find("-->")
+        if end < 0:
+            break
+        probe = probe[end + 3:].lstrip()
+    low = probe[:64].lower()
+    if any(low.startswith(h) for h in _HTML_HEAD):
+        return "HTML"
+    return "TEXT"
 
 
 def _hexdump(data: bytes, limit: int = 2048) -> str:
@@ -128,7 +150,15 @@ def main(argv: list[str]) -> int:
         text = tk.Text(frame, wrap="word", width=90, height=32, yscrollcommand=bar.set)
         text.pack(side="left", fill="both", expand=True)
         bar.config(command=text.yview)
-        if kind == "TEXT":
+        if kind == "HTML":
+            # **Tk には HTML を動かす手段が無い**（WebEngine は Qt 側）。ここで
+            # 「それらしく」描くと押せないボタンが並んで嘘になるので、正直に言って
+            # ソースを出す。動かしたい時はタスクウィンドウ（集約 ON）を使う。
+            body = ("（このウィンドウでは HTML を動かせません。"
+                    "設定の「イブの表示をタスクウィンドウ内に集める」を ON にすると、"
+                    "押せる状態で表示できます。以下はソースです）\n\n"
+                    + resolved.read_text(encoding="utf-8", errors="replace")[:TEXT_MAX_CHARS])
+        elif kind == "TEXT":
             body = resolved.read_text(encoding="utf-8", errors="replace")[:TEXT_MAX_CHARS]
         else:
             # 表示できない形式は**勝手に別の解釈をせず**正直にそう言う（+ 中身の先頭だけ）
@@ -147,13 +177,15 @@ def main(argv: list[str]) -> int:
     # 状態だけ受け取って自分で掛け直す）。1秒ごとに見て、変わった時だけ適用する。
     try:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
-        from eve.capture_guard import desired, set_own_windows
+        from eve.capture_guard import TASK, desired, set_own_windows
 
         state = {"hide": None}
 
         def _follow() -> None:
             try:
-                want = desired()
+                # ビューアは**イブの表示物**なので `TASK` 側の設定に従う
+                # （メインウィンドウの `UI` とは別に ON/OFF できる・2026-08-15）。
+                want = desired(TASK)
                 if want != state["hide"]:
                     set_own_windows(want)
                     state["hide"] = want

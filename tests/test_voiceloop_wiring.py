@@ -39,7 +39,14 @@ try:
     # 応答プロンプト leak 修正: system プロンプトが空でなく SPEECH_STYLE を含む（"システム応答" leak 防止）
     from eve.response.style import SPEECH_STYLE as _SS  # noqa: E402
     check("orchestrator の system プロンプトが非空", bool(vl.orchestrator._ctx.system_prompt))
-    check("orchestrator の system が SPEECH_STYLE", vl.orchestrator._ctx.system_prompt == _SS)
+    # 2026-08-15: ペルソナ層（`persona.md`）を後付けするようになったので完全一致ではなくなった。
+    # 守りたいのは「SPEECH_STYLE が先頭にある（leak 防止）」＋「ペルソナが載る／無くても壊れない」。
+    _sp = vl.orchestrator._ctx.system_prompt
+    check("orchestrator の system が SPEECH_STYLE で始まる", _sp.startswith(_SS))
+    from eve.persona import PERSONA_HEADING, load_persona  # noqa: E402
+    _persona = load_persona()
+    check("ペルソナがあれば後ろに載る／無ければ SPEECH_STYLE のまま",
+          (PERSONA_HEADING in _sp) if _persona else (_sp == _SS))
     # F4: 内分泌系（PredictionState / FeedbackLLM / FeedbackWorker）の配線
     check("orchestrator に PredictionState を配線", vl.orchestrator._state is vl.prediction)
     check("orchestrator 完了トリガ=_on_response_complete(feedback+沈黙リセット)", vl.orchestrator._on_complete == vl._on_response_complete)

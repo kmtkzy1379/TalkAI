@@ -40,6 +40,7 @@ class _Handle:
 
     def __init__(self) -> None:
         self.closed = False
+        self.protected = False   # ユーザが操作中（UI 側の `_ItemHandle` と同じ形）
 
     def poll(self):
         return None if not self.closed else 0
@@ -178,6 +179,69 @@ def t_max_windows() -> None:
         check("close_window の案内が出る", "close_window" in outs[3])
 
 
+def t_user_engaged() -> None:
+    """ユーザが操作中（3クリック以上）の窓は、イブ側から閉じない（2026-08-15 指定）。
+
+    HTML が動くようになった＝**操作の途中**が存在する。電卓を叩いている最中に
+    `close_window` や機能 OFF で消えるのを構造的に止める。
+    守るのはイブ側の閉鎖だけで、停止処理（`force=True`）とユーザ自身の×は通す。
+    """
+    print("\n[7] ユーザが操作中の窓は閉じない")
+    with tempfile.TemporaryDirectory() as d:
+        ws, reg = _make(Path(d))
+        made = []
+
+        def open_fn(path, name):
+            h = _Handle()
+            made.append(h)
+            return h
+
+        ws.viewer_open_fn = open_fn
+        reg.execute("show_on_screen", {"path": "a.txt"})
+        reg.execute("show_on_screen", {"path": "b.txt"})
+        made[0].protected = True          # a.txt をユーザが触っている
+
+        check("protected_names に出る", ws.protected_names() == ["a.txt"],
+              f"{ws.protected_names()}")
+        out = reg.execute("close_window", {"path": "a.txt"})
+        check("**イブの close_window では閉じない**", not made[0].closed, out)
+        check("閉じたと嘘をつかない（操作中だと伝える）", "操作中" in out, out)
+        check("台帳に残る", "a.txt" in ws.open_window_names(), f"{ws.open_window_names()}")
+
+        out = reg.execute("close_window", {})
+        check("全部閉じる要求でも操作中は残る", not made[0].closed and made[1].closed, out)
+        check("残した事実を報告に含める", "残して" in out or "操作中" in out, out)
+
+        # 停止処理は force=True（プロセスごと終わるので残しても孤児になるだけ）
+        check("force=True なら閉じる（停止時）", ws.close_viewers(force=True) == 1)
+        check("全部閉じた", ws.live_viewers() == [])
+
+
+def t_protection_is_opt_in_attr() -> None:
+    """`protected` は**属性が無ければ False**（別プロセスの `Popen` を壊さない）。"""
+    print("\n[8] 保護属性を持たないハンドルは従来どおり閉じる")
+    with tempfile.TemporaryDirectory() as d:
+        ws, reg = _make(Path(d))
+
+        class _Bare:
+            """`Popen` の最小模型（`protected` を持たない）。"""
+
+            def __init__(self):
+                self.closed = False
+
+            def poll(self):
+                return 0 if self.closed else None
+
+            def terminate(self):
+                self.closed = True
+
+        bare = _Bare()
+        ws.viewer_open_fn = lambda p, n: bare
+        reg.execute("show_on_screen", {"path": "a.txt"})
+        check("protected 属性が無くても例外にならない", ws.protected_names() == [])
+        check("従来どおり閉じられる", ws.close_viewers() == 1 and bare.closed)
+
+
 def t_shared_rules() -> None:
     """安全規律を再実装していないこと（片方だけ古くなる事故を防ぐ）。"""
     print("\n[6] 判定・上限は viewer.py と共有している")
@@ -198,6 +262,8 @@ if __name__ == "__main__":
     t_close_window()
     t_fallback()
     t_max_windows()
+    t_user_engaged()
+    t_protection_is_opt_in_attr()
     t_shared_rules()
     print(f"\n合計: PASS {PASS} / FAIL {FAIL}")
     sys.exit(1 if FAIL else 0)

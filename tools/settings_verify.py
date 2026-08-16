@@ -40,6 +40,7 @@ REPO = Path(__file__).resolve().parent.parent
 NOT_ON_CONFIG = {
     "RESPONSE_MODEL", "DECIDE_MODEL", "TASK_MODEL", "VLM_LEAF_MODEL", "FEEDBACK_MODEL",
     "SUMMARIZE_MODEL", "SEARCH_SUMMARIZE_MODEL", "DELIVERY_CHECK_MODEL",
+    "SELF_MODEL_MODEL",
 }
 
 # (env キー, 入れる値, 消費者の読み方 or None)。消費者は子プロセス内で eval される式。
@@ -60,6 +61,8 @@ CASES: tuple = (
     ("SUMMARIZE_MODEL", "openai/gpt-4o", "vl.registry.resolve('summarize')"),
     ("SEARCH_SUMMARIZE_MODEL", "openai/gpt-4o", "vl.registry.resolve('search_summarize')"),
     ("DELIVERY_CHECK_MODEL", "openai/gpt-4o", "vl.registry.resolve('delivery_check')"),
+    ("SELF_MODEL_MODEL", "openai/gpt-4o", "vl.registry.resolve('self_model')"),
+    ("SELF_MODEL_ENABLED", "1", "vl.self_model is not None"),
     # --- 自律発話 ---
     ("SILENCE_THRESHOLD_SEC", "9.0", "vl.silence_monitor._threshold"),
     ("AUTOSPEECH_ENABLED", "1", None),          # run() の分岐（構築時には現れない）
@@ -122,6 +125,11 @@ CASES: tuple = (
     ("WS_VIEWER_MODE", "external", None),       # UI 側（app.py）が読む
     ("UI_ALWAYS_ON_TOP", "1", None),
     ("UI_HIDE_FROM_CAPTURE", "0", "__import__('eve.capture_guard', fromlist=['x']).enabled_by_env()"),
+    ("TASKWIN_HIDE_FROM_CAPTURE", "0",
+     "__import__('eve.capture_guard', fromlist=['x']).enabled_by_env('task')"),
+    # 消費者は UI（task_window.py）が使う瞬間に Config を直読みする＝3段目で確かめる
+    ("TASKWIN_HTML_ENABLED", "0", None),
+    ("TASKWIN_PROTECT_CLICKS", "5", None),
     ("USAGE_LOG_ENABLED", "1", "vl.usage is not None"),
 )
 
@@ -137,6 +145,8 @@ DIRECT_READERS = {
     "VLM_ENABLED": "eve/voice_loop.py",
     "WS_VIEWER_MODE": "eve/ui/app.py",
     "UI_ALWAYS_ON_TOP": "eve/ui/app.py",
+    "TASKWIN_HTML_ENABLED": "eve/ui/task_window.py",
+    "TASKWIN_PROTECT_CLICKS": "eve/ui/task_window.py",
     "WS_VIEWER_MAX_WINDOWS": "eve/voice_loop.py",
     "SAMPLE_RATE": "eve/audio_input.py",
 }

@@ -21,6 +21,7 @@ import logging
 from typing import Optional
 
 from ..clock import now_mono
+from ..text_match import has_substance
 from .schema import CANCELLED
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,19 @@ TASK_AGENT_SYSTEM = (
     "待とうとせず（時間を待つ手段は無い・同じ関数を繰り返し呼ばない）、時間の語は無視して**今すぐ内容を1回実行**する。\n"
     "・失敗した結果が返ってきたら、別の手段・引数で**やり直してよい**（同じ呼び出しの単純反復はしない）。\n"
     "・どうしても達成できない/できない依頼なら、**正直に理由を述べて**終えてください（憶測で成功と言わない）。\n"
+    "・**画面で触れるもの（電卓・カウンタ・ミニゲーム等）を頼まれたら、1枚のHTMLファイルを書いて"
+    "show_on_screen で出す**。tkinter 等のデスクトップGUIは窓を出せないので使わない"
+    "（プログラム実行は画面を持たない environment で動く）。\n"
     "・最終結果はイブがユーザに報告する一言になります。簡潔に、事実だけを。"
+    "**必ず「何を」したかが分かる語を入れる**（例:「表示したよ」ではなく「ラーメンの画像を表示したよ」）。"
+    "ユーザは実行の経過を見ていないので、対象を言わないと何の報告か伝わらない。"
+)
+
+# 実質チェックで直せなかった時に返る「せめて何のタスクか」を示す接頭辞（決定論フォールバック）。
+_SUBSTANCE_REPAIR_SYSTEM = (
+    "タスクの実行結果を、ユーザに口頭で報告する**1文**に直してください。"
+    "**何をしたか（対象）が分かる語を必ず含める**こと。事実だけを書き、実行していないことを足さない。"
+    "分からない対象を推測で補わない。話し言葉で短く。記号・箇条書き・かっこ書きは使わない。"
 )
 
 
@@ -79,6 +92,7 @@ class TaskAgent:
     def __init__(
         self, *, registry, model_registry, store,
         max_steps: int = 6, timeout_sec: float = 30.0, now_fn=now_mono,
+        self_model_fn=None,
     ) -> None:
         self._registry = registry          # CapabilityRegistry（agent_tool_schemas + execute_async）
         self._model = model_registry        # ModelRegistry（complete("task", ...)）
@@ -86,6 +100,32 @@ class TaskAgent:
         self._max_steps = max(1, int(max_steps))
         self._timeout = float(timeout_sec)
         self._now = now_fn
+        # イブ自身の好み（`memory/self_model.py` の render）を返す関数。既定 None＝従来どおり。
+        # **会話履歴は渡さない**ので「タスク担当は今の会話を見られない」契約は無傷。
+        # これが無いと、goal が「イブの好きな食べ物の画像」のままの時に解決できない
+        # （実機事故 2026-08-15 02:44: TaskAgent が Web 検索で“りんご”を拾ってきた）。
+        self._self_model_fn = self_model_fn
+
+    def _self_model_block(self) -> str:
+        """goal 中の「イブの好きな〜」を解決するための台帳（無ければ空文字）。
+
+        goal は応答LLM が書くが、**自己参照を具体名に書き換えてくれるとは限らない**
+        （実測 2026-08-15: 4回中3回「好きな食べ物の画像出してくれない？」のまま投げた）。
+        goal の書き方に期待せず、受け手側が解決できるようにする。
+        """
+        if self._self_model_fn is None:
+            return ""
+        try:
+            block = self._self_model_fn() or ""
+        except Exception:
+            logger.exception("自己モデルの取得に失敗（無しで継続）")
+            return ""
+        if not block:
+            return ""
+        return ("\n\n" + block
+                + "\nゴールに「イブの好きな〜」のような自己参照があれば、上の台帳で解決してから動く。"
+                  "台帳に無いことは**調べて決めつけない**（イブ本人が決めていないだけなので、"
+                  "無難なものを選ぶか、選べないなら正直にそう言う）。")
 
     def _cancelled(self, task_id: str) -> bool:
         t = self._store.get(task_id)
@@ -95,7 +135,7 @@ class TaskAgent:
         """ゴールを完遂し最終結果文字列を返す。実行中に取り消されたら None（executor が破棄）。"""
         deadline = self._now() + self._timeout
         messages: list[dict] = [
-            {"role": "system", "content": TASK_AGENT_SYSTEM},
+            {"role": "system", "content": TASK_AGENT_SYSTEM + self._self_model_block()},
             {"role": "user", "content": f"ゴール: {goal}"},
         ]
         last_content = ""
@@ -129,7 +169,8 @@ class TaskAgent:
                 last_content = content
             if not calls:
                 # 関数を呼ばない＝完了（達成 or 正直な失敗報告）。
-                return content or last_content or "（結果が空でした）"
+                return await self._ensure_substance(
+                    goal, content or last_content or "（結果が空でした）", notes)
 
             # tool_calls あり → assistant メッセージ + 各 tool 結果を積んで次の step へ。
             messages.append({
@@ -164,6 +205,43 @@ class TaskAgent:
 
         logger.info("🗒 TaskAgent: max_steps 到達 task=%s", task_id)
         return await self._summarize_failure(goal, notes, f"手数上限({self._max_steps}手)")
+
+    async def _ensure_substance(self, goal: str, result: str, notes: list[str]) -> str:
+        """最終結果に「何を」が入っていなければ、goal と実行手順から一度だけ言い直させる。
+
+        実機事故 2026-08-15 02:44: ネットから拾った画像を出したタスクの最終結果が
+        **「表示したよ。」**（内容語ゼロ）になり、ユーザには何を出したのか伝わらなかった。
+        TaskAgent 自身も「何の画像か」を知らなかった（検索結果の URL を curl しただけ）ので、
+        これは**正直な振る舞いの結果**であり、プロンプトだけでは防ぎ切れない。
+
+        規律（CLAUDE.md「規律はコードで強制」）:
+        - 検出は決定論（`text_match.has_substance`）。**内容語がある通常ケースは LLM を呼ばない**
+          ＝コスト増ゼロ。呼ぶのは稀な空報告のときだけ。
+        - 「（…」で始まる**正直な失敗報告は触らない**（executor がこれで Failed を判定するため、
+          言い直すと成否が反転する）。
+        - 直せなかった/直しても空のままなら**元の文字列をそのまま返す**（no-op 規律）。
+        """
+        if not result or result.startswith("（") or has_substance(result):
+            return result
+        detail = " / ".join(notes[-4:]) if notes else "（手がかりなし）"
+        messages = [
+            {"role": "system", "content": _SUBSTANCE_REPAIR_SYSTEM},
+            {"role": "user", "content": (
+                f"ゴール: {goal}\n実際に行った手順:\n{detail}\n"
+                f"今の報告文（対象が抜けている）: {result}"
+            )},
+        ]
+        try:
+            fixed = _content(await self._model.complete("task", messages)).strip()
+        except Exception:
+            logger.exception("報告の実質チェックで LLM 失敗（元の報告のまま続行）")
+            return result
+        # 直った時だけ差し替える。「（」始まりは成否判定を反転させるので**必ず弾く**。
+        if not fixed or fixed.startswith("（") or not has_substance(fixed):
+            logger.info("🗒 報告の実質チェック: 直せず元のまま: %.40s", result)
+            return result
+        logger.info("🗒 報告に対象を補った: %.40s → %.40s", result, fixed)
+        return fixed
 
     async def _summarize_failure(self, goal: str, notes: list[str], reason: str) -> str:
         """限界(タイムアウト/手数上限/エラー)で離脱した時、**なぜ終わらなかったか**を一言にまとめて返す。

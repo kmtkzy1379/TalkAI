@@ -19,9 +19,17 @@ import logging
 from typing import Optional
 
 from ..context_assembler import OMITTED_SPEAKER, Turn
+from ..stt.askback import ASK_BACK_FALLBACK, ASK_BACK_LINES, UNINTELLIGIBLE_PLACEHOLDER
 from .feedback_llm import FeedbackLLM
 
 logger = logging.getLogger(__name__)
+
+_ASKBACK_TEXTS = frozenset(ASK_BACK_LINES) | {ASK_BACK_FALLBACK, UNINTELLIGIBLE_PLACEHOLDER}
+
+
+def _is_askback_turn(t: Turn) -> bool:
+    """聞き取り失敗のプレースホルダ、またはその定型の聞き返しか。"""
+    return t.text in _ASKBACK_TEXTS
 
 
 class FeedbackWorker:
@@ -94,6 +102,13 @@ class FeedbackWorker:
             Turn(t.speaker, t.text, t.stamp) for t in span if t.speaker != OMITTED_SPEAKER
         ]
         if not snapshot:
+            return
+        # 聞き取り失敗（＋その聞き返し）だけのスパンは内省しない。中身ゼロのチャンクを
+        # RAG に増やすと検索を汚し、無言時の「話題の種」(RAG_RANDOM_K) として引かれる。
+        # 会話履歴には残す（聞き返しの原因を消さないため）が、長期記憶には入れない
+        # ＝ユーザ裁定 2026-08-15。**watermark は進める**（同じスパンを永久に再試行しない）。
+        if all(_is_askback_turn(t) for t in snapshot):
+            self._state.watermark = snapshot[-1].stamp.iso
             return
         new_watermark = snapshot[-1].stamp.iso  # 読んだ時点の最新（以後の新着は次サイクル）
         self._idle.clear()

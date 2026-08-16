@@ -942,6 +942,79 @@ async def t_input_source_stt_window_order() -> bool:
     )
 
 
+async def t_input_source_routes_unintelligible() -> bool:
+    """日本語として受け取れない認識結果は**刺激にせず**聞き返しへ回す（ユーザ裁定 2026-08-15）。
+
+    そのまま応答LLM に渡すと知ったかぶりの元になる（`style.py` の同趣旨の規則は
+    プロンプトなので守られないことがある＝コードで止める）。
+    """
+    from eve.response.input_source import MicSttInputSource
+
+    seen: list = []
+    understood: list = []
+
+    class FakeStt:
+        async def transcribe(self, pcm):
+            return "오케이."  # 発音が崩れて韓国語として認識された形（実データにある）
+
+    async def on_unintelligible(text):
+        seen.append(text)
+
+    q = StimulusQueue()
+    src = MicSttInputSource(q, FakeStt(),
+                            on_unintelligible=on_unintelligible,
+                            on_understood=lambda: understood.append(1))
+    src._ai = _FakeAIOnce()
+    task = asyncio.create_task(src._consume())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    return seen == ["오케이."] and q.qsize() == 0 and understood == []
+
+
+async def t_input_source_normal_text_still_flows() -> bool:
+    """通常の日本語は従来どおり刺激になり、聞き取れた合図（連続カウント戻し）が出る。"""
+    from eve.response.input_source import MicSttInputSource
+
+    seen: list = []
+    understood: list = []
+
+    class FakeStt:
+        async def transcribe(self, pcm):
+            return "こんにちは"
+
+    async def on_unintelligible(text):
+        seen.append(text)
+
+    q = StimulusQueue()
+    src = MicSttInputSource(q, FakeStt(),
+                            on_unintelligible=on_unintelligible,
+                            on_understood=lambda: understood.append(1))
+    src._ai = _FakeAIOnce()
+    task = asyncio.create_task(src._consume())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    ok = q.qsize() == 1
+    s = await q.get() if ok else None
+    return ok and s.payload == "こんにちは" and seen == [] and understood == [1]
+
+
+async def t_input_source_unhooked_keeps_old_behavior() -> bool:
+    """フック未配線なら従来どおり（別言語でもそのまま刺激にする＝既存挙動を変えない）。"""
+    from eve.response.input_source import MicSttInputSource
+
+    class FakeStt:
+        async def transcribe(self, pcm):
+            return "오케이."
+
+    q = StimulusQueue()
+    src = MicSttInputSource(q, FakeStt())
+    src._ai = _FakeAIOnce()
+    task = asyncio.create_task(src._consume())
+    await asyncio.sleep(0.05)
+    task.cancel()
+    return q.qsize() == 1
+
+
 async def t_input_source_stt_window_closes_on_failure() -> bool:
     # STT 失敗/空認識でも窓は必ず閉じる（固着防止）・投入なし・ループ継続（無クラッシュ）。
     from eve.response.input_source import MicSttInputSource
@@ -1242,6 +1315,9 @@ async def main() -> None:
     check("J-2 ③-A: 窓内は monitor が発火しない", t_monitor_blocks_during_stt_pending())
     check("J-2 ③-A: 判定完了時に窓内なら破棄", await t_decider_discards_when_stt_pending_at_completion())
     check("J-2 ③-A: 窓は transcribe 前に開き put 後に閉じる", await t_input_source_stt_window_order())
+    check("聞き返し: 別言語の認識結果は刺激にせず聞き返しへ", await t_input_source_routes_unintelligible())
+    check("聞き返し: 通常の日本語は従来どおり刺激になる", await t_input_source_normal_text_still_flows())
+    check("聞き返し: フック未配線なら既存挙動のまま", await t_input_source_unhooked_keeps_old_behavior())
     check("J-2 ③-A: STT失敗でも窓は閉じる（固着防止）", await t_input_source_stt_window_closes_on_failure())
     # C4
     check("C4 Eve 発話で沈黙時計リセット + user_speaking トグル", t_eve_activity_resets_silence())

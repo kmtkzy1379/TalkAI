@@ -25,12 +25,19 @@ ROLE_ENV: dict[str, tuple[str, str]] = {
     "vlm_merge": ("VLM_MERGE_MODEL", "gemini/gemini-2.5-pro"),
     "youtube": ("YOUTUBE_MODEL", "openai/gpt-4o"),
     "summarize": ("SUMMARIZE_MODEL", "openai/gpt-4o-mini"),
+    # 自己形成（イブの好み・趣向の台帳を更新する）。**速度は要らないが賢さは要る**:
+    # 起動は合図が出た時だけ（実測 イブ発話の 15.5%）＝呼び出しが稀なので、
+    # 安いモデルを常時回すより賢いモデルを稀に呼ぶ方が安く正確（裁定 2026-08-15）。
+    "self_model": ("SELF_MODEL_MODEL", "openai/gpt-5.4"),
     # J-2 inc2: Web本文の隔離要約（タスクLLM2）。**ツールを一切渡さない**専用ロール＝
     # 信頼できない Web 本文を読むのはこのロールだけ（injection がツール実行に到達しない構造）。
     "search_summarize": ("SEARCH_SUMMARIZE_MODEL", "openai/gpt-4o-mini"),
-    # J-2 P1-1: 機能実行結果が実際に発話へ反映されたか(delivered/withheld/forgotten)の
-    # 安価な確認係。ツールは渡さない（判定専用・実行系に触れない）。
-    "delivery_check": ("DELIVERY_CHECK_MODEL", "openai/gpt-4o-mini"),
+    # 報告が実発話で伝わったかの確認係。**決定論で決められない分岐でしか呼ばれない**
+    # （`response/delivery_checker.py` の規則5）。既定を旧 gpt-4o-mini から上げたのは、
+    # 02:44 の誤判定（ほぼ同一の報告と発話を forgotten と判定→二重回答）を出したのが
+    # その世代で、しかも**パイプラインで最も弱いモデルが最も強い権限＝再依頼を持つ**
+    # 構図になっていたため。呼び出し頻度が低いので安さより賢さを取る。
+    "delivery_check": ("DELIVERY_CHECK_MODEL", "openai/gpt-5.4"),
 }
 
 CompletionFn = Callable[..., Awaitable[object]]

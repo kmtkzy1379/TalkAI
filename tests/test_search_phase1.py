@@ -379,12 +379,15 @@ async def t_agent_blocking_per_step_limit():
         _resp(tool_calls=[_tc("c1", "search_web", '{"query": "A"}'),
                           _tc("c2", "search_web", '{"query": "B"}'),
                           _tc("c3", "search_web", '{"query": "C"}')]),
-        _resp(content="Aの結果だけ見た。"),
+        # 報告文には内容語を入れる（「A」1文字＋汎用語「結果」だけだと報告の実質チェック
+        # (`task/agent.py:_ensure_substance`) が発火して補修 LLM を1回余分に呼ぶ。
+        # このテストの主眼は 1step1件の制限なので、そこに巻き込まれないようにする）。
+        _resp(content="Aの結果だけ見たよ。BとCは保留。"),
     ])
     agent = TaskAgent(registry=reg, model_registry=model, store=AliveStore(), max_steps=5)
     out = await agent.run("AとBとCを調べて", "t1")
     rejected = [m for m in model.tool_msgs if "一度に1つまで" in m["content"]]
-    return out == "Aの結果だけ見た。" and calls == ["A"] and len(rejected) == 2
+    return out == "Aの結果だけ見たよ。BとCは保留。" and calls == ["A"] and len(rejected) == 2
 
 
 async def t_agent_blocking_reallowed_next_step():

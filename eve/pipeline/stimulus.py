@@ -13,6 +13,11 @@ from typing import Any, Optional
 from ..clock import Stamp
 
 
+# 再配達の理由（CallFunctionResult.reason）。前置き文の分岐に使う。
+REDELIVER_BARGE_IN = "barge_in"        # 発話が割り込みで潰れた＝**まだ伝わっていない**
+REDELIVER_NOT_CONVEYED = "not_conveyed"  # 発話はしたが報告の要点に触れなかった
+
+
 class StimulusKind(IntEnum):
     """値が小さいほど高優先（基本優先度）。"""
 
@@ -45,9 +50,15 @@ class CallFunctionResult:
     function_name = 実行した能力名（ログ/文脈用）。ok = 成否（失敗も正直に伝えるため保持）。
     attempts = 配達試行回数（0=初回）。barge-in で報告が発話前に潰れた時の再配達で +1 され、
     文脈に「遮られた再報告」と明示される（2026-07-13 21:20 実機事故: 報告の無音消失 対応）。
+    reason = 再配達の**理由**（attempts>0 の時だけ意味を持つ）。応答LLM に渡す前置き文が
+    これで変わる（`response/orchestrator.py`）。理由で分けないと嘘の前提を渡すことになる:
+    実機事故 2026-08-15 02:44 では、**実際には喋り終えた**報告に対して barge-in 用の
+    「直前に読み上げが遮られて、まだユーザに伝わっていない」が付き、応答LLM が謝罪ごと
+    作り直して二重回答になった（`attempts>0` の単一条件で分岐していたのが原因）。
     """
 
     function_name: str
     content: str
     ok: bool = True
     attempts: int = 0
+    reason: str = REDELIVER_BARGE_IN

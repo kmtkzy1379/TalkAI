@@ -18,6 +18,7 @@ from typing import Optional
 
 from ..context_assembler import Turn
 from ..model_registry import ModelRegistry
+from ..text_match import strip_ungrounded_foreign
 from .parser import FeedbackResult, parse_feedback
 from .prediction_state import NEUTRAL_SURPRISE, PredictionState
 from .prompts import build_messages
@@ -85,6 +86,44 @@ def render_chunk_text(r: FeedbackResult) -> str:
     return "\n".join(lines)
 
 
+def sanitize_result(r: FeedbackResult, source: str) -> FeedbackResult:
+    """内省結果から**会話に根拠の無い別言語の断片**を落とす（純関数・raise しない）。
+
+    実データ 2026-08-15: `rag_memory.jsonl` の3レコードに、会話に一切文脈の無い
+    デーヴァナーガリーが混入していた（`感情: イブ=शांत` / `次の予測: …話題に
+    प्रतिक्रियाするかもしれない` / `topic_tags: ["…","短文 प्रतिक्रिया"]`）。
+    これは FeedbackLLM の確率的破綻がそのまま永続化されたもので、うち1件は実際に
+    応答LLM の `# 参照` へ再注入されていた（＝壊れた日本語を毎回読ませていた）。
+
+    RAG は一度書くと消えないので、**入口で止める**（CLAUDE.md「規律はコードで強制」）。
+    根拠がある別言語は残す（「『수도권』は韓国語で…」のような正当な用例を壊さないため）。
+    """
+    dropped: list[str] = []
+
+    def clean(s: str) -> str:
+        out, removed = strip_ungrounded_foreign(s, source)
+        dropped.extend(removed)
+        return out.strip()
+
+    tags = []
+    for t in r.topic_tags or []:
+        c = clean(t)
+        if c:  # 丸ごと別言語だったタグは消える＝落とす
+            tags.append(c)
+    cleaned = FeedbackResult(
+        summary=clean(r.summary),
+        emotions=clean(r.emotions),
+        user_emotion=clean(r.user_emotion),
+        next_prediction=clean(r.next_prediction),
+        prediction_diff=r.prediction_diff,
+        reason=clean(r.reason),
+        topic_tags=tags,
+    )
+    if dropped:
+        logger.warning("内省に会話と無関係な別言語が混入→除去: %s", " / ".join(dropped[:5]))
+    return cleaned
+
+
 class FeedbackLLM:
     def __init__(
         self,
@@ -113,7 +152,9 @@ class FeedbackLLM:
         except Exception:
             logger.exception("FeedbackLLM 呼び出し失敗（no-op で継続）")
             return None
-        result = parse_feedback(_content(resp))
+        # 会話（＝根拠）に無い別言語の断片は、RAG に焼き付く前にここで落とす。
+        result = sanitize_result(parse_feedback(_content(resp)),
+                                 "\n".join(t.text for t in turns))
         if result.is_empty():
             logger.warning("FeedbackLLM 出力から何も抽出できず（no-op で継続）")
             return None

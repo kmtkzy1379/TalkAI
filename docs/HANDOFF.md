@@ -25,6 +25,9 @@ $env:PYTHONIOENCODING="utf-8"
   それ以前は前作（`../portfolio8-VLM-AI/venv`）を流用していた。torch は CPU 版で入れる:
   `pip install torch --index-url https://download.pytorch.org/whl/cpu`。
   文字ゲート（`VLM_OCR_ENABLED=1`）を使うなら `pip install winsdk` と OCR 言語パック(ja) が要る。
+- **UI 経路（`tools/ui_chat.py`）の追加依存**: `pip install PySide6-Essentials live2d-py`。
+  さらに **`PySide6-Addons`**（QtWebEngine・約169MB）を入れると、イブが作った HTML
+  （電卓など）が**押せる状態**で出る。無くても起動し、HTML はソース表示に落ちる。
 - **VOICEVOX 起動必須**（`http://127.0.0.1:50021`）。未起動でも落ちないが声が出ない。確認 `curl -s http://127.0.0.1:50021/version`
 - **マイク + イヤホン**（AEC は不採用＝スピーカーだと自分の声を拾う）
 - **`.env` が必要**（`.env.example` をコピーして API キーを入れる）
@@ -85,7 +88,8 @@ Get-ChildItem tests\test_*.py | ForEach-Object {
 | test_lipsync.py | 46 | モーラ長からの口の開閉（RMS 不採用の根拠ごと） |
 | test_ui_emotion.py | 65 | 感情ごとの揺れ・瞬き・視線 |
 | test_restartable.py | 55 | サイドカーの stop→start（欠陥クラス自体を走査して守る） |
-| test_capture_guard.py | 32 | キャプチャ除外の ON/OFF と共有状態 |
+| test_capture_guard.py | 32 | キャプチャ除外の ON/OFF と共有状態（+ scope 分離 14件） |
+| test_html_view.py | 46 | HTML 判定と表示サンドボックス（ネット遮断・ファイル横断禁止） |
 | test_ui_input.py | 24 | キーボード入力と状態インジケータ |
 | test_task_window.py | 24 | 表示物のタスクウィンドウ集約 |
 | test_warmup.py | 28 | 並列ウォームアップと起動進捗 |
@@ -384,9 +388,27 @@ Tier-1: 608 → **656 PASS / FAIL 0**（2回連続）。
 - venv の `python.exe` は実体を子プロセスで起動するため、**ビューアの窓は Popen の pid に
   属さない**（capture_guard 導入前からの挙動）。窓を探すならタイトルで探す。
 
-検証: `tools/capture_guard_check.py`（**API コストゼロ・約30秒**・2回連続 7/7）/
-Tier-1 `tests/test_capture_guard.py` 25件 / 実起動 `tools/ui_chat.py` で窓の矩形を撮ると
+検証: `tools/capture_guard_check.py`（**API コストゼロ・約60秒**・2026-08-15 時点 12/12）/
+Tier-1 `tests/test_capture_guard.py` 46件 / 実起動 `tools/ui_chat.py` で窓の矩形を撮ると
 **背後のエディタが写る**ことを目視確認。Tier-1 全体 656 → **681 PASS / FAIL 0**。
+
+**2026-08-15: scope を2つに分けた**（ユーザ指定）。1つの設定でメインも表示物も隠していたため
+「自分の UI は見せないが、**自分が出した表示物は見せる**」ができなかった。
+
+| scope | 対象 | 環境変数 | 既定 |
+|---|---|---|---|
+| `capture_guard.UI` | メインウィンドウ | `UI_HIDE_FROM_CAPTURE` | ON |
+| `capture_guard.TASK` | タスクウィンドウ + 別プロセスのビューア | `TASKWIN_HIDE_FROM_CAPTURE` | ON |
+
+共有ファイルも scope ごとに分ける（1ファイルに2値を詰めると、片方だけ書いた古いプロセスが
+もう片方を巻き添えで戻す）。UI の設定タブはチェックボックス2枚。旧 API は既定 `UI` のまま
+＝呼び出し側の変更は不要。
+
+`tools/capture_guard_check.py` を 7項目 → **12項目**に拡張（**API コストゼロ**・実測 12/12）。
+追加した [6] は4通りの組み合わせを実際に撮って測る。**核心の「メイン隠 / タスク見」**は
+メインの目印 0.0% / タスクの目印 97.4% ＝ 片方の設定がもう片方に漏れていない。
+なお [4][5] は**ハーネス側が `UI` scope のままで嘘をついていた**（分離後は viewer が
+`TASK` を見るため「切り替えたのに追従しない」と出る）。ハーネスも scope を追うよう修正済み。
 
 #### キーボード入力欄 + 状態インジケータ（実装済 2026-08-14）
 
@@ -437,6 +459,63 @@ UI のチェックボックスで**集約 ON/OFF を即時に切り替えられ�
 テスト `tests/test_task_window.py` 24件（既定は挙動不変 / None で別プロセスへ落ちる /
 フック例外でも表示が死なない / 上限が効く / 安全規律を再実装していない）。
 Tier-1 712 → **736 PASS / FAIL 0**（2回連続）。
+
+#### HTML を動く状態で表示する（実装済 2026-08-15・`eve/ui/web_view.py`・`TASKWIN_HTML_ENABLED` 既定 ON）
+
+「四則演算の電卓を作って画面に出して」を成立させる経路。**サンドボックス側では GUI を出さない**
+（Job の `UILIMIT_*` は shatter とシャットダウン封じを同時に担っている。`python` を許している
+以上、対話デスクトップを開けるのは「親権限で任意コード実行」と同義。加えて `run_program` は
+終わるまで待って 60秒で殺す契約＝常駐 GUI と形が合わない）。**表示側の種類を1つ増やす**方針。
+
+- `sniff()` に `HTML` を追加（**判定順は 画像 → HTML → TEXT**。逆にすると「HTML を騙る PNG」が
+  HTML 扱いになる＝拡張子を信じない規律が崩れる）。BOM・先頭空白・先頭コメントは飛ばす。
+  **中身で決める**ので `.txt` でも HTML なら HTML、`.html` でも PNG なら画像。
+- タスクウィンドウは HTML を `QWebEngineView` で開く。**柵は実測で確認済**（`tools/html_view_check.py`・
+  API コストゼロ・14項目 PASS）: ネット遮断 / 隣のファイルも読めない / `window.open` で窓が増えない /
+  `alert()` でモーダルに固まらない / off-the-record プロファイル / `QWebChannel` を使わない。
+- 依存は **`PySide6-Addons`**（`PySide6-Essentials` とは別・約169MB。AI が言う「PySide6-WebEngine」
+  という名前のパッケージは**存在しない**）。無ければ **HTML ソース表示**に落ちる（fail-soft）。
+- `QApplication` を作る**前**に `web_view.preinit()` を呼ぶ（`AA_ShareOpenGLContexts`）。
+  Live2D と同居して問題ないことを実起動で確認（Cubism 初期化・モデル読込とも正常）。
+- 能力の説明の**1文目**に HTML を入れた（`outward_actions()` は1文目しか応答LLM に渡さない＝E5 の穴）。
+  TaskAgent のプロンプトにも「触れるものは HTML にして show_on_screen / tkinter は使わない」を1行。
+
+**ユーザが操作中の窓は閉じない**（`TASKWIN_PROTECT_CLICKS` 既定3・ユーザ指定）:
+子ウィンドウを3回クリックしたら「操作中」と見なし、イブの `close_window` と機能 OFF 時の
+一括クローズから守る（**1回にしないのは誤クリック対策**）。停止処理だけは `force=True` で閉じる
+（プロセスごと終わるので残しても孤児になるだけ）。実装上の要点2つ:
+- 印は **loop 側の台帳にも置く**（`_ItemHandle.protected` → `store.close_viewers()` が見る）。
+  UI だけで守るとイブが「閉じた」と言いながら窓が残る＝嘘の報告になる。
+- 計数は**アプリ全体のイベントフィルタ**。HTML ビューのマウス入力は Chromium が作る内部
+  ウィジェットが受け取るので、子ウィンドウ自身に付けたフィルタには届かない（`QTest` で実測）。
+
+テスト `tests/test_html_view.py` 47件 + `tests/test_task_window.py` に10件追加。
+Tier-1 全体 **1310 PASS / FAIL 0**（2回連続）。
+
+**実起動での通し（2026-08-15・`tools/html_task_e2e.py`・実 API $0.66・6件すべて Done）**:
+
+| 依頼 | 秒 | 出た窓 | 報告 |
+|---|---|---|---|
+| 四則演算の電卓 | 23 | `calculator.html` = WebView | 簡易電卓を画面に出したよ |
+| クリックカウンタ | 19 | `click_counter.html` = WebView | クリックカウンターを画面に出したよ |
+| 好きなゲームの画像 | 29 | `favorite_game_title.html` = WebView | ← **劣化**（下記） |
+| PC の調子 | 15 | なし | メモリ使用率82%の高さだよ |
+| ポケモン図鑑300番の説明 | 71 | なし | エネコ + 図鑑説明（正解） |
+| ポケモン図鑑543番の高さ重さ | 21 | なし | フシデ 0.4m・5.3kg（正解） |
+
+**HTML 経路を足したことで見つかった劣化1件**: 「好きなゲームタイトルの**画像**を表示して」に
+対して **CSS で風景を描いた HTML** を出した（依頼された画像ではない）。「描いて済ませる」が
+魅力的になったため。`show_on_screen` の説明に**線を引いた**（触れるもの=HTML /
+実在するものの写真=`run_program` で取ってくる・絵で代用しない）。修正後の再実測では
+Stardew Valley の公式ページから `logo.png` を取得して**画像として**表示（窓は `QScrollArea`
+＝画像経路）、報告も「Stardew Valley のタイトル画像を表示したよ」と対象を名指しした。
+なお SVG を描いて済ませる挙動は**この変更の前にも出ていた**（`cheesecake.svg` / `okaka_onigiri.svg`）
+＝HTML 経路が作った問題ではなく、増幅した問題。
+
+**検索・PC状態の精度は落ちていない**（図鑑300/543 とも正解。PC状態も具体値つき）。
+1回だけ「どのゲームにする？」と聞き返して委譲しなかったランがある（応答LLM の揺れ。
+`outward_actions()` は description の1文目しか渡さないので、上記の追記は応答LLM には届かない
+＝聞き返しは本変更とは無関係）。
 
 #### 起動時間の短縮（実装済 2026-08-14・**33〜45秒 → 15.5秒**・2回連続で再現）
 

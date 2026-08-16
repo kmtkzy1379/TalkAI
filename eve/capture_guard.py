@@ -25,6 +25,19 @@ UI が画面に出ている間、イブの画面認識(VLM)は**自分のログ�
   （裁定 2026-08-13: 配信中は画面認識を使わない想定なので実運用で衝突しない）。
 - **実行中に ON/OFF を切り替えて元に戻せる**（実測: 除外 0.0% → 解除 92.1%）。
 - Windows 10 2004 以降。それ以前や非 Windows では何もせず False を返す（落とさない）。
+
+## 対象は2系統に分かれる（2026-08-15・ユーザ要望）
+以前は `UI_HIDE_FROM_CAPTURE` 1つで**メインウィンドウも表示物も**まとめて隠していた。
+そのため「イブに自分の UI は見せたくないが、**自分が出した表示物は見せたい**」
+（例: 電卓を作らせて、それを一緒に見ながら話す）ができなかった。scope で分ける:
+
+| scope | 対象 | 環境変数 |
+|---|---|---|
+| `UI` | メインウィンドウ（Live2D・ログ・設定） | `UI_HIDE_FROM_CAPTURE` |
+| `TASK` | タスクウィンドウと別プロセスのビューア | `TASKWIN_HIDE_FROM_CAPTURE` |
+
+どちらも既定 ON（従来の挙動と同じ）。`TASK` を OFF にすると、イブは**自分が画面に
+出したもの**を画面認識で見られるようになる（自分の UI は隠れたまま）。
 """
 from __future__ import annotations
 
@@ -37,10 +50,20 @@ logger = logging.getLogger(__name__)
 WDA_NONE = 0x00000000
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
-_ENV = "UI_HIDE_FROM_CAPTURE"
+UI = "ui"        # メインウィンドウ
+TASK = "task"    # タスクウィンドウ + 別プロセスのビューア
+
+_ENV = "UI_HIDE_FROM_CAPTURE"        # scope=UI の環境変数（旧 API 互換のため名前を残す）
+_ENV_BY_SCOPE = {UI: _ENV, TASK: "TASKWIN_HIDE_FROM_CAPTURE"}
+_STATE_BY_SCOPE = {UI: "eve_capture_guard.state", TASK: "eve_capture_guard_task.state"}
 
 _user32 = None
 _EnumProc = None
+
+
+def env_name(scope: str = UI) -> str:
+    """scope に対応する環境変数名（知らない scope は UI 扱い＝落とさない）。"""
+    return _ENV_BY_SCOPE.get(scope, _ENV)
 
 
 def _api():
@@ -78,14 +101,15 @@ def available() -> bool:
     return _api() is not None
 
 
-def enabled_by_env(default: bool = True) -> bool:
-    """`UI_HIDE_FROM_CAPTURE` の解釈。子プロセス（ビューア）は環境変数を継承して読む。
+def enabled_by_env(scope: str = UI, default: bool = True) -> bool:
+    """環境変数の解釈。子プロセス（ビューア）は環境変数を継承して読む。
 
     既定は **ON**。この設定は機能フラグではなく**ガード**で、OFF は「イブが自分の画面を
     見てしまう既知の不具合状態」だから（`CLAUDE.md` の「機能フラグはコード既定 off」は
-    能力の話で、ここは当てはまらない）。
+    能力の話で、ここは当てはまらない）。ただし scope=TASK の OFF は不具合ではなく
+    「自分が出したものを自分でも見る」という意図的な使い方（電卓を一緒に見る等）。
     """
-    raw = os.environ.get(_ENV)
+    raw = os.environ.get(env_name(scope))
     if raw is None:
         return default
     return raw.strip() not in ("0", "false", "False", "no", "")
@@ -141,41 +165,45 @@ def set_own_windows(hide: bool) -> int:
         return 0
 
 
-def state_path():
+def state_path(scope: str = UI):
     """設定の共有先。**別プロセスの窓には親から適用できない**ので、状態だけを共有して
     各プロセスが自分で適用する（環境変数は起動時に固定されるので実行中の切替に使えない）。
 
     一時ディレクトリに置く: 作業フォルダに置くと `list_files` に見えてイブの視界に入り、
     リポジトリに置くと gitignore の管理が増える。落ちても既定に倒れるだけなので永続性は不要。
+
+    **scope ごとに別ファイル**にする（1ファイルに2値を詰めると、片方だけ書いた古い
+    プロセスが他方を巻き添えで戻す）。ビューアが読むのは `TASK` だけ。
     """
     import tempfile
     from pathlib import Path
 
-    return Path(tempfile.gettempdir()) / "eve_capture_guard.state"
+    return Path(tempfile.gettempdir()) / _STATE_BY_SCOPE.get(scope, _STATE_BY_SCOPE[UI])
 
 
-def publish(hide: bool) -> None:
+def publish(hide: bool, scope: str = UI) -> None:
     """今の設定を子プロセス（ビューア）へ共有する。失敗しても無視（見た目だけの機能）。"""
     try:
-        state_path().write_text("1" if hide else "0", encoding="ascii")
+        state_path(scope).write_text("1" if hide else "0", encoding="ascii")
     except OSError:
         logger.debug("capture_guard: 状態の共有に失敗", exc_info=True)
 
 
-def desired(default: bool = True) -> bool:
+def desired(scope: str = UI, default: bool = True) -> bool:
     """今あるべき状態。共有ファイル → 環境変数 → 既定 の順に見る。"""
     try:
-        raw = state_path().read_text(encoding="ascii").strip()
+        raw = state_path(scope).read_text(encoding="ascii").strip()
         if raw in ("0", "1"):
             return raw == "1"
     except OSError:
         pass
-    return enabled_by_env(default)
+    return enabled_by_env(scope, default)
 
 
-def describe(hide: bool) -> str:
+def describe(hide: bool, scope: str = UI) -> str:
     """UI に出す短い説明（状態の取り違えを防ぐため、効果を明示する）。"""
     if not available():
         return "キャプチャ除外はこの環境では使えません"
-    return ("イブの画面認識から隠しています（OBS からも映りません）" if hide
-            else "イブの画面認識に映ります（OBS にも映ります）")
+    what = "このウィンドウ" if scope == UI else "タスクウィンドウと表示ビューア"
+    return (f"{what}をイブの画面認識から隠しています（OBS からも映りません）" if hide
+            else f"{what}はイブの画面認識に映ります（OBS にも映ります）")

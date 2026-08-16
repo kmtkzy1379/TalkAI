@@ -79,7 +79,7 @@ class ContextAssembler:
     def _build_system(self, *, rag_chunks, last_feedback, vision, speech_decision_reason, now,
                       callfunction_result=None, tools_active=False, active_tasks=None,
                       last_feedback_iso=None, session_gap_sec=None, capabilities=None,
-                      features_off=None) -> str:
+                      features_off=None, self_model=None) -> str:
         parts: list[str] = []
         if self.system_prompt:
             parts.append(self.system_prompt)
@@ -96,6 +96,13 @@ class ContextAssembler:
                   "という言い方をする。切り替えるのはユーザなので、必要そうなら"
                   "「点けてくれたらできるよ」と伝えてよい。勝手に点けることはできない。）"
             )
+        if self_model:
+            # **`# 参照`(RAG) とは別枠にする**。あちらには「今の会話に絡める」という指示が
+            # 付いており、それが 52日前の「チーズケーキが美味しそう」を“イブの好物”に
+            # 格上げした引力の正体だった（実機事故 2026-08-15 02:41）。ここは絡めさせず、
+            # 聞かれた時に同じ答えを返すための台帳として置く。長さはコード側で有界
+            # （`memory/self_model.py` の閉じたスロット × 最大2件）。
+            parts.append(self_model)
         if rag_chunks:
             lines = [
                 f"[{'話題の種' if c.as_topic_seed else '過去の記憶'}/"
@@ -287,6 +294,7 @@ class ContextAssembler:
         capabilities: list[str] | None = None,  # D3: 外の世界に手を出せる手段（registry 導出）
         prev_session_gap_sec: float | None = None,  # D1: 前セッション最終発話からの経過秒
         features_off: list[str] | None = None,  # UI: 今オフにしている機能（「無い」とは言わせない）
+        self_model: str | None = None,  # イブ自身の好み（`memory/self_model.py` の render()）
         now: Stamp | None = None,
     ) -> list[dict]:
         now = now or Stamp.now()
@@ -307,7 +315,7 @@ class ContextAssembler:
                     callfunction_result=callfunction_result, tools_active=tools_active,
                     active_tasks=active_tasks, last_feedback_iso=last_feedback_iso,
                     session_gap_sec=gap, capabilities=capabilities,
-                    features_off=features_off,
+                    features_off=features_off, self_model=self_model,
                 ),
             }
         ]

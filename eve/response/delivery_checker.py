@@ -1,51 +1,51 @@
-"""J-2 P1-1 — 配達確認サイドカー（CancelResolver の近クローン・別コルーチン）。
+"""配達確認サイドカー（**決定論の関門 + 曖昧な時だけ賢い判定LLM**）。
 
-実機事故(2026-07-18 E2E S2): 検索完了の報告ターンが、直前の未応答ユーザ発話への返事を
-優先し、報告内容(payload.content)を一度も発話せずに正常完了した（barge-in ではないため
-既存の `_maybe_redeliver`(世代変化/CancelledError 専用)は対象外＝検出装置が無かった）。
+発端の実機事故(2026-07-18 E2E S2): 検索完了の報告ターンが、直前の未応答ユーザ発話への返事を
+優先し、報告内容(payload.content)を一度も発話せずに正常完了した（barge-in ではないため既存の
+`_maybe_redeliver`(世代変化/CancelledError 専用)は対象外＝検出装置が無かった）。
 
-ここでは barge-in なしで完了した CALLFUNCTION_RESULT ターンについて、実際の発話が
-報告内容を伝えたか、安価な LLM に3択で確認させる:
-  - delivered: 内容を伝えた（言い換え/要約でもよい）
-  - withheld : ユーザの取消/中止等により意図的に控えた（例: 「わかった、やめておくね」）
-  - forgotten: 伝えておらず、控える理由も無い（別の話への返事だけ等）
-forgotten の時だけ、既存の再配達経路(redeliver_fn)をそのまま再利用して再送する
-（attempts 上限・dedup_key は redeliver_fn 側/StimulusQueue 側の既存契約に委ねる）。
+**なぜ LLM 判定をやめたか（裁定 2026-08-15・実機事故 02:44）**:
+報告「（任せてくれたタスク）表示したよ。」に対し実発話も「表示したよ。」＝**ほぼ完全一致**なのに
+判定LLM(既定 gpt-4o-mini)が `forgotten` を返し、再配達→応答LLM が謝罪ごと作り直して**二重回答**に
+なった。同経路の成功2件（「チーズケーキの画像を表示したよ。」等）との唯一の差は**照合できる
+内容語の有無**だった。判定は毎回 LLM を呼ぶ構造で、完全一致でも確率的に falseに倒れ得た。
+パイプライン中で**最も弱いモデルが最も強い権限（再依頼）を持つ**構図でもあった。
 
-判定不能（LLM失敗/出力不明瞭）は **delivered 扱い**（安全側＝過剰な再配達をしない。
-v1 教訓: 不明瞭を speak/redeliver 側に倒すと暴走する）。
+**なぜ全部を決定論にしなかったか（ユーザ指摘 2026-08-15）**:
+語の一致だけで見ると、報告「チーズケーキの画像を表示したよ」に対して実発話「やったよ」が
+「未配達」に倒れ、**不要な再配達＝直そうとしていた二重発話そのもの**を生む。しかも同じ
+「語が重ならない」形でも、報告「東京の明日の天気は雨だよ」×発話「うん、そうみたい」は
+**中身が本当に届いていない**ので再配達が正しい。差は「文脈から要点を復元できるか」であり、
+語の一致では原理的に判別できない。よってそこだけ判定LLM に渡す。
+
+構成:
+  1. 一文字も喋っていない              → not_conveyed（決定論・確実）
+  2. 報告文（定型接頭辞を除く）を丸ごと含む → delivered（決定論）
+  3. 報告に**内容語が無い**             → delivered（決定論。照合材料が無い。ここで再配達すると
+     応答LLM は文脈で埋めるしかなく＝**捏造を強制する**。02:44 の事故がまさにこれ）
+  4. 内容語が1つでも重なる             → delivered（決定論・緩め＝ユーザ裁定）
+  5. 内容語が1つも重ならない           → **判定LLM に聞く**（迷ったら delivered）
+
+この形なら 02:44 の事故は規則3で**確率に依らず**消え、LLM が呼ばれるのは稀な5だけになる。
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
-from ..pipeline.stimulus import CallFunctionResult, Stimulus, StimulusKind
+from ..pipeline.stimulus import (
+    REDELIVER_NOT_CONVEYED,
+    CallFunctionResult,
+    Stimulus,
+    StimulusKind,
+)
+from ..text_match import content_tokens, strip_report_prefix
 
 logger = logging.getLogger(__name__)
-
-DELIVERY_CHECK_SYSTEM = (
-    "あなたはAI VTuber「イブ」の報告配達の確認係です。イブには機能実行結果（報告すべき内容）が渡され、"
-    "直後にイブが実際に発話しました。次の3択で判定し、1語だけ返してください:\n"
-    "- delivered: 発話が報告内容の要点をユーザに伝えている（言い換え・要約でもよい）\n"
-    "- withheld: ユーザが直前に不要・中止と言ったため、報告を意図的に控えた（その旨の発話がある）\n"
-    "- forgotten: 報告内容を伝えておらず、控える理由もない（別の話への返事だけ等）\n"
-    "出力は delivered / withheld / forgotten のどれか1語のみ。"
-)
-
-_VERDICTS = ("delivered", "withheld", "forgotten")
-
-
-def parse_delivery_verdict(text: Optional[str]) -> str:
-    """判定LLM出力→verdict。解析失敗/不明瞭は 'delivered'（安全側・過剰な再配達をしない）。"""
-    t = (text or "").strip().lower()
-    for v in _VERDICTS:
-        if v in t:
-            return v
-    return "delivered"
 
 
 def _g(o, k):
@@ -60,6 +60,68 @@ def _content(resp) -> str:
     return (_g(msg, "content") or "") if msg is not None else ""
 
 
+VERDICT_DELIVERED = "delivered"
+VERDICT_UNSURE = "unsure"  # 決定論では決められない＝判定LLM に聞く
+
+
+def decide_delivery_fast(report: str, spoken: str) -> str:
+    """決定論で確定できる分だけ判定する。決められなければ `VERDICT_UNSURE`。
+
+    ここで確定するのは「LLM に聞くまでもない」ケースだけ。**02:44 の事故（報告と発話が
+    ほぼ一致しているのに forgotten）はここで確定するので、確率的に揺れる余地が無い**。
+    """
+    core = strip_report_prefix(report)
+    said = (spoken or "").strip()
+    if not said:
+        return REDELIVER_NOT_CONVEYED  # 1) 一文字も喋っていない＝確実に未配達
+    if core and core in said:
+        return VERDICT_DELIVERED       # 2) 報告文を丸ごと言った
+    want = content_tokens(core)
+    if not want:
+        # 3) 報告に照合できる内容語が無い（例「表示したよ。」）。ここで再配達しても応答LLM は
+        #    文脈で埋めるしかない＝**捏造を強制する**。伝えるべき中身が無い以上、済み扱いにする。
+        return VERDICT_DELIVERED
+    if want & content_tokens(said):
+        return VERDICT_DELIVERED       # 4) 要点の語が発話に出ている（言い換え可）
+    # 5) 語が一つも重ならない。ここは**二分できない**:
+    #    「東京の明日の天気は雨だよ」×「うん、そうみたい」＝中身が届いておらず再配達が正しい。
+    #    「チーズケーキの画像を表示したよ」×「やったよ」＝直前にユーザ自身が頼んでおり文脈で
+    #    通じている＝再配達は不要（ユーザ指摘 2026-08-15）。
+    #    差は「文脈から要点を復元できるか」で、語の一致では原理的に判別できない → LLM に聞く。
+    return VERDICT_UNSURE
+
+
+# 判定LLM は**この分岐でしか呼ばれない**（＝実測ではほぼ発火しない）ので、安さより賢さを取る。
+# 既定を旧 gpt-4o-mini から上げた理由: 02:44 の誤判定を出したのがその世代で、しかも
+# 「パイプラインで最も弱いモデルが最も強い権限（再依頼）を持つ」構図になっていたため。
+DELIVERY_CHECK_SYSTEM = (
+    "あなたはAI VTuber「イブ」の報告が、ユーザに伝わったかを見る確認係です。\n"
+    "イブには機能実行結果（報告すべき内容）が渡され、直後にイブが実際に発話しました。\n"
+    "**判定は緩めに。迷ったら conveyed（伝わった）にしてください。**\n"
+    "- conveyed: 報告の要点が伝わっている。**言い換え・要約・指示語でもよい**。"
+    "ユーザが直前に自分で頼んでいて、短い返事（「やったよ」「出しといたよ」等）でも"
+    "何のことか文脈で分かるなら conveyed。\n"
+    "- not_conveyed: 報告に含まれる**具体的な中身（調べた結果・数値・事実）がユーザに一切"
+    "届いていない**場合だけ。例: 天気を調べた報告なのに天気に触れず別の話だけをした。\n"
+    "出力は conveyed / not_conveyed のどちらか1語のみ。"
+)
+
+
+def parse_delivery_verdict(text: Optional[str]) -> str:
+    """判定LLM出力→verdict。解析失敗/不明瞭は delivered（安全側＝過剰な再配達をしない）。"""
+    t = (text or "").strip().lower()
+    # "not_conveyed" は "conveyed" を部分文字列に含むので**先に**見る。
+    if "not_conveyed" in t or "not conveyed" in t:
+        return REDELIVER_NOT_CONVEYED
+    return VERDICT_DELIVERED
+
+
+def _summarize(text: str, limit: int = 24) -> str:
+    """ログ用の短縮（改行を潰す）。診断のために報告/発話の頭を残す。"""
+    t = re.sub(r"\s+", " ", (text or "").strip())
+    return t[:limit] + ("…" if len(t) > limit else "")
+
+
 @dataclass
 class DeliveryCheckRequest:
     stimulus: Stimulus
@@ -69,7 +131,12 @@ class DeliveryCheckRequest:
 
 
 class DeliveryChecker:
-    """single-flight サイドカー（FeedbackWorker/CancelResolver と同形）。既定 no-op（未 start）。"""
+    """single-flight サイドカー（FeedbackWorker/CancelResolver と同形）。既定 no-op（未 start）。
+
+    LLM を持たないので判定自体は同期で終わるが、**サイドカーの形は維持する**:
+    `orchestrator.handle` を1マイクロ秒もブロックしない契約と、再配達の put が
+    `voice_loop._redeliver_stimulus`（STT 猶予つき）経由であることを変えないため。
+    """
 
     def __init__(self, *, model_registry, redeliver_fn, max_attempts: int) -> None:
         self._model = model_registry
@@ -116,10 +183,10 @@ class DeliveryChecker:
             finally:
                 self._inbox.task_done()
 
-    async def _handle_one(self, req: DeliveryCheckRequest) -> None:
-        payload = req.stimulus.payload
-        if not isinstance(payload, CallFunctionResult):
-            return
+    async def _ask_llm(self, req: DeliveryCheckRequest, payload: CallFunctionResult) -> str:
+        """曖昧な分岐だけ判定LLM に聞く。失敗・不明瞭は delivered（安全側）。"""
+        if self._model is None:
+            return VERDICT_DELIVERED  # 未配線＝過剰な再配達に倒さない
         messages = [
             {"role": "system", "content": DELIVERY_CHECK_SYSTEM},
             {"role": "user", "content": (
@@ -130,23 +197,41 @@ class DeliveryChecker:
         ]
         try:
             resp = await self._model.complete("delivery_check", messages)
-            verdict = parse_delivery_verdict(_content(resp))
         except Exception:
             logger.exception("配達確認 LLM 失敗（再配達しない・安全側）")
+            return VERDICT_DELIVERED
+        return parse_delivery_verdict(_content(resp))
+
+    async def _handle_one(self, req: DeliveryCheckRequest) -> None:
+        payload = req.stimulus.payload
+        if not isinstance(payload, CallFunctionResult):
             return
-        logger.info("📮 配達確認: %s (dedup=%s)", verdict, req.stimulus.dedup_key)
-        if verdict != "forgotten":
+        verdict = decide_delivery_fast(payload.content, req.spoken_text)
+        asked = verdict == VERDICT_UNSURE
+        if asked:
+            verdict = await self._ask_llm(req, payload)
+        logger.info(
+            "📮 配達確認: %s%s (dedup=%s) 報告=%r 発話=%r",
+            verdict, "(LLM判定)" if asked else "", req.stimulus.dedup_key,
+            _summarize(payload.content), _summarize(req.spoken_text),
+        )
+        if verdict != REDELIVER_NOT_CONVEYED:
             return
         if payload.attempts >= self._max_attempts:
-            logger.warning("⚠ 配達確認で forgotten だが再配達上限のため断念: %.40s", payload.content)
+            logger.warning("⚠ 配達確認で未配達だが再配達上限のため断念: %.40s", payload.content)
             return
         if self._redeliver_fn is None:
             return
         retry = Stimulus(
             kind=StimulusKind.CALLFUNCTION_RESULT,
-            payload=CallFunctionResult(payload.function_name, payload.content, payload.ok, payload.attempts + 1),
+            payload=CallFunctionResult(
+                payload.function_name, payload.content, payload.ok, payload.attempts + 1,
+                # barge-in ではない＝「遮られた」と言ってはいけない（02:44 の二重回答の原因）。
+                REDELIVER_NOT_CONVEYED,
+            ),
             dedup_key=req.stimulus.dedup_key,
         )
+        logger.info("🔁 報告を再配達予約（未配達・%d回目）: %.40s", payload.attempts + 1, payload.content)
         # ターンは既に完了済み（audio.join 後）＝put 直前に再考すべきレースは無い
         # （barge-in 用の delivered() クロージャと違い、ここでの spoken は既に確定している）。
         self._redeliver_fn(retry, lambda: False)

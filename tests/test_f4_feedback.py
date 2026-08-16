@@ -25,6 +25,8 @@ from eve.feedback import (  # noqa: E402
     PredictionState,
     parse_feedback,
 )
+from eve.feedback.feedback_llm import render_chunk_text, sanitize_result  # noqa: E402
+from eve.stt.askback import ASK_BACK_LINES, UNINTELLIGIBLE_PLACEHOLDER  # noqa: E402
 from eve.feedback.prompts import build_messages, build_user_text  # noqa: E402
 from eve.memory import ConversationCache, RagStore  # noqa: E402
 from eve.memory.embed import Embedder  # noqa: E402
@@ -507,6 +509,106 @@ async def t_shutdown_recovery() -> bool:
     return fb.state.watermark is None and len(leftover) == 2 and len(store) == 0
 
 
+async def t_askback_span_not_reflected() -> bool:
+    """聞き取り失敗＋その聞き返しだけのスパンは RAG に入れない（ユーザ裁定 2026-08-15）。
+
+    中身ゼロのチャンクは検索を汚し、無言時の「話題の種」(RAG_RANDOM_K) として引かれると
+    最悪。ただし**会話履歴には残す**（聞き返しの原因を消すと次ターンで自答になる）ので、
+    除外はここで行う。watermark は進める＝同じスパンを永久に再試行しない。
+    """
+    cache = _cache()
+    store = _store()
+    cache.add_turn("user", UNINTELLIGIBLE_PLACEHOLDER)
+    cache.add_turn("eve", ASK_BACK_LINES[0])
+    fb = FeedbackLLM(_reg_const("summary: 聞き返しただけ\ntags: 雑談"),
+                     rag_store=store, prediction_state=PredictionState())
+    worker = FeedbackWorker(fb, cache)
+    worker.start()
+    worker.trigger()
+    await asyncio.sleep(0.05)
+    await worker.stop()
+    # RAG は増えず、watermark は進む（次の本物の会話から再開できる）
+    return len(store) == 0 and cache.turns_since(fb.state.watermark) == []
+
+
+async def t_askback_mixed_span_is_reflected() -> bool:
+    """聞き返しに**本物の会話が続いた**スパンは通常どおり内省する（過剰に捨てない）。"""
+    cache = _cache()
+    store = _store()
+    cache.add_turn("user", UNINTELLIGIBLE_PLACEHOLDER)
+    cache.add_turn("eve", ASK_BACK_LINES[0])
+    cache.add_turn("user", "ごめん、好きな食べ物の話ね")
+    cache.add_turn("eve", "うん、聞かせて。")
+    fb = FeedbackLLM(_reg_const("summary: 食べ物の話に戻った\ntags: 食べ物"),
+                     rag_store=store, prediction_state=PredictionState())
+    worker = FeedbackWorker(fb, cache)
+    worker.start()
+    worker.trigger()
+    await asyncio.sleep(0.05)
+    await worker.stop()
+    return len(store) == 1
+
+
+# ---- 別言語混入の検査（実データ 2026-08-15 rag_memory.jsonl:72/84/299 の回帰） ----
+#
+# 実際に永続化されていた文字列をそのまま使う。うち299行目は 02:45 のターンで応答LLM の
+# `# 参照` に注入されていた＝壊れた日本語を毎回読ませていた。
+
+_SRC = "今日はごはんもう決めた？\nこの前出ていた生姜焼き定食が急に食べたくなるね。"
+
+
+def t_sanitize_drops_ungrounded_foreign() -> bool:
+    r = parse_feedback(
+        "summary: イブは生姜焼き定食が食べたくなると話した\n"
+        "emotion: शांतかつ少し名残惜しい\n"
+        "next_prediction: ユーザは今日のごはんや生姜焼き定食の話題に प्रतिक्रियाするかもしれない\n"
+        "surprise: 50\n"
+        "tags: ごはん,生姜焼き\n"
+    )
+    out = sanitize_result(r, _SRC)
+    return (
+        "शांत" not in out.emotions
+        and "प्रतिक्रिया" not in out.next_prediction
+        # 日本語部分は残る（丸ごと捨てない）
+        and "名残惜しい" in out.emotions
+        and "生姜焼き定食の話題に" in out.next_prediction
+        and out.prediction_diff == 50
+    )
+
+
+def t_sanitize_keeps_grounded_foreign() -> bool:
+    # 実データに「『수도권』は韓国語で首都圏って意味だよ」がある。会話に出ている語は残す。
+    src = "「수도권」って何？\n「수도권」は韓国語で「首都圏」って意味だよ。"
+    r = parse_feedback("summary: ユーザが「수도권」の意味を尋ね、イブが首都圏だと答えた\ntags: 韓国語,수도권\n")
+    out = sanitize_result(r, src)
+    return "수도권" in out.summary and "수도권" in out.topic_tags
+
+
+def t_sanitize_drops_foreign_only_tag() -> bool:
+    # `topic_tags: [..., "短文 प्रतिक्रिया"]`（実レコード84行目）の形。
+    r = parse_feedback("summary: 短い相槌が続いた\ntags: 雑談,言い淀み,प्रतिक्रिया\n")
+    out = sanitize_result(r, "うん。\nそうだね。")
+    return out.topic_tags == ["雑談", "言い淀み"]
+
+
+def t_sanitize_noop_on_clean() -> bool:
+    r = parse_feedback(
+        "summary: ユーザが好きな食べ物の画像を求めた\nemotion: 楽しみ\n"
+        "user_emotion: 期待\nnext_prediction: 画像への感想が来るかもしれない\n"
+        "surprise: 20\nreason: 直近の流れどおり\ntags: 食べ物,画像\n")
+    out = sanitize_result(r, "好きな食べ物の画像出してくれない？")
+    return (out.summary == r.summary and out.emotions == r.emotions
+            and out.next_prediction == r.next_prediction and out.reason == r.reason
+            and out.topic_tags == r.topic_tags and out.prediction_diff == r.prediction_diff)
+
+
+def t_sanitize_reaches_chunk_text() -> bool:
+    # RAG に書かれる本文（render_chunk_text）まで到達していないことを確認する。
+    r = parse_feedback("summary: 生姜焼きの話\nemotion: イブ=शांत\nsurprise: 10\n")
+    text = render_chunk_text(sanitize_result(r, _SRC))
+    return "शांत" not in text and "生姜焼き" in text
+
+
 async def main() -> None:
     # B1
     check("B1 PredictionState 既定値", t_predstate_defaults())
@@ -540,6 +642,15 @@ async def main() -> None:
     # B7
     check("B7 起動 catch-up(未処理 tail を取り戻す)", await t_startup_catchup())
     check("B7 shutdown 中断は watermark 未前進で回収可能", await t_shutdown_recovery())
+    # 聞き返しターンの扱い
+    check("聞き返し: 失敗ターンだけのスパンは RAG に入れない", await t_askback_span_not_reflected())
+    check("聞き返し: 本物の会話が続けば通常どおり内省する", await t_askback_mixed_span_is_reflected())
+    # 別言語混入の検査（実データ 2026-08-15 の回帰）
+    check("混入: 根拠の無い別言語を落とす(実レコード再現)", t_sanitize_drops_ungrounded_foreign())
+    check("混入: 会話に根拠がある別言語は残す", t_sanitize_keeps_grounded_foreign())
+    check("混入: 丸ごと別言語のタグは消える", t_sanitize_drops_foreign_only_tag())
+    check("混入: 通常の内省は素通り(壊さない)", t_sanitize_noop_on_clean())
+    check("混入: RAG 本文にも残らない", t_sanitize_reaches_chunk_text())
 
 
 if __name__ == "__main__":

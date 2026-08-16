@@ -335,6 +335,60 @@ async def t_delegate_task_capability():
     )
 
 
+# ---- 報告の実質チェック（実機事故 2026-08-15 02:44 の回帰） ----
+
+async def t_substance_repairs_contentless_report():
+    # 最終答が「表示したよ。」（内容語ゼロ）→ もう1回だけ LLM を呼んで対象を補う。
+    model = FakeModel([
+        _resp(tool_calls=[_tc("c1", "self_status")]),
+        _resp(content="表示したよ。"),
+        _resp(content="りんごの画像を表示したよ。"),  # 補修呼び出しの応答
+    ])
+    reg = FakeReg({"self_status": "ok"})
+    agent = TaskAgent(registry=reg, model_registry=model, store=CancelStore())
+    out = await agent.run("ネットからイブの好きな食べ物の画像を取り寄せて画面に表示して", "t")
+    return out == "りんごの画像を表示したよ。" and model.calls == 3
+
+
+async def t_substance_skips_when_report_has_content():
+    # 通常ケース（対象が入っている）は**追加の LLM 呼び出しをしない**＝コスト増ゼロ。
+    model = FakeModel([_resp(content="ラーメンの画像を表示したよ。")])
+    agent = TaskAgent(registry=FakeReg({}), model_registry=model, store=CancelStore())
+    out = await agent.run("好きな食べ物の画像を表示して", "t")
+    return out == "ラーメンの画像を表示したよ。" and model.calls == 1
+
+
+async def t_substance_leaves_honest_failure_alone():
+    # 「（…」始まりは executor が Failed 判定に使う＝言い直すと成否が反転するので触らない。
+    model = FakeModel([_resp(content="（画像を取ってこられなかった）")])
+    agent = TaskAgent(registry=FakeReg({}), model_registry=model, store=CancelStore())
+    out = await agent.run("画像を出して", "t")
+    return out == "（画像を取ってこられなかった）" and model.calls == 1
+
+
+async def t_substance_falls_back_when_repair_bad():
+    # 補修結果が「（」始まり/内容語ゼロなら採用しない（no-op 規律で元のまま）。
+    for bad in ("（わからない）", "やったよ。"):
+        model = FakeModel([_resp(content="表示したよ。"), _resp(content=bad)])
+        agent = TaskAgent(registry=FakeReg({}), model_registry=model, store=CancelStore())
+        if await agent.run("画像を出して", "t") != "表示したよ。":
+            return False
+    return True
+
+
+async def t_substance_llm_exception_safe():
+    # 補修 LLM が落ちても元の報告で続行する（タスク自体は成功しているので潰さない）。
+    class Boom(FakeModel):
+        async def complete(self, role, messages, tools=None):
+            self.calls += 1
+            if self.calls == 1:
+                return _resp(content="表示したよ。")
+            raise RuntimeError("api down")
+    model = Boom([])
+    agent = TaskAgent(registry=FakeReg({}), model_registry=model, store=CancelStore())
+    return await agent.run("画像を出して", "t") == "表示したよ。" and model.calls == 2
+
+
 async def main():
     check("Agent: 基本ループ(object形)→最終答", await t_agent_loop_basic_object_path())
     check("Agent: 2手(pc→self)→要約", await t_agent_two_step_then_final())
@@ -349,6 +403,11 @@ async def main():
     check("Executor: goal が None→取消破棄", await t_executor_goal_cancel_discard())
     check("Executor: agent 無し goal→Failed", await t_executor_goal_no_agent_fails())
     check("capabilities: delegate_task(goal/markers)", await t_delegate_task_capability())
+    check("実質: 内容語ゼロの報告に対象を補う(回帰2026-08-15)", await t_substance_repairs_contentless_report())
+    check("実質: 対象がある報告は追加LLM呼び出し無し", await t_substance_skips_when_report_has_content())
+    check("実質: 正直な失敗報告(（…)は触らない", await t_substance_leaves_honest_failure_alone())
+    check("実質: 補修結果が不良なら元のまま(no-op)", await t_substance_falls_back_when_repair_bad())
+    check("実質: 補修LLM例外でも元の報告で継続", await t_substance_llm_exception_safe())
 
 
 asyncio.run(main())

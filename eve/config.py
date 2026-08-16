@@ -82,6 +82,9 @@ class Config:
 
     # 長期記憶（F3.5 RAG / 連想想起）
     RAG_FILE = os.getenv("RAG_FILE", "rag_memory.jsonl")  # 永続 JSONL（埋め込み込み）
+    # 自己モデル（イブの好み・趣向の台帳）。会話から自己形成サイドカーが育てる。
+    SELF_MODEL_ENABLED = os.getenv("SELF_MODEL_ENABLED", "0") == "1"
+    SELF_MODEL_FILE = os.getenv("SELF_MODEL_FILE", "self_model.jsonl")
     RAG_MAX_CHUNKS = int(os.getenv("RAG_MAX_CHUNKS", "500"))  # ロケット鉛筆の上限
     RAG_TOP_K = int(os.getenv("RAG_TOP_K", "3"))  # 注入する記憶件数（top-1必須+MMR）
     # 埋め込み backend（ruri=ローカル日本語特化 / openai=API）。STT と同じ差替え方式。
@@ -193,6 +196,13 @@ class Config:
     # 有効な間は OBS 等の画面キャプチャからも消えるので、配信時は OFF にする
     # （裁定 2026-08-13: 配信中は画面認識を使わない想定なので実運用で衝突しない）。
     UI_HIDE_FROM_CAPTURE = os.getenv("UI_HIDE_FROM_CAPTURE", "1") not in ("0", "false", "no")
+    # **タスクウィンドウ（と別プロセスのビューア）は別扱い**（2026-08-15）。
+    # 以前は上の1つで両方を隠していたため、「自分の UI は見せたくないが、**自分が出した
+    # 表示物は見せたい**」（例: 作らせた電卓を一緒に見ながら話す）ができなかった。
+    # 既定は ON＝従来と同じ挙動。OFF にしても隠れるのはメインウィンドウのままで、
+    # イブが見えるようになるのは**自分が出したもの**だけ（自己観察ループの本体は残る）。
+    TASKWIN_HIDE_FROM_CAPTURE = os.getenv(
+        "TASKWIN_HIDE_FROM_CAPTURE", "1") not in ("0", "false", "no")
     # ウィンドウを常に最前面に出す（既定 off）。作業しながら顔を見たい時に使う。
     UI_ALWAYS_ON_TOP = os.getenv("UI_ALWAYS_ON_TOP", "0") == "1"
 
@@ -265,6 +275,14 @@ class Config:
     # （UI が `viewer_open_fn` を差さないので自動的に別プロセスへ落ちる）。UI から即時に
     # 切り替えられる（再登録不要）。
     WS_VIEWER_MODE = os.getenv("WS_VIEWER_MODE", "window")
+    # タスクウィンドウで HTML を**動かして**表示する（既定 ON・PySide6-Addons が要る）。
+    # イブに「押せるもの」を作らせる唯一の経路（サンドボックスで GUI は出せない＝意図的）。
+    # 入っていなければ自動で HTML ソースの表示に落ちる（fail-soft）ので、OFF にするのは
+    # WebEngine が環境で問題を起こす時の逃げ道。
+    TASKWIN_HTML_ENABLED = os.getenv("TASKWIN_HTML_ENABLED", "1") not in ("0", "false", "no")
+    # 子ウィンドウを何回クリックしたら「ユーザが操作中」と見なすか（既定 3）。
+    # 1回だと誤クリックで居座るため（ユーザ指定 2026-08-15）。0 で保護を切る。
+    TASKWIN_PROTECT_CLICKS = int(os.getenv("TASKWIN_PROTECT_CLICKS", "3"))
 
     @classmethod
     def validate(cls) -> list[str]:

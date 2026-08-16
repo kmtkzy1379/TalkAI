@@ -38,7 +38,11 @@ from .response.player import RealAudioPlayer
 from .response.style import SPEECH_STYLE
 from .response.tts import VoicevoxTTS
 from .speech import SilenceMonitor, SpeechDecider, SpeechState, make_decide_fn
+from .memory.self_model import SelfModelStore
+from .persona import load_persona, persona_path
+from .self_model.worker import SelfModelWorker
 from .stt import make_stt
+from .stt.askback import UNINTELLIGIBLE_PLACEHOLDER, AskBackPicker
 from .vlm import ChangeDetector, VisionState, VlmWorker, make_narrate_fn
 from .vlm.capture import ScreenCapture
 from .vlm.capture_thread import CaptureThread
@@ -83,6 +87,15 @@ class VoiceLoop:
         # 埋め込みは RAG と自発発話の同内容抑制（意味の重複）で共有する（モデルの二重ロードを避ける）。
         self.embedder = make_embedder()
         self.rag = RagStore(self.embedder)  # 長期記憶（連想想起）
+        # 自己モデル（イブの好み・趣向）。**性格はここに入らない**（ペルソナ=persona.md の担当）。
+        # 既定 off。ON なら応答文脈と TaskAgent の両方に `# イブ自身のこと` が渡る。
+        self.self_model = None
+        self.self_model_worker = None
+        if Config.SELF_MODEL_ENABLED:
+            self.self_model = SelfModelStore(Config.SELF_MODEL_FILE)
+            self.self_model_worker = SelfModelWorker(
+                model_registry=self.registry, store=self.self_model, cache=self.cache,
+            )
 
         # F4 内分泌系: 各応答後に非同期で内省 → RAG 書込 + surprise + 直近フィードバック注入。
         self.prediction = PredictionState()  # loop 所有・単一書込（feedback/VLM が書く）
@@ -184,6 +197,8 @@ class VoiceLoop:
             task_agent = TaskAgent(
                 registry=self.capabilities, model_registry=self.registry, store=self.task_store,
                 max_steps=Config.TASK_AGENT_MAX_STEPS, timeout_sec=Config.TASK_AGENT_TIMEOUT_SEC,
+                # goal の「イブの好きな〜」を受け手側で解決できるようにする（会話履歴は渡さない）。
+                self_model_fn=(lambda: self.self_model.render()) if self.self_model else None,
             )
             self.task_executor = TaskExecutor(
                 store=self.task_store, registry=self.capabilities, queue=self.queue, agent=task_agent,
@@ -277,10 +292,15 @@ class VoiceLoop:
             # tts は `generate_with_meta`（= (WAV, 口の開閉計画)）を渡す。UI が無い時は
             # 計画が誰にも読まれないだけで挙動は同じ（orchestrator が tuple を吸収する）。
             self.audio, stream_fn, self.tts.generate_with_meta,
-            ContextAssembler(system_prompt=SPEECH_STYLE),
+            # ペルソナ（性格・口調）は**別ファイル**から後付けする。規律(SPEECH_STYLE)と
+            # 分けておくのが要点で、混ぜると v1 の「プロンプト肥大＋ペルソナとロジックの癒着」
+            # を繰り返す（CLAUDE.md の v1 問題5）。無ければ従来どおりペルソナ無しで動く。
+            ContextAssembler(system_prompt="\n\n".join(
+                p for p in (SPEECH_STYLE, load_persona(os.getenv("PERSONA_FILE"))) if p)),
             conversation_cache=self.cache, rag_store=self.rag,
             prediction_state=self.prediction,
             on_response_complete=self._on_response_complete,  # 正常完了で feedback + 沈黙時計リセット
+            self_model_fn=(lambda: self.self_model.render()) if self.self_model else None,
             vision_state=self.vision_state,  # F6: 応答文脈に直近画面を注入
             dispatcher=self.dispatcher,  # J: tool_calls を応答完了後に submit（gate は CALLFUNCTION_ENABLED）
             tasks_provider=tasks_provider,  # J-1/Fix#2: 予約タスク状態の毎ターン注入（TASK_ENABLED 時のみ）
@@ -304,7 +324,10 @@ class VoiceLoop:
             on_utterance=self.speech_state.mark_user_utterance,  # 発話終了→沈黙時計リセット
             on_stt_start=self.speech_state.mark_stt_pending,     # J-2 ③-A: STT待ち窓を開く
             on_stt_end=self.speech_state.clear_stt_pending,      # J-2 ③-A: 投入完了で窓を閉じる
+            on_unintelligible=self._ask_back,                    # 日本語として受け取れない認識結果
+            on_understood=lambda: self._askback.reset(),         # 聞き取れたら連続カウントを戻す
         )
+        self._askback = AskBackPicker()
         self._tasks: list[asyncio.Task] = []
         # 再配達（barge-in で潰れた機能報告）の待機タスク。done で自己除去・stop() で cancel。
         self._redeliver_waiters: "set[asyncio.Task]" = set()
@@ -323,6 +346,49 @@ class VoiceLoop:
         # F5: ユーザ優先。判定中の自発発話は seq 変化で自己破棄、キュー済みの自発刺激は削除。
         self.speech_state.mark_user_speech_start()
         self.queue.discard_kind(StimulusKind.AUTONOMOUS_SPEECH)
+
+    async def _speak_canned(self, text: str) -> None:
+        """応答LLM を通さず決まり文句を1つ喋る（聞き返し用・raise しない）。
+
+        LLM に投げない理由は2つ: (a) 聞き取れなかった語をモデルに渡すと、それ自体が
+        知ったかぶりの素材になる、(b) 定型で足りる場面に確率的な生成を挟むと、規律が
+        揺れる（CLAUDE.md「規律はコードで強制」）。
+        """
+        gen = self.audio.current_generation()
+        seq = self.audio.reserve_seq(gen)
+        wav = meta = None
+        try:
+            wav = await self.tts.generate_with_meta(text)
+            if isinstance(wav, tuple) and len(wav) == 2:
+                wav, meta = wav
+        except Exception:
+            logger.exception("聞き返しの音声合成に失敗（seq は埋めて継続）")
+            wav = meta = None
+        if self.audio.current_generation() != gen:
+            return  # 待っている間に barge-in された＝古い世代は鳴らさない
+        if meta is not None:
+            try:
+                self.audio.note_meta(gen, seq, meta)
+            except Exception:
+                logger.exception("note_meta 失敗（口パクを諦めて音声は続行）")
+        logger.info("🤖 %s", text)
+        self.audio.enqueue(gen, seq, wav, text=text)
+
+    async def _ask_back(self, raw_text: str) -> None:
+        """聞き取れなかった入力に、決まり文句で一度だけ聞き返す。
+
+        記憶の扱い（ユーザ裁定 2026-08-15）:
+        - 会話履歴には**残す**。残さないと聞き返しの原因が消え、次ターンでイブが自分の
+          発話に自答する形になる。
+        - ただし**生の誤認識テキストは保存しない**（別言語混入の素材になるため）。
+        - RAG には入れない（`feedback/worker.py` が聞き取り失敗ターンを内省対象から外す）。
+        """
+        line = self._askback.next_line()
+        self.speech_state.mark_eve_activity()  # 沈黙時計をリセット（自発発話と衝突させない）
+        if self.cache is not None:
+            self.cache.add_turn("user", UNINTELLIGIBLE_PLACEHOLDER)
+            self.cache.add_turn("eve", line)
+        await self._speak_canned(line)
 
     def submit_user_text(self, text: str) -> None:
         """キーボードで打った文を**マイク発話と同じ経路**でパイプラインへ入れる。
@@ -344,6 +410,7 @@ class VoiceLoop:
             return
         self._barge_in()
         self.speech_state.mark_user_utterance()
+        self._askback.reset()  # 打てている＝意思疎通できている（連続聞き返しを持ち越さない）
         logger.info("⌨ %s", text)
         task = asyncio.create_task(self.queue.put(
             Stimulus(StimulusKind.USER_UTTERANCE, payload=text)))
@@ -354,6 +421,8 @@ class VoiceLoop:
     def _on_response_complete(self) -> None:
         """応答 正常完了: F4 feedback を起こす + F5 沈黙時計をリセット（Eve が喋った）。"""
         self.feedback_worker.trigger()
+        if self.self_model_worker is not None:
+            self.self_model_worker.trigger()  # 合図が無ければ LLM は呼ばれない（trigger.py）
         self.speech_state.mark_eve_activity()
 
     def _redeliver_stimulus(self, stim, should_abort) -> None:
@@ -562,6 +631,11 @@ class VoiceLoop:
             self.dispatcher.start()
             self.delivery_checker.start()  # J-2 P1-1: 報告ターンの配達確認
             logger.info("Call-Function 稼働（read-only 能力）")
+        # 自己形成（好み・趣向の台帳）。合図が出た時だけ LLM を呼ぶ＝普段は無音のサイドカー。
+        if self.self_model_worker is not None:
+            self.self_model_worker.start()
+            logger.info("自己形成 稼働（%s・%d項目）",
+                        Config.SELF_MODEL_FILE, self.self_model.topics)
         # J-1: タスク管理（既定 off）。store 復元 + executor/scheduler 起動。
         if self.task_store is not None:
             await self.task_store.initialize()
@@ -629,6 +703,12 @@ class VoiceLoop:
             await self.delivery_checker.stop()
         except Exception:
             pass
+        # 自己形成サイドカー（好み・趣向の台帳）。止まらなくても本流に影響しない。
+        if self.self_model_worker is not None:
+            try:
+                await self.self_model_worker.stop()
+            except Exception:
+                pass
         # J-1: タスク管理を停止（取消解決 drain→timer 停止→executor drain→store flush の順）。
         if self.cancel_resolver is not None:
             try:
@@ -665,7 +745,9 @@ class VoiceLoop:
             # VLM がそれを「ユーザの画面」として拾って、イブが自分の過去の出力を相手の作業画面
             # として実況する（実測 2/3ラン）。窓が消える不便より自己観察ループの実害を取る。
             try:
-                n = self.workspace.close_viewers()
+                # `force=True`: ユーザが操作中の窓もここでは閉じる（プロセスごと終わる
+                # ので残しても意味が無く、別プロセスのビューアだけ孤児になる）。
+                n = self.workspace.close_viewers(force=True)
                 if n:
                     logger.info("表示ウィンドウを %d 個閉じた", n)
             except Exception:

@@ -26,7 +26,13 @@ from eve.capability import Capability, CapabilityRegistry  # noqa: E402
 from eve.config import Config  # noqa: E402
 from eve.model_registry import merge_tool_call_deltas  # noqa: E402
 from eve.pipeline.audio_play_queue import AudioPlayQueue  # noqa: E402
-from eve.pipeline.stimulus import CallFunctionResult, Stimulus, StimulusKind  # noqa: E402
+from eve.pipeline.stimulus import (  # noqa: E402
+    REDELIVER_BARGE_IN,
+    REDELIVER_NOT_CONVEYED,
+    CallFunctionResult,
+    Stimulus,
+    StimulusKind,
+)
 from eve.pipeline.stimulus_queue import StimulusQueue  # noqa: E402
 from eve.response.function_dispatcher import FunctionDispatcher, parse_tool_call  # noqa: E402
 from eve.response.orchestrator import ResponseOrchestrator  # noqa: E402
@@ -564,12 +570,13 @@ async def main() -> None:
     check("再配達: >5文字再生済みは再配達しない", await t_no_redeliver_after_spoken())
     check("再配達: ≤5文字の前置きのみ再生は再配達する（境界下側）", await t_redeliver_short_preamble())
     check("再配達: ≤5文字でも全文完走再生済みは再配達しない", await t_tiny_report_complete_no_redeliver())
-    check("再配達: 途中停止文は聞かれた扱い→put直前 abort が反転（レース）", await t_redeliver_abort_after_midstop())
+    check("再配達: 途中停止文は聞かれた扱い→再配達せず記憶に残る(回帰2026-08-15)", await t_no_redeliver_after_midstop())
     check("再配達: USER kind は対象外", await t_no_redeliver_user_kind())
     check("再配達: 非 CallFunctionResult payload は無反応", await t_no_redeliver_bad_payload())
     check("再配達: cancel のみ(世代不変)は対象外", await t_no_redeliver_cancel_only())
     check("再配達: attempts 上限の両側(1→通る/2→断念)", await t_redeliver_attempts_boundary())
     check("再配達: 再報告プレフィクスは attempts>0 のみ", t_redeliver_prefix_in_messages())
+    check("再配達: 前置きは理由で分かれる(barge_in / not_conveyed)", t_redeliver_prefix_differs_by_reason())
     check("再配達: redeliver_fn 例外でも本流に漏れない", await t_redeliver_fn_exception_safe())
     check("再配達: queue で USER が再投入刺激より先に出る", await t_queue_user_priority_over_retry())
 
@@ -919,9 +926,17 @@ async def t_tiny_report_complete_no_redeliver() -> bool:
     return captured == []
 
 
-async def t_redeliver_abort_after_midstop() -> bool:
-    # レッドチーム指摘#2の回帰: cancel 伝播は即時・on_played は遅れて発火。判定時は「未配達」でも
-    # put 直前の should_abort が途中停止文（聞かれた扱い）を拾って True に反転＝二重発話を防ぐ。
+async def t_no_redeliver_after_midstop() -> bool:
+    """途中停止した報告は**そもそも再配達が予約されない**（＝二重発話が構造的に起きない）。
+
+    旧挙動（レッドチーム指摘#2）: cancel 伝播は即時・`on_played` は遅れて発火するため、
+    `_maybe_redeliver` の判定時は `spoken` が空＝「未配達」に見え、いったん再配達を予約して
+    から put 直前の `should_abort` で取り消していた。
+
+    2026-08-15 の C5 修正で `AudioPlayQueue.interrupt()` が**鳴っていた文をその場で確定**
+    するようになったので、判定時点で既に「聞かれた扱い」＝予約自体が起きない。
+    同時に、その文が会話記憶へ残ることも確認する（実機事故: 4グループが記憶から消えた）。
+    """
     started = asyncio.Event()
 
     async def play_fn(audio_bytes, should_stop=None):
@@ -940,7 +955,8 @@ async def t_redeliver_abort_after_midstop() -> bool:
         yield "タスク終わったよ、いまは二十一時。"
         await asyncio.Event().wait()
         yield "x。"
-    orch = ResponseOrchestrator(audio, stream_fn, _tts, redeliver_fn=rd)
+    cache = FakeCache()
+    orch = ResponseOrchestrator(audio, stream_fn, _tts, conversation_cache=cache, redeliver_fn=rd)
     w = asyncio.create_task(audio.play_worker())
     t = asyncio.create_task(orch.handle(
         Stimulus(StimulusKind.CALLFUNCTION_RESULT, _rd_payload(), dedup_key="task:t1")))
@@ -950,11 +966,12 @@ async def t_redeliver_abort_after_midstop() -> bool:
         await t
     except asyncio.CancelledError:
         pass
-    pre = len(captured) == 1 and captured[0][1]() is False  # 判定時: spoken 未確定
-    await asyncio.sleep(0.1)  # should_stop で play が戻り on_played 発火
-    post = captured[0][1]() is True  # put 直前判定: 聞かれた扱い＝中止
+    no_retry = captured == []                       # 再配達は予約されない
+    remembered = cache.turns == [("eve", "タスク終わったよ、いまは二十一時。")]  # 記憶に残る
+    await asyncio.sleep(0.1)                        # play が戻っても状況は変わらない
+    stable = captured == []
     w.cancel()
-    return pre and post
+    return no_retry and remembered and stable
 
 
 async def t_no_redeliver_user_kind() -> bool:
@@ -1069,6 +1086,33 @@ def t_redeliver_prefix_in_messages() -> bool:
             and s1.index("# 機能実行結果") < s1.index("読み上げが遮られて")
             and "21時45分" in s1
             and "遮られて" not in s0 and "# 機能実行結果" in s0)
+
+
+def t_redeliver_prefix_differs_by_reason() -> bool:
+    """実機事故 2026-08-15 02:44 の回帰: 再配達の前置きを**理由で分ける**。
+
+    旧実装は `attempts > 0` の単一条件で barge-in 用の「読み上げが遮られて、まだユーザに
+    伝わっていない」を付けていた。配達確認由来（＝実際には喋り終えている）にも同じ文言が
+    付き、応答LLM に**事実と食い違う前提**を渡した結果、直前のユーザ発話への謝罪ごと
+    作り直して二重回答になった。
+    """
+    orch = ResponseOrchestrator(AudioPlayQueue(play_fn=_noop_play), None, _tts)
+    nc = CallFunctionResult("goal", "10秒タスクの結果: 今は21時45分だよ", True, 1,
+                            REDELIVER_NOT_CONVEYED)
+    bi = CallFunctionResult("goal", "10秒タスクの結果: 今は21時45分だよ", True, 1,
+                            REDELIVER_BARGE_IN)
+    s_nc = orch._build_messages(Stimulus(StimulusKind.CALLFUNCTION_RESULT, nc))[0]["content"]
+    s_bi = orch._build_messages(Stimulus(StimulusKind.CALLFUNCTION_RESULT, bi))[0]["content"]
+    return (
+        # 未配達（発話済み）: 「遮られた」と嘘をつかない・繰り返しを禁じる
+        "遮られて" not in s_nc
+        and "要点がユーザに伝わっていない可能性がある" in s_nc
+        and "同じ話を繰り返さず" in s_nc
+        and "21時45分" in s_nc
+        # barge-in 側は従来どおり
+        and "遮られて" in s_bi
+        and "要点がユーザに伝わっていない可能性がある" not in s_bi
+    )
 
 
 async def t_redeliver_fn_exception_safe() -> bool:

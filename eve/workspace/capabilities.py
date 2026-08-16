@@ -89,8 +89,11 @@ def register_viewer_capability(registry: CapabilityRegistry, ws: Workspace, *,
             # 古い窓を勝手に消さない（ユーザが見ているものを閉じる方が迷惑）。ただし
             # E12: 昔は閉じる手段が無く、上限に当たるとイブは自力で回復できなかった。
             names = "・".join(n for (_p, n) in live)
+            busy = ws.protected_names()
+            extra = (f"ただし{'・'.join(busy)}はユーザが操作中だから閉じられない。"
+                     "ユーザ自身に閉じてもらう必要がある。" if busy else "")
             return (f"表示中のウィンドウが{len(live)}個（{names}）あるから、これ以上は開けなかった。"
-                    "close_window で閉じてから、もう一度出してね。")
+                    f"close_window で閉じてから、もう一度出してね。{extra}")
         name = ws.paths.relative(target)
         # UI が起動していれば**タスクウィンドウの中**に開く（`store.py` の `viewer_open_fn`）。
         # None が返る＝集約 OFF なので、従来どおり別プロセスで画面の好きな位置に開く。
@@ -124,7 +127,15 @@ def register_viewer_capability(registry: CapabilityRegistry, ws: Workspace, *,
         if match and not any(match in n for (_p, n) in live):
             names = "・".join(n for (_p, n) in live)
             return f"{match} の窓は開いてないよ。今開いてるのは {names}。"
+        # ユーザが操作中（3クリック以上）の窓は閉じない。**閉じたと嘘をつかない**ために
+        # 先に名前を取っておき、結果の文面を実際に起きたことに合わせる。
+        busy = ws.protected_names(match)
         n = ws.close_viewers(match)
+        if busy and not n:
+            return (f"{'・'.join(busy)} はユーザが操作中だから閉じなかったよ。"
+                    "閉じたい時はユーザ自身に閉じてもらってね。")
+        if busy:
+            return (f"窓を{n}個閉じたよ。{'・'.join(busy)} はユーザが操作中だから残してある。")
         return (f"{match} の窓を閉じたよ。" if match else f"開いてた窓を{n}個ぜんぶ閉じたよ。")
 
     registry.register(Capability(
@@ -144,10 +155,27 @@ def register_viewer_capability(registry: CapabilityRegistry, ws: Workspace, *,
         # 「見せた方が早い」を1文目へ動かす必要は無い: `outward_actions()`（応答LLM 向け・
         # 1文目のみ）が要るのは**手段の有無**で、使いどころの示唆は TaskAgent 向けであり、
         # そちらは `agent_tool_schemas()` が description 全文を渡している（registry.py:144-146）。
-        description="作業フォルダにある画像やテキストを、PCの画面に出してユーザに見せる。"
+        # HTML を1文目に入れる（`outward_actions()` は1文目しか応答LLM へ渡さないので、
+        # 2文目に書くと「作って見せる」という手段の存在がユーザ向けの文脈に届かない。
+        # E5 で `run_program` の「ネットから取ってくる」を落として実際に踏んだ穴）。
+        description="作業フォルダにある画像やテキストや HTML を、PCの画面に出してユーザに見せる。"
                     "言葉で説明しにくいものは、見せた方が早い。"
                     "path に作業フォルダからの相対パスを渡す（画像はそのまま、"
-                    "テキストは読める形で出る）。",
+                    "テキストは読める形で出る）。"
+                    "**HTML は実際に動く状態で開く**（ボタンを押せる・JavaScript も効く）ので、"
+                    "電卓やカウンタのような『触れるもの』を頼まれたら、"
+                    "1枚の HTML ファイルを write_file してからこれで出すこと。"
+                    "tkinter などのデスクトップ GUI は動かせない（画面に窓を出せない）。"
+                    "HTML からネットには出られないので、外部の CDN や画像 URL は使わず"
+                    "1ファイルの中で完結させる。"
+                    # 実測 2026-08-15: 「好きなゲームタイトルの画像を表示して」に対して
+                    # CSS で風景を描いた HTML を出した（＝依頼された画像ではない）。
+                    # HTML 経路を足したことで「描いて済ませる」が魅力的になったので、
+                    # ここで線を引く。**触れるもの=HTML / 実物の画像=取ってくる**。
+                    "逆に、実在するものの写真や画像を頼まれた時に、"
+                    "HTML や SVG で絵を描いて代用してはいけない（それは頼まれた画像ではない）。"
+                    "その場合は run_program でネットから画像ファイルを取ってきて、"
+                    "その画像ファイルを出すこと。",
         params_schema={"path": {"type": "string", "description": "表示したいファイルの相対パス"}},
         handler=_guard(_show), offered=False, agent_tool=True, mutates_state=True,
     ))

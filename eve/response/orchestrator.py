@@ -25,7 +25,13 @@ from ..context_assembler import (
     Turn,
 )
 from ..pipeline.audio_play_queue import AudioPlayQueue
-from ..pipeline.stimulus import CallFunctionResult, Stimulus, StimulusKind
+from ..pipeline.stimulus import (
+    REDELIVER_BARGE_IN,
+    REDELIVER_NOT_CONVEYED,
+    CallFunctionResult,
+    Stimulus,
+    StimulusKind,
+)
 from ..speech.decider import AutonomousSpeech
 from .splitter import JapaneseSentenceSplitter
 from .style import SPEECH_STYLE, sanitize_for_speech
@@ -98,6 +104,7 @@ class ResponseOrchestrator:
         delivery_checker=None,  # J-2 P1-1 任意: barge-in なしで完了した報告ターンの配達確認サイドカー
         is_suppressed: Optional[Callable[[Optional[str]], bool]] = None,  # D2 任意: 取消済み報告の判定（同期）
         features_off_provider: Optional[Callable[[], list[str]]] = None,  # UI 任意: 今オフの機能
+        self_model_fn: Optional[Callable[[], str]] = None,  # 任意: イブ自身の好み（`# イブ自身のこと`）
     ) -> None:
         self._audio = audio
         self._stream_fn = stream_fn
@@ -133,6 +140,7 @@ class ResponseOrchestrator:
         self._is_suppressed = is_suppressed
         # 任意注入(UI): 今オフにしている機能の名前。ヘッドレスでは None＝ブロック自体が出ない。
         self._features_off_provider = features_off_provider
+        self._self_model_fn = self_model_fn
         self.last_response = ""  # 生成済み全文（自然さの目視・テスト用。記憶には使わない＝C5）
 
     def _tools_enabled_for(self, stimulus: Stimulus) -> bool:
@@ -211,13 +219,26 @@ class ResponseOrchestrator:
             # 機能実行結果はユーザ発話ではない＝user 枠でなく「# 機能実行結果」ブロックへ（誤話者防止）。
             callfunction_result = payload.content
             if payload.attempts > 0:
-                # 再配達: 「遮られた再報告」であることを認識させる（さっき言いかけた、等の自然な言い直し。
-                # 既に伝えた前提の話し方や、同じ内容の二重報告を防ぐ）。
-                callfunction_result = (
-                    "（この報告は直前に読み上げが遮られて、まだユーザに伝わっていない。"
-                    "今の会話の流れに合わせて、改めて一度だけ自然に伝える。既に伝えた前提では話さない）\n"
-                    + payload.content
-                )
+                # 再配達の前置き。**理由で文言を分ける**（実機事故 2026-08-15 02:44）:
+                # 旧実装は `attempts > 0` の単一条件で barge-in 用の文言を付けており、
+                # 「実際には喋り終えたが要点が伝わらなかった」ケースにも
+                # 「まだユーザに伝わっていない」という**事実と食い違う前提**を渡していた。
+                # 結果、応答LLM は直前のユーザ発話への謝罪ごと作り直し、二重回答になった。
+                if getattr(payload, "reason", REDELIVER_BARGE_IN) == REDELIVER_NOT_CONVEYED:
+                    callfunction_result = (
+                        "（この報告は一度発話したが、要点がユーザに伝わっていない可能性がある。"
+                        "**同じ話を繰り返さず**、まだ伝えていない要点だけを一言で伝える。"
+                        "謝り直したり、直前のやりとりに改めて返事をしたりしない）\n"
+                        + payload.content
+                    )
+                else:
+                    # barge-in: 「遮られた再報告」であることを認識させる（さっき言いかけた、等の
+                    # 自然な言い直し。既に伝えた前提の話し方や、同じ内容の二重報告を防ぐ）。
+                    callfunction_result = (
+                        "（この報告は直前に読み上げが遮られて、まだユーザに伝わっていない。"
+                        "今の会話の流れに合わせて、改めて一度だけ自然に伝える。既に伝えた前提では話さない）\n"
+                        + payload.content
+                    )
         else:
             user_text = str(payload)
         # Fix#2: 予約タスクの現在状態（ターン開始時の同期スナップショット・loop 単一所有なので安全）。
@@ -243,6 +264,14 @@ class ResponseOrchestrator:
                 logger.exception("能力一覧の取得に失敗（注入なしで継続）")
         # UI で今オフにしている機能。**全刺激種別で出す**（自発発話でも「見えないから」と
         # 言い出す場面があり、そこで「機能が無い」と言われるのが最も紛らわしいため）。
+        # イブ自身の好み。**毎ターン注入する**（聞かれた時に同じ答えを返すのが目的なので、
+        # 関連しそうな時だけ入れるとブレる）。長さはストア側の上限で有界。
+        self_model = None
+        if self._self_model_fn is not None:
+            try:
+                self_model = self._self_model_fn() or None
+            except Exception:
+                logger.exception("自己モデルの取得に失敗（無しで継続）")
         features_off = None
         if self._features_off_provider is not None:
             try:
@@ -266,6 +295,7 @@ class ResponseOrchestrator:
             capabilities=capabilities,
             prev_session_gap_sec=prev_gap,
             features_off=features_off,
+            self_model=self_model,
         )
 
     def _notify_complete(self) -> None:

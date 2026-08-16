@@ -81,6 +81,55 @@ def t_shared_state() -> None:
             os.environ[capture_guard._ENV] = saved_env
 
 
+def t_scopes() -> None:
+    """メイン／タスクウィンドウを**独立に**切り替えられること（2026-08-15 ユーザ指定）。
+
+    守りたいのは「片方を切ったらもう片方も切れた」という混線が起きないこと。
+    これが崩れると「自分の UI は隠したまま、作らせた電卓だけイブに見せる」が成立しない。
+    """
+    print("\n[1c] scope の分離（メイン / タスクウィンドウ）")
+    ui, task = capture_guard.UI, capture_guard.TASK
+    saved = {s: os.environ.pop(capture_guard.env_name(s), None) for s in (ui, task)}
+    try:
+        check("環境変数が別（UI_HIDE_FROM_CAPTURE / TASKWIN_HIDE_FROM_CAPTURE）",
+              capture_guard.env_name(ui) != capture_guard.env_name(task),
+              f"{capture_guard.env_name(ui)} / {capture_guard.env_name(task)}")
+        check("共有ファイルも別（片方の書込が他方を巻き添えにしない）",
+              capture_guard.state_path(ui) != capture_guard.state_path(task))
+        check("タスク側の既定も ON（従来の挙動を変えない）",
+              capture_guard.enabled_by_env(task) is True)
+
+        os.environ[capture_guard.env_name(ui)] = "0"
+        os.environ[capture_guard.env_name(task)] = "1"
+        check("メインだけ OFF にできる", capture_guard.enabled_by_env(ui) is False)
+        check("その時タスク側は ON のまま", capture_guard.enabled_by_env(task) is True)
+        os.environ[capture_guard.env_name(ui)] = "1"
+        os.environ[capture_guard.env_name(task)] = "0"
+        check("**タスクウィンドウだけ OFF にできる**（電卓を一緒に見る用途）",
+              capture_guard.enabled_by_env(task) is False)
+        check("その時メインは隠れたまま", capture_guard.enabled_by_env(ui) is True)
+
+        capture_guard.state_path(ui).unlink(missing_ok=True)
+        capture_guard.state_path(task).unlink(missing_ok=True)
+        capture_guard.publish(True, task)
+        check("publish(task) は task の desired だけを動かす",
+              capture_guard.desired(task) is True and capture_guard.desired(ui) is True)
+        capture_guard.publish(False, task)
+        check("task を OFF にしても ui は環境変数（ON）のまま",
+              capture_guard.desired(task) is False and capture_guard.desired(ui) is True)
+        check("describe が scope で文言を変える（取り違え防止）",
+              capture_guard.describe(True, ui) != capture_guard.describe(True, task))
+        check("知らない scope は UI 扱い（落とさない）",
+              capture_guard.env_name("nonsense") == capture_guard.env_name(ui))
+    finally:
+        for s in (ui, task):
+            capture_guard.state_path(s).unlink(missing_ok=True)
+            if saved[s] is None:
+                os.environ.pop(capture_guard.env_name(s), None)
+            else:
+                os.environ[capture_guard.env_name(s)] = saved[s]
+
+
 def t_safe() -> None:
     print("\n[2] 壊れた入力でも落ちない（表示や対話を止めない）")
     for hwnd in (0, None, -1, 123456789, "abc", 2 ** 63):
@@ -108,12 +157,16 @@ def t_config() -> None:
     from eve.config import Config
 
     check("UI_HIDE_FROM_CAPTURE が bool", isinstance(Config.UI_HIDE_FROM_CAPTURE, bool))
+    check("TASKWIN_HIDE_FROM_CAPTURE が bool",
+          isinstance(Config.TASKWIN_HIDE_FROM_CAPTURE, bool))
     env_example = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                ".env.example")
     with open(env_example, encoding="utf-8") as f:
         body = f.read()
     # D6 の再発防止（.env.example に全フラグを明記する規律）
     check("**.env.example に明記されている**", "UI_HIDE_FROM_CAPTURE" in body)
+    check("**.env.example にタスク側も明記されている**",
+          "TASKWIN_HIDE_FROM_CAPTURE" in body)
 
 
 def t_viewer_applies_itself() -> None:
@@ -125,15 +178,18 @@ def t_viewer_applies_itself() -> None:
         src = f.read()
     check("viewer が capture_guard を呼んでいる", "capture_guard" in src)
     check("viewer が共有状態を見ている（実行中の切替に追従する）", "desired" in src)
+    # ビューアは**イブの表示物**＝タスク側の設定に従う（メインとは独立に切れる）
+    check("viewer が TASK scope を見ている", "desired(TASK)" in src)
     check("viewer が自プロセスの窓に適用している", "set_own_windows" in src)
     check("viewer が周期的に見直している（開いたままでも追従する）", "after(1000" in src)
     check("表示機能を止めないよう例外を握っている",
-          "except Exception" in src.split("capture_guard")[1][:400])
+          "except Exception" in src.split("capture_guard")[1][:800])
 
 
 if __name__ == "__main__":
     t_env()
     t_shared_state()
+    t_scopes()
     t_safe()
     t_config()
     t_viewer_applies_itself()

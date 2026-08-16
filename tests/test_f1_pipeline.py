@@ -336,6 +336,60 @@ async def t7_e2e() -> dict:
     }
 
 
+# ---- C5: 割り込み時の「途中まで喋った文」の確定（実機事故 2026-08-15 の回帰） ----
+#
+# 症状: イブの発話15グループ中4グループが conversation_history.jsonl に1文字も残らなかった。
+# 4件とも直後 1.2〜5秒でユーザが割り込んでいた。原因は on_played が `await self._play` から
+# 戻った後（数十ms 遅れ）に発火する一方、cancel を受けた orchestrator は**同期で**記憶に
+# 書き込むため、`spoken` が空のまま記録されていたこと。
+
+async def _play_until_stopped(audio, should_stop=None):
+    """鳴り続け、should_stop が立ったら戻る偽 play（実 player の B3 相当）。"""
+    for _ in range(1000):
+        if should_stop is not None and should_stop():
+            return
+        await asyncio.sleep(0.001)
+
+
+async def t_c5_flush_on_interrupt() -> bool:
+    spoken: list[str] = []
+    q = AudioPlayQueue(play_fn=_play_until_stopped)
+    worker = asyncio.create_task(q.play_worker())
+    q.enqueue(0, q.reserve_seq(0), b"a", text="ほぼ最後まで喋った文。", on_played=spoken.append)
+    await asyncio.sleep(0.05)  # 再生開始まで待つ
+    q.interrupt()              # barge-in: この時点で確定していないと記憶から消える
+    ok = spoken == ["ほぼ最後まで喋った文。"]  # interrupt 直後＝await を挟まずに入っている
+    worker.cancel()
+    return ok
+
+
+async def t_c5_no_double_report() -> bool:
+    spoken: list[str] = []
+    q = AudioPlayQueue(play_fn=_play_until_stopped)
+    worker = asyncio.create_task(q.play_worker())
+    q.enqueue(0, q.reserve_seq(0), b"a", text="一回だけ。", on_played=spoken.append)
+    await asyncio.sleep(0.05)
+    q.interrupt()
+    await asyncio.sleep(0.05)  # play が戻り、通常経路の on_played 判定を通過させる
+    ok = spoken == ["一回だけ。"]
+    worker.cancel()
+    return ok
+
+
+async def t_c5_unplayed_not_reported() -> bool:
+    # まだ鳴っていない（queue で待っている）文は「聞かれた」扱いにしない＝C5 の芯。
+    spoken: list[str] = []
+    q = AudioPlayQueue(play_fn=_play_until_stopped)
+    worker = asyncio.create_task(q.play_worker())
+    q.enqueue(0, q.reserve_seq(0), b"a", text="1文目。", on_played=spoken.append)
+    q.enqueue(0, q.reserve_seq(0), b"b", text="2文目。", on_played=spoken.append)
+    await asyncio.sleep(0.05)
+    q.interrupt()
+    ok = spoken == ["1文目。"]  # 2文目は一度も鳴っていない
+    worker.cancel()
+    return ok
+
+
 async def main() -> None:
     check("T1a 非ブロッキング sidecar", await t1a_nonblocking_sidecar())
     check("T1b 並列合成 < 直列和", await t1b_parallel_compose())
@@ -358,6 +412,10 @@ async def main() -> None:
     check("D2 キーは完全一致(prefix 誤爆なし)", await t_d2_namespace_exact())
     check("D2 失効墓標は遅延掃除される", await t_d2_tombstone_swept())
     check("D2 suppress は同期メソッド", t_d2_suppress_is_sync())
+
+    check("C5: 再生中の barge-in で途中文が即座に確定する", await t_c5_flush_on_interrupt())
+    check("C5: 二重発火しない（確定後に play が戻っても1回）", await t_c5_no_double_report())
+    check("C5: 一度も鳴っていない文は確定しない", await t_c5_unplayed_not_reported())
 
     r = await t7_e2e()
     check("T7 例外なし", r["raised"] is None)

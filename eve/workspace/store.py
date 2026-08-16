@@ -210,7 +210,16 @@ class Workspace:
         """いま自分が開いている窓のファイル名（VLM への自己認識注入・E11 用）。"""
         return [n for (_p, n) in self.live_viewers()]
 
-    def close_viewers(self, match: str = "") -> int:
+    def protected_names(self, match: str = "") -> list[str]:
+        """ユーザが操作中で**閉じない**窓の名前（イブに正直に報告させるため）。
+
+        `protected` はタスクウィンドウ側のハンドルにだけ立つ属性で、別プロセスの
+        `Popen` には無い（＝`getattr` の既定 False で自然に「保護なし」になる）。
+        """
+        return [n for (p, n) in self.live_viewers()
+                if getattr(p, "protected", False) and (not match or match in n)]
+
+    def close_viewers(self, match: str = "", force: bool = False) -> int:
         """開いているビューアを閉じる（停止時 / `close_window` から・同期・raise しない）。
 
         `match` 空 = 全部。指定時はファイル名の部分一致だけ閉じる。
@@ -218,6 +227,11 @@ class Workspace:
         E2: 閉じないと窓がランを跨いで残り、次セッションの VLM がそれを「ユーザの画面」
         として拾う（実測 2/3ラン）。ユーザが見ている窓が消える不便より、イブが自分の
         過去の出力を相手の作業画面として実況する実害の方が大きい、という判断。
+
+        **例外はユーザが操作中の窓**（2026-08-15）: 3クリック以上で `protected` が立った
+        ものは残す。E2 の実害はキャプチャ除外（`TASKWIN_HIDE_FROM_CAPTURE` 既定 ON）が
+        別途塞いでいるうえ、居残っても本プロセスの子ウィンドウなので**ランを跨がない**。
+        `force=True`（停止処理）は保護を無視する＝プロセスが終わるので残しても意味が無い。
         """
         closed, keep = 0, []
         for item in self.viewers:
@@ -227,6 +241,9 @@ class Workspace:
                     continue
                 if match and match not in name:   # 対象外は残す
                     keep.append(item)
+                    continue
+                if not force and getattr(p, "protected", False):
+                    keep.append(item)             # ユーザが触っている最中
                     continue
                 p.terminate()
                 closed += 1

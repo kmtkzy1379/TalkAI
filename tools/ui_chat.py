@@ -5,6 +5,8 @@ r"""UI 付きの実行経路（Live2D + リップシンク）。
 
 前提は `tools/voice_chat.py` と同じ（.env / VOICEVOX 起動 / マイク+イヤホン）。
 加えて `eve_ui/` に Live2D モデルと背景画像、`pip install PySide6-Essentials live2d-py` が要る。
+イブが作った HTML（電卓など）を**動く状態で**表示するには `pip install PySide6-Addons` も要る
+（無くても起動する。その場合 HTML はソース表示になる）。
 
 **ヘッドレス経路 `tools/voice_chat.py` は今後も一級の実行経路として残す**（ユーザ裁定
 2026-08-13）。E2E ハーネスは VoiceLoop を直接叩くので UI を通さずに回り続ける。

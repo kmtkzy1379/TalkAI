@@ -31,8 +31,10 @@ class _Item:
     seq: int
     audio: Any
     text: str = ""  # この音声が読み上げる文（C5: 実発話の記憶用）
-    # 実際に再生し終えた時だけ呼ばれる（barge-in で捨てられた文では呼ばれない＝C5）。
+    # 実際に再生した時だけ呼ばれる（barge-in で**一度も鳴らなかった**文では呼ばれない＝C5）。
     on_played: Optional[Callable[[str], None]] = None
+    # on_played を既に呼んだか（barge-in 時の同期フラッシュと通常完了の二重発火を防ぐ）。
+    reported: bool = False
 
 
 class AudioPlayQueue:
@@ -67,6 +69,9 @@ class AudioPlayQueue:
         self.on_sentence_end: Optional[Callable[[str], None]] = None
         self._meta: dict[tuple[int, int], Any] = {}  # (generation, seq) -> 口の開閉計画
         self._meta_max = 64  # bound（barge-in で再生されなかった分の溜まり込みを防ぐ）
+        # 今まさに鳴っている項目（`_drain_buffer` の `await self._play` 中だけ非 None）。
+        # barge-in が来た瞬間に「途中まで喋った文」を確定させるために持つ（下記 `_flush_playing`）。
+        self._playing: Optional[_Item] = None
 
     def current_generation(self) -> int:
         return self._generation
@@ -90,8 +95,32 @@ class AudioPlayQueue:
                 self._meta.pop(k, None)
         self._meta[(generation, seq)] = meta
 
+    def _flush_playing(self) -> None:
+        """鳴っている最中の文を**その場で**「喋った」と確定させる（C5・同期・raise しない）。
+
+        実機事故 2026-08-15（イブの発話15グループ中4グループが会話履歴に1文字も残らなかった）:
+        C5 は元々「再生開始した文は途中停止でも聞かれた扱い」だが、`on_played` は
+        `_drain_buffer` が `await self._play(...)` から戻った後＝**数十ms 遅れて**発火する。
+        一方 barge-in は `voice_loop._barge_in` が `audio.interrupt()` → `runner.interrupt()` と
+        進み、cancel を受けた `response/orchestrator.py` の `except CancelledError:` が
+        **同期で** `_record_eve()` を呼ぶ。この順序だと `spoken` はまだ空で、
+        「ほぼ最後まで喋った文」ごと記憶から消えていた（ユーザ指摘 2026-08-15）。
+
+        `interrupt()` は cancel より前に走るので、ここで確定させれば記録に間に合う。
+        """
+        it = self._playing
+        if it is None or it.reported or it.audio is None or it.on_played is None:
+            return
+        it.reported = True
+        try:
+            it.on_played(it.text)
+        except Exception:
+            logger.exception("on_played コールバックでエラー（barge-in 時の確定・継続）")
+
     def bump_generation(self) -> int:
         """barge-in / 新ターン。世代を進め、古い世代の待機・buffer を破棄する。"""
+        # 世代を進める**前**に、鳴っている文を「喋った」と確定させる（C5・上記の順序問題）。
+        self._flush_playing()
         self._generation += 1
         self._next_seq = 0
         self._buffer.clear()
@@ -162,7 +191,12 @@ class AudioPlayQueue:
                     self.on_sentence_start(it.text, meta)
                 except Exception:
                     logger.exception("on_sentence_start コールバックでエラー（再生は継続）")
-            await self._play(it.audio, it.generation)
+            # 鳴っている間だけ自分を指しておく（barge-in が来たら `_flush_playing` が確定させる）。
+            self._playing = it
+            try:
+                await self._play(it.audio, it.generation)
+            finally:
+                self._playing = None
             if it.audio is not None and self.on_sentence_end is not None:
                 try:
                     self.on_sentence_end(it.text)
@@ -170,7 +204,9 @@ class AudioPlayQueue:
                     logger.exception("on_sentence_end コールバックでエラー（再生は継続）")
             # C5: 実際に再生した文だけ「喋った」と報告（B3 の途中停止も聞かれた扱い）。
             # 番兵(audio=None)は再生していないので報告しない。
-            if it.audio is not None and it.on_played is not None:
+            # `reported` は barge-in 時に `_flush_playing` が既に報告した印＝二重に積まない。
+            if it.audio is not None and it.on_played is not None and not it.reported:
+                it.reported = True
                 try:
                     it.on_played(it.text)
                 except Exception:
