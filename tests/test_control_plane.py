@@ -18,6 +18,15 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# 決定論の担保: ControlPlane の availability は Config（=.env）を読むため、ユーザの
+# `.env` のフラグ次第で vision/task が disabled になり結果が反転する（2026-09-20 に
+# VLM_ENABLED=0 の .env で 12件 FAIL を実際に踏んだ）。eve.config は load_dotenv を
+# override なしで呼ぶので、**eve を import する前に** os.environ へ置けば必ず勝つ
+# （E2E ハーネスと同じ流儀。import 後では効かない＝HANDOFF 落とし穴 #3）。
+os.environ["VLM_ENABLED"] = "1"
+os.environ["TASK_ENABLED"] = "1"
+os.environ["AUTOSPEECH_ENABLED"] = "1"
+
 from eve.pipeline.orchestrator import PipelineRunner, StubOrchestrator  # noqa: E402
 from eve.pipeline.audio_play_queue import AudioPlayQueue  # noqa: E402
 from eve.pipeline.stimulus import Stimulus, StimulusKind  # noqa: E402
@@ -215,7 +224,12 @@ class _Store:
 
 
 class _Workspace:
-    """`close_viewers()` だけを見る（タスク OFF で表示窓を畳むかの検証用）。"""
+    """`close_viewers()` / `protected_names()` を見る（タスク OFF で表示窓を畳むかの検証用）。
+
+    `protected_names()` は control.py:_apply_task が呼ぶ（ユーザ操作中の窓の報告用）。
+    無いと AttributeError で ControlPlane の遷移ワーカーが死に、以降の全遷移が
+    黙って止まる（2026-09-20 に実際に踏んだ＝フェイクの更新漏れ）。
+    """
 
     def __init__(self) -> None:
         self.closed = 0
@@ -224,6 +238,9 @@ class _Workspace:
     def close_viewers(self) -> int:
         self.closed += 1
         return 1
+
+    def protected_names(self, match: str = "") -> list[str]:
+        return []
 
 
 class _FakeVL:
