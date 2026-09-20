@@ -107,6 +107,12 @@ class AudioInput:
         # onset 確認: これだけ連続して発話が続いてから「発話開始」とする（単発スパイク無視）
         onset_chunks = max(1, int(Config.VAD_ONSET_SEC * self.rate / self.chunk))
         speech_run = 0
+        # 音量ゲート（`Config.MIC_MIN_PEAK`）。**まとまりの最大振幅**で見る:
+        # run_peak = onset 窓の最大（割り込み発火の判定）/ utt_peak = 発話全体の最大（STT 送りの判定）。
+        # チャンクごとに切ると語尾や語間で落ちて実発話まで捨てるので、必ず max を使う。
+        min_peak = float(Config.MIC_MIN_PEAK)
+        run_peak = 0.0
+        utt_peak = 0.0
         loop = asyncio.get_running_loop()
 
         while self.running:
@@ -123,16 +129,24 @@ class AudioInput:
             speech_prob = self.model(torch.from_numpy(audio_f32), self.rate).item()
             self.speech_prob = speech_prob  # UI 表示専用（判定はこの下の既存ロジックのまま）
 
+            peak = float(np.abs(audio_f32).max())
+
             if speech_prob > Config.VAD_THRESHOLD:
                 speech_run += 1
+                run_peak = max(run_peak, peak)
                 if is_speaking:
+                    utt_peak = max(utt_peak, peak)
                     silence_start = None
                     audio_buffer.append(data)
                 else:
                     preroll.append(data)  # 確定前は pre-roll に溜める
-                    # 単発スパイク(クリック/打鍵)を無視: 連続して発話が続いた時だけ開始
-                    if speech_run >= onset_chunks:
+                    # 単発スパイク(クリック/打鍵)を無視: 連続して発話が続いた時だけ開始。
+                    # 加えて音量ゲート: 漏れ音のような極小音では割り込まない。ここで見送っても
+                    # speech_run は伸び続けるので、声が大きくなった次のチャンクで発火する
+                    # （＝小声の出だしでも数十ms遅れるだけで取りこぼさない）。
+                    if speech_run >= onset_chunks and run_peak >= min_peak:
                         is_speaking = True
+                        utt_peak = run_peak
                         logger.debug("発話開始を確定")
                         audio_buffer = list(preroll)  # 確認チャンク+直前を先頭に（頭欠け防止）
                         preroll.clear()
@@ -145,7 +159,9 @@ class AudioInput:
                                 cb()
             else:
                 speech_run = 0
+                run_peak = 0.0
                 if is_speaking:
+                    utt_peak = max(utt_peak, peak)
                     audio_buffer.append(data)
                     if silence_start is None:
                         silence_start = time.time()
@@ -153,8 +169,18 @@ class AudioInput:
                         is_speaking = False
                         full_audio = b"".join(audio_buffer)
                         audio_buffer = []
+                        reached = utt_peak  # ログ用に退避してからリセットする
+                        utt_peak = 0.0
                         if len(full_audio) > self.rate * 2 * 0.3:  # 最小0.3秒ゲート
-                            self.speech_queue.put_nowait(full_audio)
+                            if reached >= min_peak:
+                                self.speech_queue.put_nowait(full_audio)
+                            else:
+                                # **黙って捨てない**: 「喋ったのに無視された」を後から追えるようにする。
+                                # ここが続くなら MIC_MIN_PEAK が高すぎる。
+                                logger.info(
+                                    "音量ゲートで破棄（最大振幅 %.4f < %.4f）。"
+                                    "自分の声が拾われない場合は MIC_MIN_PEAK を下げてください",
+                                    reached, min_peak)
                 else:
                     preroll.append(data)  # 非発話中は直近を pre-roll に溜める
 
