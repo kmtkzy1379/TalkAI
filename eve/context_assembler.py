@@ -76,7 +76,8 @@ class ContextAssembler:
     def __init__(self, system_prompt: str = "") -> None:
         self.system_prompt = system_prompt
 
-    def _build_system(self, *, rag_chunks, last_feedback, vision, speech_decision_reason, now,
+    def _build_system(self, *, rag_chunks, last_feedback, vision, vision_stale,
+                      speech_decision_reason, now,
                       callfunction_result=None, tools_active=False, active_tasks=None,
                       last_feedback_iso=None, session_gap_sec=None, capabilities=None,
                       features_off=None, self_model=None) -> str:
@@ -110,7 +111,20 @@ class ContextAssembler:
                 for c in rag_chunks
             ]
             parts.append("# 参照（今の会話に絡める。思い出話に逸れない）\n" + "\n".join(lines))
-        if vision:
+        if vision and vision_stale:
+            # 「画面が変わったが実況がまだ追いついていない」区間。ここを不在明示にすると、
+            # 下の分岐の指示どおり「今は画面が見えていない」と**能力ごと否認**する
+            # （実測 2026-09-21: 空白時 9/9＝100%。ユーザには「変わった瞬間しか見えていない」
+            # と映る）。見出しを分けるのは、本文が「今この瞬間」ではないと一目で分かるため。
+            # この文言での実測: 否認 0/9・中身を話せた 9/9・断り付き 9/9。
+            parts.append(
+                f"# 画面（直前に見えていたもの）\n{vision}\n"
+                "（**能力が無いとは言わない**。画面は見えていて、今映っているものの読み取りが"
+                "追いついていないだけ。直前に見えていた内容は上のとおりなので、"
+                "「さっきの時点では」と断って話してよい。今この瞬間のことは断定しない。）\n"
+                "（会話に必要なら自然に織り込む。話題と無関係なら無理に触れなくてよい＝画面に引っ張られすぎない）"
+            )
+        elif vision:
             parts.append(
                 f"# 画面（今この瞬間）\n{vision}\n"
                 "（会話に必要なら自然に織り込む。話題と無関係なら無理に触れなくてよい＝画面に引っ張られすぎない）"
@@ -285,6 +299,9 @@ class ContextAssembler:
         rag_chunks: list[RagChunk] | None = None,
         last_feedback: str | None = None,
         vision: str | None = None,
+        # 「変化後・実況待ち」の暫定か（`vlm/state.py:vision_after_change`）。
+        # True の時だけ `# 画面（直前に見えていたもの）` の断り付きブロックにする。
+        vision_stale: bool = False,
         speech_decision_reason: str | None = None,
         stale_reference: bool = False,  # ②-6: 下書きの時間表現が経過と食い違う（訂正許可を出す）
         callfunction_result: str | None = None,
@@ -311,6 +328,7 @@ class ContextAssembler:
                 "role": "system",
                 "content": self._build_system(
                     rag_chunks=rag_chunks, last_feedback=last_feedback, vision=vision,
+                    vision_stale=vision_stale,
                     speech_decision_reason=speech_decision_reason, now=now,
                     callfunction_result=callfunction_result, tools_active=tools_active,
                     active_tasks=active_tasks, last_feedback_iso=last_feedback_iso,

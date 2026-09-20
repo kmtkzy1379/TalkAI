@@ -95,3 +95,36 @@ class VisionState:
         if age > static_max:
             return None
         return f"{self.latest_vision}（{int(age)}秒前の画面。以降ずっと変化なし）"
+
+    def vision_after_change(
+        self, ttl: float, stale_max: float, now: Optional[float] = None
+    ) -> Optional[str]:
+        """`vision_for_user` が「実況より後に変化」で None を返す区間の暫定（断り付き）。
+
+        画面が変わってから新しい実況が届くまでには VLM 呼び出しぶんの遅れがある。そこを
+        「画面情報なし」にすると、応答LLM は不在ブロックの指示どおり「今は画面が見えていない」と
+        **能力ごと否認**する（実測 2026-09-21: 空白時 9/9＝100%）。ユーザには「画面が変わった
+        瞬間しか見えていない」と映る。据え置きの他の関門（実況であること・capture 生存）は
+        満たしているので、**捨てずに「その後に変わった」と断って渡す**。`static_max` を
+        180→600→1800 と上げてきたのと同じ方針（捨てずに正直にラベルする）を変化後にも適用する。
+
+        担当範囲は `vision_for_user` と排他: TTL 内（そのまま現在として使える）と「変化なしの
+        据え置き」はあちらが返すので、ここは**必ず None** を返す。呼び手は先にあちらを見る。
+        """
+        if self.latest_vision is None:
+            return None
+        n = now if now is not None else now_mono()
+        age = n - self.latest_vision_mono
+        if age <= ttl:
+            return None  # TTL 内は `vision_for_user` の担当
+        if not self.latest_is_narration:
+            return None  # 視認不可マーカは据え置かない（`vision_for_user` と同じ）
+        if (n - self.last_frame_mono) > CAPTURE_ALIVE_SEC:
+            return None  # capture が止まっている → 画面を見られているとは言えない
+        if self.last_change_mono <= self.latest_vision_mono:
+            return None  # 変化していない＝「以降変化なし」の据え置き（あちらの担当）
+        if age > stale_max:
+            return None  # 古すぎ（VLM が詰まっている）→ 正直に「画面情報なし」へ落とす
+        return (f"{self.latest_vision}"
+                f"（{int(age)}秒前に読んだ画面。その後に画面が変わったので、"
+                "今まさにこの通りとは限らない）")

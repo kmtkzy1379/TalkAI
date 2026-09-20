@@ -163,20 +163,32 @@ class ResponseOrchestrator:
             logger.exception("tool_schemas の取得に失敗（tool なしで応答）")
             return False
 
-    def _vision_for(self, stimulus: Stimulus) -> Optional[str]:
+    def _vision_for(self, stimulus: Stimulus) -> tuple[Optional[str], bool]:
         """この刺激の応答文脈に入れる画面情報（層分離の唯一の分岐点）。
 
-        3値: None=VLM 未配線（ブロックを出さない）/ ""=今は画面情報が無い**明示** / 本文。
+        `(本文, 暫定か)` を返す。本文は3値: None=VLM 未配線（ブロックを出さない）/
+        ""=今は画面情報が無い**明示** / 本文。
         「無い」を明示しないと、RAG に入った過去の画面描写を現在として語る（実機事故 2026-07-27）。
+
+        暫定=True は「画面が変わったが実況がまだ追いついていない」区間（`vision_after_change`）。
+        ここを空白にすると応答LLM が能力ごと否認するため、断り付きで渡す（実測 2026-09-21）。
+        **自発発話系には渡さない**: `fresh_vision` のままにして、静止中に画面へ引っ張られる
+        同話題固執（実測: 判定136回中135回に画面が入りっぱなし）を断つ層分離を保つ。
         """
         if self._vision_state is None:
-            return None
+            return None, False
         if stimulus.kind == StimulusKind.USER_UTTERANCE:
             v = self._vision_state.vision_for_user(
                 Config.VLM_VISION_TTL_SEC, Config.VLM_STATIC_VISION_MAX_SEC)
-        else:
-            v = self._vision_state.fresh_vision(Config.VLM_VISION_TTL_SEC)
-        return v if v else ""
+            if v:
+                return v, False
+            v = self._vision_state.vision_after_change(
+                Config.VLM_VISION_TTL_SEC, Config.VLM_STALE_VISION_MAX_SEC)
+            if v:
+                return v, True
+            return "", False
+        v = self._vision_state.fresh_vision(Config.VLM_VISION_TTL_SEC)
+        return (v if v else ""), False
 
     def _build_messages(
         self,
@@ -201,7 +213,7 @@ class ResponseOrchestrator:
         #   注入文言に「N秒前・以降変化なし」が付くので捏造にならない）。
         # - 自発発話/機能報告: 鮮度 TTL 内＝「今さっき変化した画面」だけ。静止中に画面が入り続けて
         #   同じ画面要素の話を繰り返す固執を断つ（実機実測で判定136回中135回に画面が入っていた）。
-        vision = self._vision_for(stimulus)
+        vision, vision_stale = self._vision_for(stimulus)
         # F5 自発発話: payload は AutonomousSpeech(content, reason)。content は**ユーザ発話でなく
         # イブ自身の下書き**として autonomous_content へ（ユーザ枠に入れると応答LLMが自分の発話に
         # 返事して話者を取り違える＝Fix3）。reason は発話判定理由。USER 等は従来どおり user_text。
@@ -287,6 +299,7 @@ class ResponseOrchestrator:
             last_feedback=last_feedback,
             last_feedback_iso=last_feedback_iso,
             vision=vision,
+            vision_stale=vision_stale,
             speech_decision_reason=speech_reason,
             stale_reference=stale_reference,
             callfunction_result=callfunction_result,

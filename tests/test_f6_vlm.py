@@ -248,6 +248,80 @@ def t_vision_for_user_e6_holdover() -> bool:
             and Config.VLM_STATIC_VISION_MAX_SEC >= 1430.0)
 
 
+def t_vision_after_change_fills_gap() -> bool:
+    """E15（2026-09-21・実機）: 「画面が変わった瞬間しか見えていない」の回帰。
+
+    画面が変わってから新しい実況が届くまでの数秒、`vision_for_user` は「実況より後に変化」で
+    None を返し、応答文脈が不在明示になる。すると応答LLMは不在ブロックの指示どおり
+    「今は画面が見えていない」と**能力ごと否認**した（実測: 空白時 9/9＝100%）。
+    空白の実長は実測で最大 9.8秒（激しい操作でも p95 9.8s）。捨てずに断り付きで渡す。
+    """
+    from eve.config import Config
+
+    def _after(age: float, stale_max: float):
+        vs = VisionState()
+        vs.add_frame(_frame(0), True, now=100.0)
+        vs.set_latest("VS Code のターミナルにログが流れている", mono=101.0)
+        vs.add_frame(_frame(1), True, now=102.0)  # 実況の**後**に変化＝旧経路が捨てる条件
+        vs.add_frame(_frame(2), False, now=101.0 + age - 0.5)  # capture は生存
+        now = 101.0 + age
+        return (vs.vision_for_user(7.0, 1800.0, now=now),
+                vs.vision_after_change(7.0, stale_max, now=now))
+
+    held, fill = _after(9.0, Config.VLM_STALE_VISION_MAX_SEC)
+    _, over = _after(60.0, Config.VLM_STALE_VISION_MAX_SEC)  # 上限超過は正直に捨てる
+    return (held is None                        # 従来経路の挙動は変えていない
+            and fill is not None                # 空白を埋める
+            and "その後に画面が変わった" in fill  # 現在と断定させない注記
+            and "9秒前" in fill
+            and over is None                    # VLM が詰まったら諦める（上限は残す）
+            and 10.0 <= Config.VLM_STALE_VISION_MAX_SEC <= 60.0)
+
+
+def t_vision_after_change_exclusive() -> bool:
+    # `vision_for_user` と担当が排他（二重に出ない）。静止中・TTL 内・視認不可は必ず None。
+    vs = VisionState()
+    vs.add_frame(_frame(0), True, now=100.0)
+    vs.set_latest("メモ帳が開いている", mono=101.0)
+    vs.add_frame(_frame(1), False, now=129.5)  # 静止のまま
+    static_held = vs.vision_for_user(7.0, 1800.0, now=130.0)
+    static_fill = vs.vision_after_change(7.0, 20.0, now=130.0)
+    in_ttl = vs.vision_after_change(7.0, 20.0, now=104.0)
+    vs2 = VisionState()
+    vs2.add_frame(_frame(0), True, now=100.0)
+    vs2.set_latest(BLANK_MARKER, mono=101.0, narration=False)
+    vs2.add_frame(_frame(1), True, now=102.0)
+    marker = vs2.vision_after_change(7.0, 20.0, now=110.0)
+    return (static_held is not None and static_fill is None
+            and in_ttl is None and marker is None)
+
+
+async def t_orchestrator_stale_vision_block() -> bool:
+    # ⭐配線: 変化後・実況待ちでは不在明示でなく「直前に見えていたもの」を断り付きで渡す
+    from eve.clock import now_mono
+    from eve.pipeline import AudioPlayQueue, Stimulus, StimulusKind
+    from eve.response import ResponseOrchestrator
+
+    async def stream_fn(m):
+        yield "ok"
+
+    async def tts(s):
+        return b"x"
+    n = now_mono()
+    vs = VisionState()
+    vs.add_frame(_frame(0), True, now=n - 30.0)
+    vs.set_latest("右側に Agents Window が開いている", mono=n - 9.0)
+    vs.add_frame(_frame(1), True, now=n - 8.0)   # 実況の後に変化
+    vs.add_frame(_frame(2), False, now=n - 0.2)  # capture 生存
+    orch = ResponseOrchestrator(AudioPlayQueue(), stream_fn, tts, vision_state=vs)
+    sysmsg = orch._build_messages(
+        Stimulus(StimulusKind.USER_UTTERANCE, "今画面に何が見えてる?"))[0]["content"]
+    return ("# 画面（直前に見えていたもの）" in sysmsg
+            and "Agents Window" in sysmsg
+            and "能力が無いとは言わない" in sysmsg
+            and "画面情報なし" not in sysmsg)
+
+
 def t_vision_for_user_marker_not_held() -> bool:
     # A11 の正直マーカ（視認不可）は据え置かない（「30秒前は取得できなかった」は無意味/紛らわしい）
     vs = VisionState()
@@ -889,6 +963,9 @@ async def main() -> None:
     check("vision を応答文脈に注入(# 画面)", await t_vision_injected_into_messages())
     check("⭐画面不在マーカ: 無い事を明示し捏造を禁じる(3値規約)", await t_vision_absence_marker())
     check("⭐配線: 画面情報なしは None でなく不在明示を渡す", await t_orchestrator_reports_vision_absence())
+    check("⭐E15 変化後・実況待ちの空白を断り付きで埋める", t_vision_after_change_fills_gap())
+    check("E15 据え置きと担当が排他（静止/TTL内/視認不可は None）", t_vision_after_change_exclusive())
+    check("⭐E15 配線: 不在明示でなく「直前に見えていたもの」", await t_orchestrator_stale_vision_block())
     check("E11 自分が開いた窓は VLM に自己申告する", t_own_windows_declared())
     check("E11 窓ゼロ/取得失敗では余計な文を足さない", await t_own_windows_absent_or_broken())
     # 文字ゲート（pHash が拾えない枠内の文字変化）
