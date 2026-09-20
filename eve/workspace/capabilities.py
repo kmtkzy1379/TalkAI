@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 from pathlib import Path
 
@@ -181,6 +182,30 @@ def register_viewer_capability(registry: CapabilityRegistry, ws: Workspace, *,
     ))
 
 
+def _sandbox_visible_path() -> str:
+    """**ユーザプロファイル配下を除いた** PATH を返す（実行ファイル解決用）。
+
+    `eve_sandbox` は親のプロファイル（`C:\\Users\\<me>\\...`）を ACL で拒否されている
+    ＝設計どおり。ところが親の PATH は先頭が Anaconda / python.org / Store スタブ /
+    WinGet で埋まっていることがあり、そこへ解決した exe を渡すと子は起動すらできず
+    `WinError 5` で落ちる。**失敗の形が「引数が悪い」と区別できない**ので、イブは
+    延々と別のやり方を試して結局あきらめる。
+
+    実測（2026-09-21・新PC）: python/pip は Anaconda、curl も Anaconda、ffmpeg は
+    WinGet に解決され、画像を取得する手段が1つも残らなかった。除外すると curl は
+    `System32\\curl.exe`（Windows 標準）に落ち、tar・git は元から機械全体の場所。
+    """
+    home = os.path.expanduser("~").rstrip("\\/").lower()
+    keep = []
+    for p in (os.environ.get("PATH") or "").split(os.pathsep):
+        if not p:
+            continue
+        if os.path.normpath(p).lower().startswith(home + os.sep):
+            continue
+        keep.append(p)
+    return os.pathsep.join(keep)
+
+
 def register_exec_capability(registry: CapabilityRegistry, ws: Workspace, *,
                              allow: list[str], timeout_sec: float, grace_sec: float,
                              mem_mb: int, max_procs: int, max_output_chars: int) -> None:
@@ -215,10 +240,16 @@ def register_exec_capability(registry: CapabilityRegistry, ws: Workspace, *,
             raw = [raw]
         argv_rest = [str(a) for a in raw]
 
-        # 実行ファイルは allowlist の名前から解決する（LLM にパスを組ませない）
-        exe = shutil.which(stem) or shutil.which(program)
-        if exe is None and stem in ("python", "pip"):
+        # 実行ファイルは allowlist の名前から解決する（LLM にパスを組ませない）。
+        # **PATH のうち親プロファイル配下は見ない**（`_sandbox_visible_path`）。そこに
+        # 解決すると子が ACL で弾かれて WinError 5 になり、能力が黙って死ぬ。
+        if stem in ("python", "pip"):
+            # sandbox から実行できる python は runtime\py とこの venv だけで、どちらも
+            # PATH には載っていない。PATH を引くと必ず親プロファイル側を掴むので引かない。
             exe = str(ws.paths.root.parent / "venv" / "Scripts" / f"{stem}.exe")
+        else:
+            safe = _sandbox_visible_path()
+            exe = shutil.which(stem, path=safe) or shutil.which(program, path=safe)
         if not exe or not Path(exe).exists():
             return f"（{program} が見つからなかった）"
 
