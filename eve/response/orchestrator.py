@@ -12,7 +12,9 @@ barge-in（応答側）: stream 中に世代が変わったら生成停止。TTS
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import re
 from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable, Optional
 
 from ..config import Config
@@ -71,6 +73,70 @@ def _fallback_ack(tool_sink: list) -> str:
     return _DEFAULT_ACK
 
 
+# 引数の一言がこれより長い時は使わない（読み上げが長引く・中身の説明を始めている）＝定型へ
+_REPLY_MAX_CHARS = 80
+
+
+def _ack_from_tools(tool_sink: list) -> tuple[str, bool]:
+    """機能呼び出しのみで発話が空だったターンに言う一言と、それを応答LLM が書いたか。
+
+    1. `delegate_task` の `reply`（応答LLM が書いた、依頼に合った一言）
+    2. 無ければ定型（`_fallback_ack`）
+
+    ユーザ 2026-09-28「タスクやる前に｢やっとくね｣が定型文化してて機械的。出来ればその文脈にあった言い回しとかして
+    欲しい」→ 2026-09-29 採用。応答LLM（gpt-6-luna）は本文を書かずにツールだけ返すことが多く（実測 6件中5件）、
+    その度に定型の「やっとくね。」になっていた。ツールの引数なら書き落とさない（必須の引数・`task/capabilities.py`）。
+    """
+    for tc in tool_sink:
+        fn = tc.get("function") if isinstance(tc, dict) else None
+        if not fn:
+            continue
+        try:
+            args = json.loads(fn.get("arguments") or "{}")
+        except (TypeError, ValueError):
+            continue
+        reply = args.get("reply") if isinstance(args, dict) else None
+        if isinstance(reply, str) and reply.strip() and len(reply.strip()) <= _REPLY_MAX_CHARS:
+            return reply.strip(), True
+    return _fallback_ack(tool_sink), False
+
+
+# 応答の二重化の関門（`handle._emit`）: この文字数以上の節が同じ応答の中でもう一度出たら「2回目に入った」とみなす。
+# 短い節（「うん」「そっか」等）は普通に繰り返すので対象にしない。
+REPEAT_MIN_CHARS = 8
+_REPEAT_IGNORE = re.compile(r"[\s、。，．,.！？!?…・ー〜~「」『』（）()]")
+# 文末の軽い終助詞は落として比べる（「…設定しておいて。」と「…設定しておいてね。」を同じ節とみなす・実測）
+_REPEAT_TAIL = re.compile(r"[ねよなわ]+$")
+
+
+def _repeat_key(clause: str) -> str:
+    """節の比較用の形（空白・句読点・記号と、文末の終助詞を落とす）。"""
+    return _REPEAT_TAIL.sub("", _REPEAT_IGNORE.sub("", clause or ""))
+
+
+# 「できない」と言ったのに同じ返事で delegate_task も出す矛盾の関門（2026-10-01・ユーザ「不可能作業はタスク依頼しないで。
+# その場でなんでできないか説明させたい。できないこと引き受けるのはハルシネーション」）。実測（`tools/prompt_eval/`）:
+# プロンプトに「できないと伝えた依頼で delegate_task を呼ばない」と書いても、「予約できるのは1時間先までなんだ。明日の朝7時には
+# 起こせないよ」＋委譲（when=3600）、「予定表は確認できないんだ」＋予定を調べる委譲、が出た。言った内容の方を正とし、委譲を捨てる。
+_CANNOT = re.compile(
+    r"(?:でき|行え|起こせ|入れられ|送れ|見られ|見れ|鳴らせ|使え|扱え|触れ|届け)(?:ない|ません)"
+    r"|手段(?:は|が|を)?(?:持って)?(?:い)?ない|手段(?:は|が)?無い|機能(?:は|が)?(?:ない|無い)"
+)
+# 断った上で別の手を引き受けている返事は矛盾ではない（「ドラマを見ることはできないんだ。タイトルは知らないから、ちょっと
+# 調べてみるね」「アラームで起こす機能はないんだ。30分後に通知する予約ならできるけど」）。ここで委譲を捨てると
+# 「調べてみるね」が**破られる約束**になり、矛盾より悪い。引き受けの言い方（〜てみるね・〜しておくね・〜調べるね・
+# 〜しようか・〜ならできる・〜話せるよ）があれば止めない。実測（記録済み 452委譲・声にした文で判定）: 断りの語を含む16件のうち、
+# 引き受けの語を含む6件はすべて正しい委譲（知らないドラマの検索・30分後の通知・手元の情報を探す）、含まない10件はすべて
+# 手段の無い依頼（エアコン・メール・明日の朝7時・予定表）。
+_COMMIT = re.compile(r"[るく]ね|(?:よう|そう)か|ならできる|[せれ]るよ")
+
+
+def _says_cannot(text: str) -> bool:
+    """返事が「それはできない」で終わっていて、別の手も引き受けていないか（delegate_task と矛盾する断り）。"""
+    t = text or ""
+    return bool(_CANNOT.search(t)) and not _COMMIT.search(t)
+
+
 def _render_recent(turns: Optional[list]) -> str:
     """J-2 P1-1: 配達確認 judge へ渡す直近会話の簡易描画（省略マーカは除く）。"""
     if not turns:
@@ -105,6 +171,21 @@ class ResponseOrchestrator:
         is_suppressed: Optional[Callable[[Optional[str]], bool]] = None,  # D2 任意: 取消済み報告の判定（同期）
         features_off_provider: Optional[Callable[[], list[str]]] = None,  # UI 任意: 今オフの機能
         self_model_fn: Optional[Callable[[], str]] = None,  # 任意: イブ自身の好み（`# イブ自身のこと`）
+        # S3 任意: 「応答が近い」合図（そのターンで最初の文の合成を始めた瞬間＝音声まで約0.2〜0.35秒）。
+        # フィラーはこれで新しい語を始めない（同期・非ブロッキング・例外は握る）。
+        on_first_sentence: Optional[Callable[[], None]] = None,
+        # S3 任意: 直前にイブが口にしたつなぎ言葉（「あー」「あ、えー」等・無ければ None）。
+        # USER 発話のときだけ読み、応答LLM への user メッセージの前置きにする（**payload は変えない**
+        # ＝会話履歴・RAG・フィードバックには入らない）。
+        filler_provider: Optional[Callable[[], Optional[str]]] = None,
+        # S5 任意: イブの今の気持ち（`EmotionState.describe()`・未判定なら None）。全刺激種別で system に入れる
+        emotion_provider: Optional[Callable[[], Optional[str]]] = None,
+        # S5 任意: 声のトーン＝今の感情の絵文字（Irodori の注釈・未決の感情は None）。応答を組み立てた時点で
+        # 1回だけ読み、そのターンの全部の節の**TTS に渡す文字にだけ**付ける（記憶・画面の文字には付けない）
+        tone_provider: Optional[Callable[[], Optional[str]]] = None,
+        # 任意: 話し方の実例（`eve/persona_examples.StyleExamples`）。ユーザ発話への応答でだけ、毎ターン選び直して
+        # 性格の直後に入れる。今の話しかけと意味が近い実例は見せない（丸写しの元・2026-10-01 実測）
+        style_examples=None,
     ) -> None:
         self._audio = audio
         self._stream_fn = stream_fn
@@ -141,6 +222,11 @@ class ResponseOrchestrator:
         # 任意注入(UI): 今オフにしている機能の名前。ヘッドレスでは None＝ブロック自体が出ない。
         self._features_off_provider = features_off_provider
         self._self_model_fn = self_model_fn
+        self._on_first_sentence = on_first_sentence
+        self._filler_provider = filler_provider
+        self._emotion_provider = emotion_provider
+        self._tone_provider = tone_provider
+        self._style_examples = style_examples
         self.last_response = ""  # 生成済み全文（自然さの目視・テスト用。記憶には使わない＝C5）
 
     def _tools_enabled_for(self, stimulus: Stimulus) -> bool:
@@ -172,29 +258,31 @@ class ResponseOrchestrator:
 
         暫定=True は「画面が変わったが実況がまだ追いついていない」区間（`vision_after_change`）。
         ここを空白にすると応答LLM が能力ごと否認するため、断り付きで渡す（実測 2026-09-21）。
-        **自発発話系には渡さない**: `fresh_vision` のままにして、静止中に画面へ引っ張られる
-        同話題固執（実測: 判定136回中135回に画面が入りっぱなし）を断つ層分離を保つ。
+
+        **自発発話・機能報告も同じ規則にした（ユーザ提案 2026-09-30）**: 以前は `fresh_vision`（7秒）だけで、
+        画面が静止しているだけで「画面情報なし・今この瞬間の画面は届いていない」になっていた（誤解を生む文言）。
+        静止中は「N秒前の画面。以降ずっと変化なし」を付けて渡す。同話題固執の層分離は**発話判定の入力と
+        記憶の検索クエリ**（どちらも `fresh_vision` のまま）で守られている。自発発話の応答は判定が決めた下書きを
+        言い直すだけで、実測（下書きが画面と無関係な場面×6）では静止画面を足しても画面の話を足さなかった。
         """
         if self._vision_state is None:
             return None, False
-        if stimulus.kind == StimulusKind.USER_UTTERANCE:
-            v = self._vision_state.vision_for_user(
-                Config.VLM_VISION_TTL_SEC, Config.VLM_STATIC_VISION_MAX_SEC)
-            if v:
-                return v, False
-            v = self._vision_state.vision_after_change(
-                Config.VLM_VISION_TTL_SEC, Config.VLM_STALE_VISION_MAX_SEC)
-            if v:
-                return v, True
-            return "", False
-        v = self._vision_state.fresh_vision(Config.VLM_VISION_TTL_SEC)
-        return (v if v else ""), False
+        v = self._vision_state.vision_for_user(
+            Config.VLM_VISION_TTL_SEC, Config.VLM_STATIC_VISION_MAX_SEC)
+        if v:
+            return v, False
+        v = self._vision_state.vision_after_change(
+            Config.VLM_VISION_TTL_SEC, Config.VLM_STALE_VISION_MAX_SEC)
+        if v:
+            return v, True
+        return "", False
 
     def _build_messages(
         self,
         stimulus: Stimulus,
         recent_turns: Optional[list[Turn]] = None,
         rag_chunks: Optional[list[RagChunk]] = None,
+        style_examples: Optional[str] = None,
     ) -> list[dict]:
         last_feedback = self._state.last_feedback if self._state is not None else None
         # D1: 内省が**いつの会話**を対象にしたか（watermark = そのスパン末尾の iso）。
@@ -208,11 +296,9 @@ class ResponseOrchestrator:
             if prev_iso:
                 age = elapsed_wall(prev_iso)
                 prev_gap = age if age > SESSION_GAP_SEC else None
-        # 画面の注入は**刺激種別で鮮度の意味を変える**（層分離）:
-        # - USER 発話: 変化していない間は据え置き可（静止画面でも「今何が見える?」に答えられる。
-        #   注入文言に「N秒前・以降変化なし」が付くので捏造にならない）。
-        # - 自発発話/機能報告: 鮮度 TTL 内＝「今さっき変化した画面」だけ。静止中に画面が入り続けて
-        #   同じ画面要素の話を繰り返す固執を断つ（実機実測で判定136回中135回に画面が入っていた）。
+        # 画面の注入: 変化していない間は据え置き（「N秒前の画面・以降変化なし」が付くので捏造にならない）。
+        # 2026-09-30 から自発発話・機能報告も同じ（以前は静止中に「画面情報なし」になっていた）。
+        # 静止中の同話題固執の層分離は、発話判定の入力と記憶の検索クエリ（`fresh_vision`）が担う。
         vision, vision_stale = self._vision_for(stimulus)
         # F5 自発発話: payload は AutonomousSpeech(content, reason)。content は**ユーザ発話でなく
         # イブ自身の下書き**として autonomous_content へ（ユーザ枠に入れると応答LLMが自分の発話に
@@ -290,6 +376,19 @@ class ResponseOrchestrator:
                 features_off = self._features_off_provider() or None
             except Exception:
                 logger.exception("オフ機能一覧の取得に失敗（注入なしで継続）")
+        # S3: この発話の後にイブが既に口にしたつなぎ言葉（USER 発話のときだけ）。
+        spoken_filler = None
+        if self._filler_provider is not None and stimulus.kind == StimulusKind.USER_UTTERANCE:
+            try:
+                spoken_filler = self._filler_provider() or None
+            except Exception:
+                logger.exception("つなぎ言葉の取得に失敗（無しで継続）")
+        emotion = None
+        if self._emotion_provider is not None:
+            try:
+                emotion = self._emotion_provider() or None
+            except Exception:
+                logger.exception("今の感情の取得に失敗（無しで継続）")
         # native ロール messages（system + user/assistant ターン列 + 最終 user発話/自発指示）。
         return self._ctx.assemble(
             user_text=user_text,
@@ -309,6 +408,9 @@ class ResponseOrchestrator:
             prev_session_gap_sec=prev_gap,
             features_off=features_off,
             self_model=self_model,
+            spoken_filler=spoken_filler,
+            emotion=emotion,
+            style_examples=style_examples if stimulus.kind == StimulusKind.USER_UTTERANCE else None,
         )
 
     def _notify_complete(self) -> None:
@@ -433,7 +535,26 @@ class ResponseOrchestrator:
                     return  # 再配達もしない（_maybe_redeliver を通さずに抜ける）
             except Exception:
                 logger.exception("抑止判定で例外（無視して通常配達）")
-        messages = self._build_messages(stimulus, recent, rag_chunks)
+        # 話し方の実例（ユーザ発話への応答だけ）。記憶の検索の後に選ぶ＝同じ発話の埋め込みを使い回せる
+        examples, shown = None, []
+        if self._style_examples is not None and stimulus.kind == StimulusKind.USER_UTTERANCE:
+            try:
+                examples, shown = await self._style_examples.pick(str(stimulus.payload))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("話し方の実例の選択に失敗（実例なしで継続）")
+                examples, shown = None, []
+        messages = self._build_messages(stimulus, recent, rag_chunks, style_examples=examples or None)
+        # S5 声のトーン: 応答を組み立てた時点の今の感情で**このターンは1つに決める**（ユーザ 2026-09-26
+        # 「ユーザー話し終わる前までの現感情→応答生成→発話」）。応答の途中で感情の判定が届いても声だけ
+        # 変わらない＝応答の文字（上の「# イブの今の気持ち」）と声の感情がそろう。
+        tone = None
+        if self._tone_provider is not None:
+            try:
+                tone = self._tone_provider() or None
+            except Exception:
+                logger.exception("声のトーンの取得に失敗（付けずに合成）")
         # J Call-Function: USER ターンのみ tools を渡す。tool_calls はここに溜め、応答完了後に submit。
         tools = self._dispatcher.tool_schemas() if self._tools_enabled_for(stimulus) else None
         tool_sink: list = []
@@ -447,6 +568,9 @@ class ResponseOrchestrator:
         spoken: list[str] = []  # C5: 実際に再生し終えた文だけが入る（生成≠発話）
         stream_complete = False  # stream が中断されず最後まで生成し切ったか（再配達の完全配達判定に使う）
         eve_recorded = False
+        # 同じ応答の中で答えを2回言い始めたら、そこから先は読み上げない（`_emit` の関門）。
+        said_keys: set[str] = set()
+        repeating = False
 
         def _record_eve() -> None:
             nonlocal eve_recorded
@@ -465,7 +589,7 @@ class ResponseOrchestrator:
                 async with sem:
                     if self._audio.current_generation() != gen:
                         return  # barge-in 済み: 起こさない（古い世代は破棄される）
-                    wav = await self._tts_fn(sentence)
+                    wav = await self._tts_fn(sentence + tone if tone else sentence)
                 # tts_fn が `(wav, meta)` を返す実装（`VoicevoxTTS.generate_with_meta`）にも対応。
                 # 単一値を返す従来の tts_fn（テスト/tools の偽物・`generate`）はここを素通りする
                 # ＝ meta は None のまま＝以降の UI 経路は完全に休眠する。
@@ -492,15 +616,33 @@ class ResponseOrchestrator:
                 self._audio.enqueue(gen, seq, wav, text=sentence, on_played=spoken.append)
 
         def _emit(sentence: str, *, auto: bool = False) -> None:
+            nonlocal repeating
             clean = sanitize_for_speech(sentence)  # 残留マークダウン除去（コードゲート）
-            if not clean:
-                return  # 記号だけの行は読み上げない
+            if not clean or repeating:
+                return  # 記号だけの行は読み上げない／繰り返しに入った後は読み上げない
+            # 応答の二重化の関門（実測 2026-09-30・gpt-6-luna reasoning_effort=none の 1308応答中 18件＝1.4%）:
+            # 答えを言い切った後に、言い回しを少し変えた**同じ答えをもう一度**出すことがある（間に
+            # 「vel」「/final_element」「<|END|>」が挟まることも）。そのまま読み上げると同じ説明を2回喋る。
+            # 前に言った節（8文字以上）とまったく同じ節が出たら「2回目に入った」とみなし、以降は読み上げない。
+            # stream は止めない（最後に来る tool_calls を取りこぼさないため・読み飛ばすだけ）。
+            key = _repeat_key(clean)
+            if len(key) >= REPEAT_MIN_CHARS and key in said_keys:
+                repeating = True
+                logger.warning("🔁 応答が同じ内容を繰り返し始めた→以降は読み上げない: %.30s", clean)
+                return
+            said_keys.add(key)
             # J-2 P2-1: auto=True(コード生成のフォールバック相槌)はログタグで区別する
             # （発話内容・記憶には印を付けない＝会話文脈を汚さない。デバッグ識別専用）。
             logger.info("🤖(auto-ack) %s" if auto else "🤖 %s", clean)
             parts.append(clean)
             seq = self._audio.reserve_seq(gen)  # stream 順に予約（再生は seq 昇順）
             tasks.append(asyncio.create_task(_tts_and_enqueue(seq, clean)))
+            if len(parts) == 1 and self._on_first_sentence is not None:
+                # S3「応答が近い」: 1文目の合成を始めた＝音声まで約0.2〜0.35秒（フィラーは次の語を始めない）
+                try:
+                    self._on_first_sentence()
+                except Exception:
+                    logger.exception("on_first_sentence フックで例外（無視して継続）")
 
         try:
             try:
@@ -525,10 +667,23 @@ class ResponseOrchestrator:
             if stream_complete and tool_sink and not parts:
                 # J-2 P2-1: 機能を呼びつつ発話ゼロで終わったターンへの最小限のフォールバック
                 # （barge-in等で stream_complete=False の時は追加しない＝古い世代を起こさない）。
-                _emit(_fallback_ack(tool_sink), auto=True)
+                # 応答LLM が引数に一言（reply）を書いていればそれを言う（「、」「。」で区切るのは本文と同じ）
+                ack, from_llm = _ack_from_tools(tool_sink)
+                if from_llm:
+                    ack_splitter = JapaneseSentenceSplitter()
+                    for sentence in ack_splitter.feed(ack) + ack_splitter.flush():
+                        _emit(sentence)
+                else:
+                    _emit(ack, auto=True)
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             self.last_response = "".join(parts)
+            if shown:
+                # 見せた実例をほぼそのまま言っていないか（止めはしない＝もう声に出ている。実例の選び直しの材料にログへ）
+                hit = self._style_examples.copy_suspect(self.last_response, shown)
+                if hit:
+                    logger.warning("📋 話し方の実例をほぼそのまま言った疑い: 「%.40s」≒ 実例「%.40s」",
+                                   self.last_response, hit)
             if self._cache is not None:
                 # 現ターンの音声が再生し切るまで待ってから「実発話」を記録（C5）。
                 await self._audio.join()
@@ -536,6 +691,15 @@ class ResponseOrchestrator:
             # F4: 正常完了時のみ feedback をトリガ（barge-in=CancelledError 経路では呼ばない）。
             # 直近の eve ターンが記録された後なので、worker のスパンに今回応答が含まれる。
             self._notify_complete()
+            # 「できない」と言った返事では委譲しない（言った内容を正とする・`_says_cannot` の注記）。
+            # 声にした文（本文。空なら reply）で判定する。cancel_task は触らない（取り消しは断りと両立する）。
+            if tool_sink and _says_cannot(self.last_response):
+                dropped = [tc for tc in tool_sink
+                           if ((tc.get("function") or {}) if isinstance(tc, dict) else {}).get("name") == "delegate_task"]
+                if dropped:
+                    tool_sink = [tc for tc in tool_sink if tc not in dropped]
+                    logger.warning("🚫 「できない」と言った返事の委譲を捨てた（%d件）: %.40s",
+                                   len(dropped), self.last_response)
             # J Call-Function: 応答完了後に tool_calls を実行へ submit（O(1)・非ブロッキング＝Eve は即解放）。
             # 実行は背景サイドカーで進む。barge-in(CancelledError)経路はここに到達しない＝submit しない。
             if tool_sink and self._dispatcher is not None:

@@ -39,9 +39,32 @@ terminal.log
 summary.json
 # P0 スパイクの出力（描画確認の PNG）
 spike/out/
+# 生成した音声（ユーザ裁定 2026-09-25「管理しないほうがよさそう」）。ローカルにだけあり、実行に要る
+# （voice_candidates/cand_04.wav は Irodori の話者の参照音声・bank/eve はフィラー）。
+# manifest.json 等の音声以外のファイルも含めてフォルダごと外す。
+bank/
+probe_breath/
+probe_emotion/
+tone_samples/
+voice_candidates/
+listen/
 # UI 素材（2026-08-13）: 購入した Live2D モデルと背景画像。**公開 MIT リポジトリに入れない**
 # （モデルは第三者の著作物で再配布不可。Live2D Cubism の資産も同様）。
 eve_ui/
+# 手元だけに置く性格・実例・評価結果（2026-10-06 ユーザ「コミットはコードとシステムプロンプトフォーマットだけで、
+# 実例データや詳細なペルソナは除外」）。リポジトリの persona.md は書式の見本で、本物は persona.local.md（あれば優先して読む）。
+# 話し方の実例 persona_examples.yaml は無ければ実例なしで動く。評価の道具の性格の案も手元だけ（無ければ案は空）。
+persona.local.md
+persona_examples.yaml
+tools/prompt_eval/persona_variants_local.py
+eval_report/
+system_prompts_review.md
+# フィラーの表・感情の表（データ）と、手元の作業記録・設計メモ（ユーザ 2026-10-06「含めない」・更新していない docs は
+# 混乱のもと）。表が無い環境ではフィラーは無効・声のトーンは付かない（起動は続く）
+fillers.yaml
+emotion.yaml
+docs/FILLER_IMPL_PLAN.md
+docs/FILLER_DESIGN.md
 # エディタ / OS メタファイル
 .idea/
 .vscode/

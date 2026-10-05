@@ -30,6 +30,50 @@ logger = logging.getLogger(__name__)
 _CACHE_MAX = 50  # クエリキャッシュ上限（超過は最古を捨てる）
 
 
+def set_dns_resolver(mod, resolver: str) -> bool:
+    """ddgs が中で使う HTTP クライアント（primp の Client / AsyncClient）の既定の名前解決を差し替える。
+
+    ddgs はこの設定を外に出していないので、クライアントを作る時の既定値を外から差し込む
+    （呼び出し側が dns_resolver を明示していればそちらが優先）。冪等。差し替えたら True。
+    `mod` は primp モジュール（テストでは偽物を渡せる）。
+    理由と実測は `Config.SEARCH_DNS_RESOLVER`。ライブラリの更新でこの口が無くなっても、
+    ここは何もしないだけ（＝ライブラリの既定の名前解決に戻る・検索は止めない）。
+    """
+    changed = False
+    for name in ("Client", "AsyncClient"):
+        orig = getattr(mod, name, None)
+        if orig is None or getattr(orig, "_eve_dns_resolver", None) == resolver:
+            continue
+        base = getattr(orig, "_eve_dns_base", orig)  # 既に差し替え済みなら元のクラスから作り直す
+
+        class _WithDns(base):  # type: ignore[misc, valid-type]
+            _eve_dns_resolver = resolver
+            _eve_dns_base = base
+
+            def __new__(cls, *args, **kwargs):
+                kwargs.setdefault("dns_resolver", cls._eve_dns_resolver)
+                return cls._eve_dns_base(*args, **kwargs)
+
+        _WithDns.__name__ = base.__name__
+        _WithDns.__qualname__ = base.__qualname__
+        setattr(mod, name, _WithDns)
+        changed = True
+    return changed
+
+
+def _use_dns_resolver(resolver: str) -> None:
+    """実機経路: primp に名前解決の既定を入れる（失敗しても検索は続ける＝ライブラリの既定のまま）。"""
+    if not resolver:
+        return
+    try:
+        import primp
+
+        if set_dns_resolver(primp, resolver):
+            logger.info("🔍 検索の名前解決: %s（ddgs の primp に設定）", resolver)
+    except Exception:
+        logger.warning("🔍 検索の名前解決を %s にできなかった（ライブラリの既定のまま）", resolver, exc_info=True)
+
+
 class SearchClient:
     """Web 検索の実行体（検索層のみ・inc1）。
 
@@ -70,6 +114,10 @@ class SearchClient:
                                    else Config.SEARCH_RETRY_EMPTY_DELAY_SEC)
         self._now = now_fn
         self._sleep = sleep_fn
+        if search_fn is None:
+            # 実機経路だけ（テストの偽の検索では触らない）。検索は別スレッドで走るので、ライブラリの差し替えは
+            # ここ（作る時＝ループ側で1回）で済ませておく
+            _use_dns_resolver(Config.SEARCH_DNS_RESOLVER)
         self._last_search_at = float("-inf")  # 最後に実検索を発射した mono 時刻
         self._cache: dict[str, tuple[float, str]] = {}  # 正規化クエリ -> (mono, ダイジェスト)
         self._fail_streak = 0  # 連続失敗（種別問わず・成功でリセット）

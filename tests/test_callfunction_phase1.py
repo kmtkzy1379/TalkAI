@@ -289,6 +289,56 @@ async def t_orch_captures_and_submits() -> bool:
         Config.CALLFUNCTION_ENABLED = False
 
 
+async def t_orch_refusal_drops_delegate() -> bool:
+    """「できない」と言った返事では delegate_task を捨てる（2026-10-01・ユーザ「不可能作業はタスク依頼しないで。
+    その場でなんでできないか説明させたい」）。実測の形: 本文は空・reply で断りつつ委譲（when=3600）／本文で断りつつ委譲。
+    取り消し（cancel_task）と、断っていない普通の委譲はそのまま通す。"""
+    Config.CALLFUNCTION_ENABLED = True
+    try:
+        results = []
+        cases = [
+            # (本文, tool_calls, 期待: submit される関数名)
+            ("", [_tc("c1", "delegate_task", '{"goal":"明日の朝7時に起こして","when_seconds":3600,'
+                                              '"reply":"ごめん、予約できるのは1時間先までなんだ。明日の朝7時には起こせないよ。"}')], []),
+            ("ごめん、予定表は確認できないんだ。", [_tc("c2", "delegate_task", '{"goal":"明日のミーティングが何時か調べて","reply":"x"}')], []),
+            ("ごめん、それはできないんだ。", [_tc("c3", "delegate_task", '{"goal":"g","reply":"x"}'), _tc("c4", "cancel_task")],
+             ["cancel_task"]),
+            ("", [_tc("c5", "delegate_task", '{"goal":"明日の東京の天気を調べて","reply":"明日の東京の天気、調べるね。"}')],
+             ["delegate_task"]),
+            # 断った上で別の手を引き受けた返事は捨てない（捨てると「調べてみるね」が破られる約束になる）。実際の出力
+            ("あー、私は実際にドラマを見ることはできないんだ。タイトルは知らないから、ちょっと調べてみるね。",
+             [_tc("c6", "delegate_task", '{"goal":"『ひだまり書店のミネコさん』というドラマについて調べて","reply":"x"}')],
+             ["delegate_task"]),
+            ("あー、私は実際にドラマを見ることはできないんだ。作品のことを聞いてるなら、今の情報を調べて話せるよ。",
+             [_tc("c7", "delegate_task", '{"goal":"ドラマについて調べて","reply":"x"}')], ["delegate_task"]),
+            ("ごめん、アラームで起こす機能はないんだ。30分後に通知する予約ならできるけど、通知で起きられそう？",
+             [_tc("c8", "delegate_task", '{"goal":"30分後に起こして","when_seconds":1800,"reply":"x"}')], ["delegate_task"]),
+            # 断ってユーザに別の手を勧めるだけ（引き受けていない）は捨てる
+            ("それはイラつくよね。ごめん、予定表は見られないから、明日のミーティングの時間は確認できないんだ。"
+             "別の場所に書いてあるなら、そこを見てみて。",
+             [_tc("c9", "delegate_task", '{"goal":"明日のミーティングの時間を教えて","reply":"x"}')], []),
+        ]
+        for text, calls, want in cases:
+            audio = AudioPlayQueue(play_fn=_noop_play)
+            disp = FakeDispatcher([{"type": "function", "function": {"name": "delegate_task"}}])
+
+            async def stream_fn(messages, *, tools=None, tool_sink=None, _t=text, _c=calls):
+                if _t:
+                    yield _t
+                if tool_sink is not None:
+                    tool_sink.extend(_c)
+
+            orch = ResponseOrchestrator(audio, stream_fn, _tts, dispatcher=disp)
+            w = asyncio.create_task(audio.play_worker())
+            await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "お願い"))
+            w.cancel()
+            got = [tc["function"]["name"] for batch in disp.submitted for tc in batch]
+            results.append(got == want)
+        return all(results)
+    finally:
+        Config.CALLFUNCTION_ENABLED = False
+
+
 async def t_orch_result_render_and_suppress() -> bool:
     Config.CALLFUNCTION_ENABLED = True
     try:
@@ -392,6 +442,87 @@ async def t_orch_toolonly_fallback_names_tool_specific_ack() -> bool:
         return orch.last_response == "やっとくね。"
     finally:
         Config.CALLFUNCTION_ENABLED = False
+
+
+async def _toolonly_turn(args: str, text_chunks=()) -> str:
+    """delegate_task を1つ返すターン（本文 text_chunks・引数 args）を流して、言った全文を返す。"""
+    Config.CALLFUNCTION_ENABLED = True
+    try:
+        audio = AudioPlayQueue(play_fn=_noop_play)
+        disp = FakeDispatcher([{"type": "function", "function": {"name": "delegate_task"}}])
+
+        async def stream_fn(messages, *, tools=None, tool_sink=None):
+            for c in text_chunks:
+                yield c
+            if tool_sink is not None:
+                tool_sink.append(_tc("c1", "delegate_task", args))
+
+        orch = ResponseOrchestrator(audio, stream_fn, _tts, dispatcher=disp)
+        w = asyncio.create_task(audio.play_worker())
+        await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "明日の天気調べて"))
+        w.cancel()
+        return orch.last_response
+    finally:
+        Config.CALLFUNCTION_ENABLED = False
+
+
+async def t_orch_toolonly_uses_reply() -> bool:
+    # ユーザ採用 2026-09-29: 本文が空でも、応答LLM が引数に書いた一言（reply）を言う（定型の「やっとくね。」にしない）
+    said = await _toolonly_turn('{"goal": "明日の天気を調べて", "reply": "明日の天気、確認してみるね。"}')
+    return said == "明日の天気、確認してみるね。"
+
+
+async def t_orch_reply_not_added_when_text() -> bool:
+    # 本文があれば本文だけ（引数の一言を重ねて言わない）
+    said = await _toolonly_turn('{"goal": "明日の天気を調べて", "reply": "調べるね。"}', ("天気、", "見てみるね。"))
+    return said == "天気、見てみるね。"
+
+
+async def t_orch_reply_bad_falls_back() -> bool:
+    # 一言が長すぎる・空・引数が壊れている時は定型に戻る（無言にしない）
+    long_ = await _toolonly_turn('{"goal": "x", "reply": "' + "あ" * 81 + '"}')
+    empty = await _toolonly_turn('{"goal": "x", "reply": "  "}')
+    broken = await _toolonly_turn('{"goal": "x", "reply": ')
+    return long_ == empty == broken == "やっとくね。"
+
+
+def t_delegate_schema_reply() -> bool:
+    # delegate_task の引数に reply（必須）・説明から「やっとくね」の定型を外した・プロンプトも同じ
+    import tempfile
+
+    from eve.capability.registry import CapabilityRegistry
+    from eve.context_assembler import ContextAssembler
+    from eve.task import TaskStore, register_task_capabilities
+
+    reg = CapabilityRegistry()
+    register_task_capabilities(reg, TaskStore(task_file=os.path.join(tempfile.mkdtemp(), "t.jsonl")))
+    sch = next(s for s in reg.tool_schemas() if s["function"]["name"] == "delegate_task")["function"]
+    tool_sys = ContextAssembler(system_prompt="SYS").assemble(user_text="x", tools_active=True)[0]["content"]
+    return ("reply" in sch["parameters"]["properties"] and sch["parameters"]["required"] == ["goal", "reply"]
+            and "やっとくね" not in sch["description"] and "依頼の中身に合った短い一言" in sch["description"]
+            and "「やっとくね」と一言添えれば" not in tool_sys and "依頼の中身に合った短い一言" in tool_sys)
+
+
+def t_report_turn_ends_with_user() -> bool:
+    """機能の報告ターンは最後をユーザ側の（指示）で終える（2026-10-04・Gemini は最後がモデルの発言だと 400 で断る）。
+    直近会話がユーザの発言で終わっている時は足さない（二重にしない）。"""
+    from eve.clock import Stamp
+    from eve.context_assembler import REPORT_CUE, SPEAKER_EVE, ContextAssembler, Turn
+    SPEAKER_USER = "user"
+
+    ca = ContextAssembler(system_prompt="S")
+    st = Stamp.now()
+    after_eve = ca.assemble(callfunction_result="検索結果: 東京は晴れ",
+                            recent_turns=[Turn(speaker=SPEAKER_USER, text="天気調べて", stamp=st),
+                                          Turn(speaker=SPEAKER_EVE, text="調べるね", stamp=st)])
+    empty = ca.assemble(callfunction_result="x")
+    after_user = ca.assemble(callfunction_result="x",
+                             recent_turns=[Turn(speaker=SPEAKER_USER, text="まだ？", stamp=st)])
+    plain = ca.assemble(user_text="やあ")
+    return (after_eve[-1] == {"role": "user", "content": REPORT_CUE}
+            and empty[-1]["content"] == REPORT_CUE
+            and after_user[-1]["content"] == "まだ？"
+            and sum(1 for m in plain if m["content"] == REPORT_CUE) == 0)
 
 
 async def t_delivery_checker_submitted_on_normal_completion() -> bool:
@@ -544,10 +675,17 @@ async def main() -> None:
     check("Dispatcher: report_result=False は成功時 再投入しない", await t_dispatcher_report_result_suppress())
     check("Dispatcher: 未対応は ok=False", await t_dispatcher_unknown())
     check("Orch: tool_calls 捕捉→完了後 submit・前置きは発話", await t_orch_captures_and_submits())
+    check("⭐Orch: 「できない」と言った返事の delegate_task は捨てる（取り消し・普通の委譲は通す）",
+          await t_orch_refusal_drops_delegate())
     check("Orch: 結果は「# 機能実行結果」へ・1ホップ抑制", await t_orch_result_render_and_suppress())
     check("Orch: barge-in では submit しない", await t_orch_bargein_no_submit())
     check("J-2 P2-1: tool のみ(無発話)は既定フォールバック相槌", await t_orch_toolonly_no_content())
     check("J-2 P2-1: delegate_task はtool名別の定型相槌", await t_orch_toolonly_fallback_names_tool_specific_ack())
+    check("一言: 本文が空なら引数の一言（reply）を言う", await t_orch_toolonly_uses_reply())
+    check("一言: 本文があれば引数の一言は重ねない", await t_orch_reply_not_added_when_text())
+    check("一言: 長すぎ・空・壊れた引数は定型に戻る", await t_orch_reply_bad_falls_back())
+    check("一言: delegate_task に reply（必須）・定型の文言を外した（説明とプロンプト）", t_delegate_schema_reply())
+    check("報告ターンは最後をユーザ側の（指示）で終える（Gemini 対応）", t_report_turn_ends_with_user())
     check("J-2 P2-1: barge-in(stream未完走)はフォールバックしない", await t_orch_toolonly_fallback_skipped_on_bargein())
     check("J-2 P1-1: barge-inなし完了は配達確認へsubmit", await t_delivery_checker_submitted_on_normal_completion())
     check("J-2 P1-1: USER_UTTERANCEは配達確認の対象外", await t_delivery_checker_not_submitted_for_user_utterance())
@@ -939,11 +1077,9 @@ async def t_no_redeliver_after_midstop() -> bool:
     """
     started = asyncio.Event()
 
-    async def play_fn(audio_bytes, should_stop=None):
+    async def play_fn(audio_bytes):
         started.set()
-        for _ in range(100):
-            if should_stop is not None and should_stop():
-                return  # 途中停止（それでも on_played は呼ばれる＝C5）
+        for _ in range(10):  # 節を鳴らす（割り込まれても言い切る）
             await asyncio.sleep(0.01)
     audio = AudioPlayQueue(play_fn=play_fn)
     captured = []
@@ -967,7 +1103,8 @@ async def t_no_redeliver_after_midstop() -> bool:
     except asyncio.CancelledError:
         pass
     no_retry = captured == []                       # 再配達は予約されない
-    remembered = cache.turns == [("eve", "タスク終わったよ、いまは二十一時。")]  # 記憶に残る
+    # 記憶に残るのは実際に鳴った節だけ（「、」で区切って1節ずつ鳴らす・割り込まれたら言い切って譲る）
+    remembered = cache.turns == [("eve", "タスク終わったよ、")]
     await asyncio.sleep(0.1)                        # play が戻っても状況は変わらない
     stable = captured == []
     w.cancel()

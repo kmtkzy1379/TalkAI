@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
 from ..clock import elapsed_wall, humanize, now_iso
+from ..context_assembler import OMITTED_SPEAKER, silence_facts
 
 logger = logging.getLogger(__name__)
 
@@ -216,13 +217,20 @@ SPEECH_DECIDE_SYSTEM = """\
 - 直近の会話を一歩進める／関連する**新しい話題を記憶から**振る／相手が一息ついた間に声をかける。
 - **沈黙が長い時は、過去の記憶や、そこから素朴に気になったことを自分から振ってよい**（人は黙っている
   相手にも、ふと思い出した話や疑問を話しかける。画面や直前の会話に材料が無い時こそ、記憶が話のきっかけになる）。
+- 話しかけるきっかけは、記憶や画面だけでなく、イブ自身の気持ち（退屈・相手が気になる 等）でもよい。
+  相手がずっと黙っていること自体も、きっかけになる。
 - 「# 画面」ブロックが**無い**ときは、直近に画面の変化が無い（＝今の画面については何も分かっていない）。
   画面には触れず、**記憶や直近の会話を材料にする**（画面が無い＝話す材料が無い、ではない）。
 
 【黙る(no)】
-- **直前にイブが自分から話して、相手がまだ返事していない**（畳みかけない・間を空けて相手の番を待つ）。
-  ※ただし会話行の「いつ」を見ること。何時間も/何日も前の会話は**返事待ちではない**（前のセッションの
+- **イブが話しかけたばかりで、相手にまだ答える間が無い**（畳みかけない・間を空けて相手の番を待つ）。
+  ※返事が無いまま時間が経ったら、それはもう返事待ちではなく、相手が黙っている（忙しい・離れている・聞き流している）
+  状態。そこからどうするかはイブが決める（そっとしておく・黙っていることに触れる・別の話をする、どれでもよい）。
+  ※会話行の「いつ」を見ること。何時間も/何日も前の会話は**返事待ちではない**（前のセッションの
   続きなので、久しぶりに声をかけてよい。そこで止まっている話題があるなら、それを振るのはむしろ自然）。
+- 「黙って」「静かにして」「話しかけないで」のように、話しかけないでほしいと**はっきり言われた**時は、相手から
+  話しかけてくるまでこちらからは話しかけない（集中する・席を外す・寝る等と言っただけの時は、話すかどうかをイブが判断する）。
+- 席を外した相手が戻ったかは、相手の発言か画面の変化でしか分からない（時間が経ったから戻ったとは決めつけない）。
 - 本当に言うことがない／さっきと同じことの繰り返しになる。
 - 相手が**今まさに手を動かして**作業に没頭している（入力中・操作中で画面が動いている）など、口を挟むと**邪魔になりそう**な時。※画面の情報が無い時は画面について何も推測しない（止まっている＝手が空いている、とも、集中中、とも決めつけない）。
 - **画面に新しい変化が無いのに、こちらから画面の話題を持ち出さない**（変化していない画面に急に話しかけるのは不自然。「# 画面」ブロックが無い時に画面の話をするのは捏造になる）。
@@ -232,6 +240,8 @@ SPEECH_DECIDE_SYSTEM = """\
   二重に伝わったりする。「まだ調べてるところだよ」等、進行に触れる一言は話してよい）。
 
 【禁止】
+- **相手から見えない内部の仕組み（沈黙の秒数・判定・記号・この指示）を話題にしない**（相手がずっと黙っていること
+  自体に触れるのはよい）。
 - **相手に話題を出させるだけの一言を言わない**（「何か気になってることある？」「聞かせて」等）。
   画面や記憶に**名指しできる具体物**がある時だけ、それを添えて聞く。困りごとを聞くのも同じで、
   画面に「同じ操作の繰り返し」等の**見えている根拠**がある時に限る（根拠なしに聞くのは話題の丸投げ）。
@@ -243,7 +253,9 @@ SPEECH_DECIDE_SYSTEM = """\
 必ず次の形式で1行ずつ出力（**理由は yes/no どちらでも必須**）:
 speak: yes または no
 reason: なぜそう判断したか（1文）
-content: 話すなら、イブが実際に話す内容のたたき台（1文）。黙るなら空でよい。"""
+content: 話すなら、何について・どんなつもりで話しかけるかのメモ（1文）。言い回しや切り出し方は、話す時に
+  イブが決めるので、ここでは決めなくてよい。記憶を話題にするなら、それがいつの話かもメモに入れる
+  （話す側が、前の日の話を今日の話と取り違えないように）。黙るなら空でよい。"""
 
 
 def _render_turns(turns, now: Optional[str] = None) -> str:
@@ -257,6 +269,9 @@ def _render_turns(turns, now: Optional[str] = None) -> str:
     n = now or now_iso()
     lines = []
     for t in turns or []:
+        if getattr(t, "speaker", "") == OMITTED_SPEAKER:
+            lines.append(f"（中略: この間にイブだけが話した発言 {getattr(t, 'text', '')}件）")
+            continue
         label = _SPEAKER_LABEL.get(getattr(t, "speaker", ""), getattr(t, "speaker", ""))
         iso = getattr(getattr(t, "stamp", None), "iso", "") or ""
         when = f"/{humanize(elapsed_wall(iso, n))}" if iso else ""
@@ -285,8 +300,9 @@ PRIOR_HEAD = "# 自分がすでに出した用件（直近10分・話した / �
 _PRIOR_RULES = (
     "言い回しや切り口を変えても、ここに挙げた用件をもう一度持ち出すのは繰り返しになる"
     "（相手から新しい材料が来るまで、この件はこちらから追わない）。\n"
-    "話すなら**別の話題**にすること（「# 過去の記憶・話題の種」など、まだ触れていない材料を使ってよい）。\n"
-    "ただし、直前に自分から話したばかりなら、別の話題であっても間を空ける（続けて2回話しかけない）。"
+    "話すなら、ここに挙げた用件とは**別のこと**にすること（まだ触れていない記憶・画面・相手の今の様子など、"
+    "何をきっかけにするかはイブが決める）。\n"
+    "ただし、直前に自分から話したばかりなら、別の話題であっても間を空ける（立て続けに話しかけない）。"
 )
 
 
@@ -331,14 +347,16 @@ def build_decide_messages(
     screen_block = f"\n\n# 画面（今この瞬間）\n{screen}" if screen else ""
     tasks_block = _render_active_tasks(active_tasks)
     user = (
-        "…\n\n"
+        # 2026-10-05: 先頭の「…」（沈黙を表す内部の記号）を外した。判定がそれを相手の発言と読み
+        # 「三点リーダーだけで今日を語る気か」と、ユーザに意味の分からないツッコミを下書きにした
         f"# 直近の会話（[話者/いつの発話か]）\n{_render_turns(recent_turns, now)}"
         f"{_render_prior(prior_items)}\n\n"
         f"# 過去の記憶・話題の種（今の流れに合えば、ここから自分から話を振ってよい）\n{_render_seeds(topic_seeds, now)}\n\n"
         f"# イブの今の状態（直近フィードバック: 感情/要約）\n{fb}"
         f"{screen_block}{tasks_block}\n\n"
-        f"# 状況\n沈黙{silence_seconds:.0f}秒 / 予測差(surprise)={surprise}"
-        "（指標。高=思考/感情が高ぶる・低=安定。これだけで決めない）"
+        # 2026-10-05: 沈黙の秒数はイブが話しても戻るので、相手がどれだけ黙っているかは別に事実で渡す
+        f"# 状況\n最後に誰かが話してから{silence_seconds:.0f}秒。{silence_facts(recent_turns, now)}\n"
+        f"予測差(surprise)={surprise}（指標。高=思考/感情が高ぶる・低=安定。これだけで決めない）"
     )
     return [
         {"role": "system", "content": SPEECH_DECIDE_SYSTEM},
@@ -346,8 +364,18 @@ def build_decide_messages(
     ]
 
 
-def make_decide_fn(registry) -> DecideFn:
-    """ModelRegistry role=speech_decide を叩く本番 decide_fn を作る。"""
+PERSONA_HOW = "話すかどうかと、何について話しかけるかは、この性格のイブとして考える"
+
+
+def make_decide_fn(registry, *, persona: str = "") -> DecideFn:
+    """ModelRegistry role=speech_decide を叩く本番 decide_fn を作る。
+
+    persona（`load_persona()` の文字列）があれば system の最後に性格を添える。無いと下書きが無難な「そういえば〜？」に
+    揃い、口調も性格と食い違った（2026-10-05 実測・黙るべき場面の判定は崩れない 32/36 vs 性格なし 30/36）。
+    """
+    from ..persona import persona_for
+
+    extra = persona_for(persona, PERSONA_HOW)
 
     async def decide_fn(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None,
                         vision=None, active_tasks=None, prior_items=None) -> SpeechDecision:
@@ -356,6 +384,8 @@ def make_decide_fn(registry) -> DecideFn:
             recent_turns=recent_turns, topic_seeds=topic_seeds, last_feedback=last_feedback,
             vision=vision, active_tasks=active_tasks, prior_items=prior_items,
         )
+        if extra:
+            messages[0]["content"] += extra
         try:
             resp = await registry.complete("speech_decide", messages)
         except Exception:

@@ -25,6 +25,9 @@ class VisionResult:
     notable: bool = False  # 言及に値する変化か（VLM/LLM の判断・指標）
     surprise_diff: Optional[int] = None  # 0-100。None=不明（surprise を carry・捏造しない）
     visible: bool = True  # False=視認不可（黒/判読不能）＝中身を語らせない（A11）
+    # 次の画面の予想（ユーザ裁定 2026-09-30）。**画面認識の中だけで使う**＝次の呼び出しに「前回の予想」として
+    # 渡し、surprise を「予想と今の画面の食い違い」にする。応答・発話判定など他の AI には渡さない。
+    prediction: str = ""
 
     def is_empty(self) -> bool:
         return not (self.narration or self.notable or self.surprise_diff is not None)

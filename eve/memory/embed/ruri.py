@@ -25,6 +25,8 @@ class RuriEmbedder(Embedder):
         self.model_name = model_name or Config.RURI_MODEL
         self._model = None
         self.dim = 768  # ruri-v3-310m。ロード後に実値で上書きする
+        # 直近のクエリの埋め込み（同じターンで記憶の検索と話し方の実例の除外が同じ発話を埋め込む＝二度計算しない）
+        self._recent: dict[str, list[float]] = {}
 
     def _get_model(self):
         if self._model is None:
@@ -54,8 +56,14 @@ class RuriEmbedder(Embedder):
         return await loop.run_in_executor(None, self._encode, prefixed)
 
     async def embed_query(self, text: str) -> list[float]:
+        hit = self._recent.get(text)
+        if hit is not None:
+            return hit
         loop = asyncio.get_running_loop()
         res = await loop.run_in_executor(None, self._encode, [QUERY_PREFIX + text])
+        if len(self._recent) >= 8:
+            self._recent.pop(next(iter(self._recent)))  # いちばん古いものを捨てる
+        self._recent[text] = res[0]
         return res[0]
 
     async def warmup(self) -> None:

@@ -294,7 +294,8 @@ class Harness:
     def __init__(self) -> None:
         self.vl = VoiceLoop()
         if os.getenv("REAL_AUDIO") != "1":
-            # 署名が RealAudioPlayer.play_fn と同形（should_stop対応判定は有効なまま）
+            # 実再生時間だけ待つ偽物に差し替える（2026-09-26 から AudioPlayQueue は音声だけを渡す＝
+            # 割り込まれても鳴っている節は最後まで。should_stop は渡らないので下の分岐は通らない）
             self.vl.audio._play_fn = DurationSimPlayer().play_fn
         self.started = asyncio.Event()
         outer = self
@@ -305,6 +306,9 @@ class Harness:
 
             def stop(self):
                 pass
+
+            def user_in_speech(self):
+                return False  # VAD が無い（話している途中かの判定＝割り込みのかけ直しは起きない）
 
         self.vl.input = StubInput()
         self.handles: list[tuple[float, str, str, str, bool]] = []  # (mono, kind, dedup, text, cancelled)

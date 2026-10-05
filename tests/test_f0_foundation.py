@@ -194,8 +194,11 @@ check("D3 一覧は registry 導出（新能力が自動で載る）", "架空�
 # ⭐死活: offered（delegate_task/cancel_task）から導出してはいけない。
 # offered 導出だと実在する検索やPC状態確認が「できない」ことになり、2026-07-28 12:24-12:26 の
 # 実機事故（tool 不在時に5連続で誤拒否）を再現する。
+# 見るのは手段の一覧の行（2026-10-01 から、同じブロックの規則文が「`delegate_task` にも回さない」と
+# 配管名を禁止の側で出すようになった。一覧に配管名が混ざる事故は、この行で必ず捕まる）。
+_d3_list = next(ln for ln in d3_blk.splitlines() if ln.startswith("実行できるのは次だけ"))
 check("D3 offered 由来の配管名を手段として出さない",
-      "delegate_task" not in d3_blk and "cancel_task" not in d3_blk)
+      "delegate_task" not in _d3_list and "cancel_task" not in _d3_list)
 check("D3 括弧の補足と実装語を落とす", "スニペット" not in d3_blk)
 
 # ⭐死活: 過剰拒否を防ぐ逃がしの一文（`# 画面` の不在マーカと同じ役割・削除禁止）。
@@ -260,6 +263,23 @@ for _w in NEVER_MEANS:
 check("D3 否定の例示に構成依存語を書かない（assembler）",
       "ファイルの作成" not in d3_blk and "アプリの起動" not in d3_blk)
 check("D3 否定の例示に構成依存語を書かない（delegate_task）", "ファイル操作" not in _dt_desc)
+
+# 2026-10-01 ユーザ「不可能作業はタスク依頼しないでほしい（引き受けるのはハルシネーション）」「簡単な知識はタスクに
+# 回さず持ってる知識で答えて」＋ZG02（会話の返事と質問を goal にして委譲した）。測った文面を固定する
+# （`tools/prompt_eval/`・gpt-6-luna: 一般常識の委譲 10/21→0/21・見ていない場面 5/24→0/24・最新の情報は 9/9 のまま）。
+from eve.task.capabilities import MAX_WHEN_SEC, _span_ja  # noqa: E402
+
+_tool_sys = _ca.assemble(user_text="x", tools_active=True)[0]["content"]
+check("D3 手段の無い依頼は delegate_task にも回さない", "手段の無いことは `delegate_task` にも回さない" in d3_blk)
+check("委譲: 一般常識はその場で答える", "委譲せずその場で自分の知識で答える" in _tool_sys)
+check("委譲: 最新の情報・知らない名前は調べる（一般常識の文で調べ物まで止めない）",
+      "最新の情報・日によって変わる数字・知らない名前や言葉は委譲して調べる" in _tool_sys)
+check("委譲: 会話の返事・質問は委譲しない（ZG02）", "会話の返事・相づち・ユーザへの質問は委譲しない" in _tool_sys)
+check("委譲: 旧文言「簡単な事も委譲してよい」が戻っていない", "簡単な事も委譲してよい" not in _tool_sys)
+check("delegate_task: 旧文言「どんな簡単な事も」が戻っていない（system と食い違う）", "どんな簡単な事も" not in _dt_desc)
+check("delegate_task: 予約の上限は MAX_WHEN_SEC から書く",
+      f"最大{int(MAX_WHEN_SEC)}秒＝{_span_ja(MAX_WHEN_SEC)}先まで" in _dt_desc)
+check("delegate_task: 上限の言い方", _span_ja(3600) == "1時間" and _span_ja(1800) == "30分" and _span_ja(7200) == "2時間")
 
 print(f"\n合計: PASS {_passed} / FAIL {_failed}")
 sys.exit(1 if _failed else 0)

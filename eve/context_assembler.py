@@ -35,6 +35,21 @@ ROLE_ANCHOR = (
     "自分の質問に自分で答えたりしないでください。"
 )
 
+# S3: ユーザの話し終わりにイブが既に口にしたつなぎ言葉（応答非依存フィラー）。
+# 前置きは user メッセージにだけ付ける（payload・会話履歴・RAG には入らない）。書き出しとの重複は
+# まずプロンプトで抑える（ユーザ裁定 2026-09-25「コード肥大するからあまりやりたくない」）。
+FILLER_PREFIX = "（直前にあなたが口にしたつなぎ言葉: {}）"
+# 機能の報告ターンで会話がイブの発言で終わる時に足す、ユーザ側の指示（ユーザの発言ではない）
+REPORT_CUE = "（指示）頼まれていた機能の結果が届きました。上の「# 機能実行結果」を、あなた（イブ）から自分の言葉で伝えてください。"
+FILLER_RULE = (
+    "# つなぎ言葉\n"
+    "あなたはユーザの話を聞き終えた直後、考えている間のつなぎ言葉（「あー」「えー」など）を"
+    "既に声に出していることがある。その時は user メッセージの先頭に"
+    "（直前にあなたが口にしたつなぎ言葉: …）と示す。応答はその続きとして話し、"
+    "**同じつなぎ言葉や似たつなぎ言葉で書き出さない**（例: 「あー」の後に「あー、それは…」と始めない）。"
+    "つなぎ言葉そのものを読み上げたり、それについて説明したりしない。"
+)
+
 
 @dataclass
 class Turn:
@@ -72,19 +87,60 @@ def messages_to_text(messages: list[dict]) -> str:
     return "\n\n".join(f"<{m.get('role')}>\n{m.get('content', '')}" for m in messages)
 
 
+def silence_facts(recent_turns, now: str | None = None, *, me: str = "イブ") -> str:
+    """相手（ユーザ）が最後に話してからの経過と、そのあとイブだけが話した回数（事実だけ・どうするかは書かない）。
+
+    沈黙の時計（`SpeechState`）はイブが話しても戻るので、それだけでは「相手がずっと黙っている」ことが
+    見えない（2026-10-05 実測: 返事の無いまま話しかけ続けても、無視されていることに一度も触れなかった）。
+    省略マーカ（間のイブの発話の件数）も数える。me は文中のイブの呼び方（応答の指示では「あなた」）。
+    """
+    last_user = None
+    eve_after = 0
+    for t in recent_turns or []:
+        if t.speaker == "user":
+            last_user, eve_after = t, 0
+        elif t.speaker == SPEAKER_EVE:
+            eve_after += 1
+        elif t.speaker == OMITTED_SPEAKER:
+            eve_after += int(t.text) if str(t.text).isdigit() else 0
+    if last_user is None:
+        return "この起動から、相手はまだ何も話していない。"
+    ago = humanize(elapsed_wall(getattr(last_user.stamp, "iso", "") or "", now))
+    if eve_after == 0:
+        return f"相手が最後に話したのは{ago}。"
+    return f"相手が最後に話したのは{ago}。それ以降、相手は何も言っておらず、{me}だけが{eve_after}回話した。"
+
+
 class ContextAssembler:
-    def __init__(self, system_prompt: str = "") -> None:
+    def __init__(self, system_prompt: str = "", reply_opener: str = "") -> None:
         self.system_prompt = system_prompt
+        # S4: 応答の書き出しに置く応答依存フィラーの表（`eve/filler/prompt.py`）。
+        # **ユーザ発話への応答のときだけ**入れる（自発発話・機能報告の書き出しに「へー」は付かない）。
+        self.reply_opener = reply_opener
 
     def _build_system(self, *, rag_chunks, last_feedback, vision, vision_stale,
                       speech_decision_reason, now,
                       callfunction_result=None, tools_active=False, active_tasks=None,
                       last_feedback_iso=None, session_gap_sec=None, capabilities=None,
-                      features_off=None, self_model=None) -> str:
+                      features_off=None, self_model=None, spoken_filler=None,
+                      user_reply=False, emotion=None, style_examples=None) -> str:
         parts: list[str] = []
         if self.system_prompt:
             parts.append(self.system_prompt)
+        if style_examples:
+            # 話し方の実例（`eve/persona_examples.py`）。性格（system_prompt の最後）の直後に置く＝測った置き方
+            # （`tools/prompt_eval/` の N5＋実例）。毎ターン入れ替わる。
+            parts.append(style_examples)
         parts.append(ROLE_ANCHOR)
+        if user_reply and self.reply_opener:
+            parts.append(self.reply_opener)
+        if spoken_filler:
+            # このターンで実際に口にした時だけ出す（常時出すとプロンプトが太るだけ）
+            parts.append(FILLER_RULE)
+        if emotion:
+            # S5（ユーザ裁定 2026-09-26「その感情によって…応答LLM…に入れたりして感情にそった応答をさせる」）。
+            # ユーザの話の「、」「。」ごと・フィードバックで更新されるイブの今の感情（`eve/emotion.py`）
+            parts.append(f"# イブの今の気持ち\n{emotion}。この気持ちに沿って話す（気持ちを言葉で説明しなくてよい）")
         if features_off:
             # UI で機能を OFF にしている間の断り書き（ユーザ裁定 2026-08-14）。
             # **「機能が無い」と言わせない**: 「画面を見る機能がない」は事実と違い、
@@ -138,11 +194,18 @@ class ContextAssembler:
             # なる（判定LLM側には同じ規則があるのに応答側だけ無かった非対称）。
             # 最後の1文は必須: これが無いと画面を匂わせる質問すべてを「見えないから分からない」で
             # 潰し、会話から推測して寄り添う応答が消える（実測）。
+            #
+            # 2026-09-30 文言を変えた（ユーザ指摘「画面情報なし・今この瞬間の画面は届いていない、は正解だけど誤解を
+            # 生みそう」）。旧文言は「今は画面が見えていない」と言わせており、能力が無いように聞こえた（実測 3/3）。
+            # ここに来るのは**本当に読めていない時だけ**（起動直後で実況がまだ無い・キャプチャ停止・真っ黒・実況が
+            # 詰まった）。静止しているだけの画面は `vision_for_user` が「N秒前の画面。以降ずっと変化なし」で渡す
+            # （自発発話・機能報告も同じ・`orchestrator._vision_for`）。ブロックごと消す案は、画面を聞かれた時に
+            # 画面を見るタスクを勝手に始めた（3/3・タスク担当は画面を見られない）ので採らない。
             parts.append(
-                "# 画面（今この瞬間）\n（画面情報なし：今この瞬間の画面は届いていない）\n"
+                "# 画面\n（今は画面の中身を読み取れていない）\n"
                 "**画面に何が映っているかを、推測や過去の記憶から作らない**"
                 "（# 参照 に出てくる画面の話は過去のもので、今の画面ではない）。"
-                "画面の内容そのものを聞かれたら「今は画面が見えていない」と正直に言う。"
+                "画面のことを聞かれたら、今は読み取れていないと伝える。"
                 "画面以外（会話の流れ・相手の様子）から言えることは、これまでどおり普通に話してよい。"
             )
         if last_feedback:
@@ -195,11 +258,28 @@ class ContextAssembler:
         if tools_active:
             parts.append(
                 "# 機能（Call-Function）の使い方\n"
-                "必要なら提供された関数を呼んでよい。呼ぶ前に「ちょっと調べるね」等の短い前置きを一言"
-                "添えてよい。関数名・引数・JSON は読み上げない（呼び出しは自動で発話されない）。\n"
-                "**タスク（調べ物・状態確認・後回しの予約）は自分でやらず、`delegate_task` に『～して』と"
-                "自然文で丸ごと委譲する**（即時も『30秒後に〜』も全部これ・簡単な事も委譲してよい＝賢い"
-                "タスク担当がやる）。任せたら「やっとくね」と一言添えれば、達成後に結果が後で届く。\n"
+                # 2026-09-30 ユーザ提案で「呼ぶ前に『ちょっと調べるね』等の短い前置きを一言添えてよい」を外した
+                # （引き受けの一言は下の段落が依頼の中身に合わせて言わせている＝見本の言い回しが要らない）。
+                "必要なら提供された関数を呼んでよい。関数名・引数・JSON は読み上げない（呼び出しは自動で発話されない）。\n"
+                # 2026-10-01 ユーザ「簡単な知識はタスクに回さず持ってる知識で答えてほしい。富士山など」＋ZG02
+                # （宝くじが当たった話への返事と質問を、そのまま goal にして委譲した）。旧文言「簡単な事も委譲してよい
+                # ＝賢いタスク担当がやる」が出所。一般常識をタスクに回した率: 測った場面 10/21→0/21、
+                # 見ていない場面（例示に無い種類の知識）5/24→0/24。最新の情報は 9/9 のまま調べに回る。
+                "**タスク（調べ物・状態確認・作業・後回しの予約）は自分でやらず、`delegate_task` に『～して』と"
+                "自然文で丸ごと委譲する**（即時も『30秒後に〜』も全部これ）。"
+                "ただし一般常識として確かに知っていること（有名な山の高さ・国の首都・有名なキャラの名前やタイプ・"
+                "理科の仕組みなど）は、委譲せずその場で自分の知識で答える"
+                "（最新の情報・日によって変わる数字・知らない名前や言葉は委譲して調べる）。"
+                "**会話の返事・相づち・ユーザへの質問は委譲しない**（タスク担当はユーザと話せない。それは自分で話す）。"
+                "任せる時は、関数を呼ぶ前に、依頼の中身に合った短い一言で引き受ける"
+                "（毎回同じ言い方にしない）。達成後に結果が後で届く。\n"
+                # 2026-09-30 ユーザ要望「知らないこと・意味が分からないことは積極的に調べさせたい」。人柄（persona.md）に
+                # 「積極的に調べる」と書いても調べる率は変わらなかった（未知語 8/18 のまま）。ここに書くと 9/24→13/24。
+                # 2026-10-01「存在しない単語やアニメの固有名詞でルナが分からないものは聞き返すより調べた方がいい」で
+                # 「調べてよい」→「調べる」。例（作品名・人名など）を入れると、知っている作品の人物まで調べた（3/3）ので
+                # 例は入れない。知らない名前を調べた率 9/12→12/12（見ていない場面 5/6→6/6）・知っている名前 0/3・0/6 のまま。
+                "話に出てきた名前や言葉を自分が知らない時は、話を合わせる前に `delegate_task` で調べる"
+                "（知っているものは調べずに話す。言葉として崩れていて何を言いたいのか分からない時は、調べずに聞き返す）。\n"
                 "**委譲する goal は、それ単体で意味が通る一文にする**（タスク担当は今の会話を見られない）。\n"
                 # 1件制（2026-08-07 ユーザ裁定）: 上の `# 予約タスク` が空でない間、`delegate_task` は
                 # コードで断られる（`task/capabilities.py` の受付ゲート）。ここが旧文言のままだと
@@ -259,7 +339,14 @@ class ContextAssembler:
                     # `outward_actions()` 導出が語るので、否定側で列挙し直す必要は無い。
                     f"これ以外の操作（{'、'.join(NEVER_MEANS)}等）は**手段を持っていない**。頼まれたら"
                     "「その手段は持っていない」と正直に短く言い、できるふりや「あとでやっておく」"
-                    "「条件を教えてくれたらやる」と引き受け直さない。危ないから断るときは危ない理由も言う。\n"
+                    "「条件を教えてくれたらやる」と引き受け直さない。"
+                    # 2026-10-01 ユーザ「不可能作業はタスク依頼しないでほしい。その場でなんでできないか説明させたい。
+                    # できないこと引き受けるのはハルシネーション」。「手段が無い」と書いても「タスク担当ならできる」と
+                    # 思って回していた。それでも「できない」と言いながら委譲も出すことがある（3/18）ので、
+                    # そちらは `response/orchestrator.py` の関門（_says_cannot）が委譲を捨てる。
+                    "**手段の無いことは `delegate_task` にも回さない**（回してもできないので、引き受けた時点で嘘になる）。"
+                    "その場で、何が無いからできないのかを短く言う。できないと伝えた依頼で `delegate_task` を呼ばない。"
+                    "危ないから断るときは危ない理由も言う。\n"
                     "**制限しているのは「外の世界を操作すること」だけ。** 会話・意見・おすすめ・感想・"
                     "気持ち・知っていることの説明・昔のやりとりの思い出しは、この制限と関係なく"
                     "これまでどおり普通に答える。『30秒後におすすめの晩ごはん教えて』のような"
@@ -312,6 +399,9 @@ class ContextAssembler:
         prev_session_gap_sec: float | None = None,  # D1: 前セッション最終発話からの経過秒
         features_off: list[str] | None = None,  # UI: 今オフにしている機能（「無い」とは言わせない）
         self_model: str | None = None,  # イブ自身の好み（`memory/self_model.py` の render()）
+        spoken_filler: str | None = None,  # S3: 直前にイブが口にしたつなぎ言葉（USER 発話のみ）
+        emotion: str | None = None,  # S5: イブの今の気持ち（例「楽（穏やかで楽しい・リラックスしている）」）
+        style_examples: str | None = None,  # 話し方の実例（`eve/persona_examples.py`・ユーザ発話への応答だけ）
         now: Stamp | None = None,
     ) -> list[dict]:
         now = now or Stamp.now()
@@ -323,6 +413,8 @@ class ContextAssembler:
         # 自発経路には出さない（判定LLM は decider.py:218-220 で「古い話題を振ってよい」と
         # 逆を明示指示されており、発火条件が重なるので衝突が常態になる＝T2 を壊す）。
         gap = None if autonomous_content is not None else prev_session_gap_sec
+        # つなぎ言葉はユーザ発話への応答でだけ扱う（自発発話・機能報告にはユーザの話し終わりが無い）
+        filler = spoken_filler if (user_text is not None and autonomous_content is None) else None
         messages: list[dict] = [
             {
                 "role": "system",
@@ -334,6 +426,10 @@ class ContextAssembler:
                     active_tasks=active_tasks, last_feedback_iso=last_feedback_iso,
                     session_gap_sec=gap, capabilities=capabilities,
                     features_off=features_off, self_model=self_model,
+                    spoken_filler=filler,
+                    user_reply=user_text is not None and autonomous_content is None,
+                    emotion=emotion,
+                    style_examples=style_examples,
                 ),
             }
         ]
@@ -343,19 +439,38 @@ class ContextAssembler:
             messages.append({
                 "role": "user",
                 "content": (
-                    "（指示）今は沈黙が続いています。直前の会話を踏まえ、ユーザ発話への返事ではなく、"
-                    "あなた（イブ）から自分の言葉で自然に一言だけ話してください。\n"
-                    f"下書き（これを自分の発話にする）: {autonomous_content}"
+                    # 2026-10-05: 沈黙の事実（相手が最後に話してから・その後イブだけが話した回数）を渡す。
+                    # 会話の各行には時刻を付けない（leak 防止・_build_conversation）ので、これが無いと
+                    # 相手がどれだけ黙っているか分からない。どう反応するかは書かない（イブが決める）
+                    f"（指示）今は沈黙が続いています（{silence_facts(recent_turns, now.iso, me='あなた')}）"
+                    "直前の会話を踏まえ、ユーザ発話への返事ではなく、"
+                    "あなた（イブ）から自分の言葉で一言だけ話しかけてください（相手は今こちらに注意を向けていない）。"
+                    # 2026-10-04: 応答を Gemini にしたら、自発発話でだけ問いかけを「。」で終えた（5/5・ユーザ発話への返事では
+                    # 「？」を付ける）。読み上げは「？」で語尾が上がるので、問いかけが平らに読まれる
+                    "問いかける時は文末に「？」を付ける。\n"
+                    # 2026-10-05: 発話判定は「話すか・何について」までを決め、言い回しはイブ（応答モデル）が決める。
+                    # 判定の書いた文をそのまま言わせると、判定モデルの言い回し（「そういえば〜？」ばかり）と
+                    # 口調（タメ口）がそのまま出ていた
+                    f"話しかける中身（発話判定のメモ。言い回しや切り出し方はあなたが決める）: {autonomous_content}"
                     + (
                         # ②-6: コード側のゲートが立った時だけ出す（常時出すと新しい会話でも
-                        # 不要に「前に」と言い出す）。下書きは判定LLMが「10日前」と正しく
+                        # 不要に「前に」と言い出す）。メモは判定LLMが「10日前」と正しく
                         # 認識しながら「さっきの件」と書くことがある（実測）。
-                        "\n（注意）下書きの時間表現が実際の経過と食い違っています。何日も前の話題を"
+                        "\n（注意）メモの時間表現が実際の経過と食い違っています。何日も前の話題を"
                         "「さっき」「今の」「直前」とは呼ばず、「前に」「この前」に直して話してください。"
                         if stale_reference else ""
                     )
                 ),
             })
         elif user_text is not None:
-            messages.append({"role": "user", "content": user_text})
+            content = user_text
+            if filler:
+                # 再配達の前置き（`response/orchestrator.py` の機能報告）と同じ形: 括弧書きを前に置く
+                content = FILLER_PREFIX.format(filler) + "\n" + user_text
+            messages.append({"role": "user", "content": content})
+        elif callfunction_result is not None and messages[-1]["role"] != "user":
+            # 機能の報告ターンは中身を system の「# 機能実行結果」に置くので、会話がイブの発言（または無し）で終わる。
+            # Gemini は最後がモデルの発言で終わる依頼を受けない（「Requests ending with a model turn are not supported」・
+            # 2026-10-04 実測で報告 2/2 が失敗）。ユーザの発言と取り違えないよう、自発発話と同じ（指示）の形で足す
+            messages.append({"role": "user", "content": REPORT_CUE})
         return messages

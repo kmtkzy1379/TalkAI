@@ -173,7 +173,7 @@ litellm 等で provider 差を吸収。`feedback_llm.py` の3段 fallback と ca
 > ※実装（`tests/test_f1_pipeline.py`）が assert するのは「サイドカーが応答経路を塞がない」「並列合成が直列和より短い」のみで、**≤3s の数値検証は無い**（レイテンシは E2E 実測が正）。
 | **T2** surprise death detection | surprise が本当に駆動しているか | surprise を反転 → `should_speak`/自己懐疑の出力が反転することを assert。反転しなければ**ビルド失敗**(装飾化の再発防止) |
 | **T3** 順序/世代 | 音声が順番通り・barge-inで旧世代破棄 | seq シャッフル投入→再生は seq 順 / generation+1 後に旧 seq が再生されないこと |
-| **T4** barge-in | 割り込みで現発話が即停止 | 再生中に user_utterance 投入→AudioPlayQueue flush + 新世代開始を assert。※AEC は**不採用**（イヤホン前提・冒頭の訂正表参照） |
+| **T4** barge-in | 割り込みで次の節から止まる（鳴っている節＝「、」「。」までは言い切る・ユーザ裁定 2026-09-22・実装 2026-09-26。旧: 現発話が即停止） | 再生中に user_utterance 投入→AudioPlayQueue flush + 新世代開始を assert。※AEC は**不採用**（イヤホン前提・冒頭の訂正表参照） |
 | **T5** provider 代用 | Claude 停止でも動く | ModelRegistry の response 役を GPT/Gemini に差替えても全テストが緑 |
 | **T6** ⭐過去参照なし(Msg6) | 「過去のことを話してない」 | タイムスタンプ付きの混在文脈(古い記憶+新会話)を与え、応答が**現在文脈に接地**し古い話に逸れないことを検証。無言時 random RAG は "話題の種" 扱いで「思い出話」にならないこと |
 | **T7** ⭐パイプライン破綻なし(Msg6) | E2E でエラー/明らかな遅延がない | 4シナリオ(§下)を端から端まで流し、例外0・キュー詰まり0・予算内・順序保持を一括検証 |

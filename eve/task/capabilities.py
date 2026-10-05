@@ -38,6 +38,12 @@ MAX_WHEN_SEC = 3600.0
 SELF_CANCEL_GUARD_SEC = 1.0
 
 
+def _span_ja(sec: float) -> str:
+    """予約の上限を delegate_task の説明に書くための言い方（3600→「1時間」・1800→「30分」）。"""
+    s = int(sec)
+    return f"{s // 3600}時間" if s % 3600 == 0 else f"{s // 60}分"
+
+
 def _display_name(t) -> str:
     """一覧/取消の表示名。goal タスクは what="" なので goal を優先（RC4 空名対策）。"""
     return t.goal or t.what or "(無題)"
@@ -200,8 +206,17 @@ def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resol
         name="delegate_task",
         description="やりたいこと・調べ物・状態確認・後回しの予約を、賢いタスク担当(TaskAgent)に任せる。"
                     "goal に自然文で『何を達成/報告したいか』を、**ユーザの言い回しをそのまま**書く"
-                    "（例: 30秒後に今の時刻を教えて / PCとイブの状態を調べてまとめて）。どんな簡単な事も"
-                    "自分でやらずここへ。when_seconds 省略=すぐ、指定=その秒後。呼んだら『やっとくね』とだけ言う。"
+                    "（例: 30秒後に今の時刻を教えて / PCとイブの状態を調べてまとめて）。"
+                    # 2026-10-01: 旧文言「どんな簡単な事も自分でやらずここへ」が system の「一般常識はその場で
+                    # 答える」と食い違い、富士山の高さまで委譲していた（ユーザ「簡単な知識はタスクに回さず」）
+                    "一般常識で答えられることはここに回さず自分で答える。会話の返事やユーザへの質問も入れない。"
+                    # 上限を書かないと「明日の朝7時に起こして」を引き受けて、受付で断られる。「声で知らせる」まで
+                    # 書かないと、今度は「30分後に起こして」（できる）まで断った
+                    f"when_seconds 省略=すぐ、指定=その秒後（最大{int(MAX_WHEN_SEC)}秒＝{_span_ja(MAX_WHEN_SEC)}先まで。"
+                    "その時間になったらイブが声で知らせる。それより先の予約はできない）。"
+                    # ユーザ 2026-09-29 採用: 旧文言「呼んだら『やっとくね』とだけ言う」は定型化して機械的だった
+                    # （ユーザ「｢やっとくね｣が定型文化してて機械的。出来ればその文脈にあった言い回しとかして欲しい」）
+                    "呼ぶ前に、依頼の中身に合った短い一言で引き受ける（毎回同じ言い方にしない）。"
                     # D3: 万能感の打ち消し。**available 側を列挙しない**（search は SEARCH_ENABLED ∧ ddgs の
                     # 内側でしか登録されず、静的な文字列では構成差を表現できないため必ず嘘になる）。
                     # J-3: 否定側も同じ理由で列挙をやめた。旧文言「外の世界を操作する手段は無い」は
@@ -213,8 +228,13 @@ def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resol
         params_schema={
             "goal": {"type": "string", "description": "達成/報告したいこと（自然文・ユーザの言い回しを保つ）"},
             "when_seconds": {"type": "integer", "description": "何秒後に始めるか（省略=すぐ）"},
+            # 応答LLM が本文を書かずにツールだけ返したターンは、定型の「やっとくね。」の代わりにこれを言う
+            # （`response/orchestrator.py` の `_ack_from_tools`・ユーザ採用 2026-09-29）
+            "reply": {"type": "string",
+                      "description": "ユーザに今すぐ返す短い一言（依頼の中身に合わせた自然な話し言葉・毎回同じ言い方にしない）"},
         },
         handler=_delegate_task, mutates_state=True, report_result=False,  # ack は応答本文が担う
+        required=("goal", "reply"),
     ))
     registry.register(Capability(
         name="list_tasks", description="登録中の予約タスク一覧を見る。引数なし。", params_schema={},

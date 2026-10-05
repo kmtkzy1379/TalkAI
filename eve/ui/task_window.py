@@ -30,11 +30,11 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, Qt, Signal
+from PySide6.QtCore import QEvent, QSize, Qt, Signal
 from PySide6.QtGui import QImageReader, QPixmap
 from PySide6.QtWidgets import (
     QApplication, QHBoxLayout, QLabel, QMdiArea, QMdiSubWindow, QPlainTextEdit,
-    QPushButton, QScrollArea, QVBoxLayout, QWidget,
+    QPushButton, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from ..config import Config
@@ -51,6 +51,51 @@ def _message(text: str) -> QWidget:
     box.setReadOnly(True)
     box.setPlainText(text)
     return box
+
+
+class FitImage(QLabel):
+    """画像を**窓に収まる大きさで**出す（元の大きさより大きくはしない）。窓の大きさが変われば描き直す。
+
+    旧実装は `pix.scaled(1100, 800)` を固定で作って `QScrollArea` に入れていた。`scaled` は縮めるだけでなく
+    **拡大もする**ので、小さな画像ほど 1100x800 近くまで引き伸ばされ、しかも子ウィンドウは最大 560x420
+    なので一部しか見えなかった（ユーザ 2026-09-30「画像出すとき拡大されて出されることが多い」・
+    2026-09-28 のルナ検証でもコーヒーの写真が「等倍表示で一部しか見えない」）。
+    """
+
+    def __init__(self, pix: QPixmap) -> None:
+        super().__init__()
+        self._pix = pix
+        self.setAlignment(Qt.AlignCenter)
+        self.setMinimumSize(1, 1)
+        # 中身（画像）の大きさで窓を押し広げない＝窓の大きさに合わせて絵の方を縮める
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self._refit()
+
+    def natural_size(self) -> QSize:
+        """画面上の元の大きさ（論理ピクセル）。子ウィンドウの初期サイズを決めるのに使う。"""
+        dpr = self._pix.devicePixelRatio() or 1.0
+        return QSize(int(self._pix.width() / dpr), int(self._pix.height() / dpr))
+
+    def resizeEvent(self, ev) -> None:  # noqa: N802（Qt の名前）
+        super().resizeEvent(ev)
+        self._refit()
+
+    def showEvent(self, ev) -> None:  # noqa: N802（表示前に決まった大きさで描き直す）
+        super().showEvent(ev)
+        self._refit()
+
+    def _refit(self) -> None:
+        nat = self.natural_size()
+        w, h = max(1, self.width()), max(1, self.height())
+        if nat.width() <= w and nat.height() <= h:
+            self.setPixmap(self._pix)  # 収まるなら元の大きさのまま（**拡大しない**）
+            return
+        # 高 DPI の画面ではぼやけないよう実画素で縮め、同じ倍率を付けて論理サイズ w x h に収める
+        dpr = self.devicePixelRatioF() or 1.0
+        fit = self._pix.scaled(max(1, int(w * dpr)), max(1, int(h * dpr)),
+                               Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        fit.setDevicePixelRatio(dpr)
+        self.setPixmap(fit)
 
 
 class _SubWindow(QMdiSubWindow):
@@ -157,6 +202,13 @@ class TaskWindow(QWidget):
         area = self.mdi.viewport().size()
         w = max(240, min(560, area.width() - 40))
         h = max(180, min(420, area.height() - 40))
+        inner = sub.widget()
+        if isinstance(inner, FitImage):
+            # 画像は**元の大きさ＋枠**で開く（小さい画像を大きな窓に置かない）。枠に入り切らなければ
+            # 枠いっぱいまでにして、絵の方を縮める（FitImage）。枠の分（タイトル・縁）はおおよその値。
+            nat = inner.natural_size()
+            w = max(240, min(nat.width() + 16, area.width() - 40))
+            h = max(180, min(nat.height() + 38, area.height() - 40))
         sub.resize(w, h)
         step, n = 28, len(self._subs)
         max_x, max_y = max(0, area.width() - w), max(0, area.height() - h)
@@ -285,13 +337,7 @@ class TaskWindow(QWidget):
             pix = QPixmap(str(target))
             if pix.isNull():
                 return _message(f"{name} は画像として読めませんでした")
-            label = QLabel()
-            label.setPixmap(pix.scaled(1100, 800, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-            label.setAlignment(Qt.AlignCenter)
-            area = QScrollArea()
-            area.setWidget(label)
-            area.setWidgetResizable(True)
-            return area
+            return FitImage(pix)
         text = QPlainTextEdit()
         text.setReadOnly(True)
         if kind == "HTML":

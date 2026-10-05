@@ -17,6 +17,10 @@
 3. **取り残されたビューア窓**。`DETACHED_PROCESS` で起動する（`capabilities.py`）ため
    **親が死んでも生き残る**。正常終了は `close_viewers()` が閉じるが、異常終了は残る。
    起動時は自分の Popen ハンドルを持っていないので、コマンドラインで見つけて畳む。
+4. **取り残された Irodori サーバ**（S1）。`sweep_orphan_tts_servers()`。`sweep()` とは別に
+   `VoiceLoop.run()` が**ウォームアップの前に**呼ぶ（`sweep()` はタスク機能が有効な時しか呼ばれず、
+   しかもウォームアップの後なので、残骸を「既にあるサーバ」として使ってしまう）。
+   終了時は自分が起動したものを `IrodoriServer.stop()` が止める。
 
 ## 方針
 **例外で起動を止めない**。掃除は「あると嬉しい」であって、失敗したら握って続行する
@@ -101,6 +105,69 @@ def sweep_orphan_viewers() -> int:
             continue  # 消えた/権限なし。掃除は best-effort
     if n:
         logger.info("🧹 前回のビューア窓を %d 個閉じた（startup）", n)
+    return n
+
+
+TTS_SERVER_MARKER = "--eve-irodori-server"  # `eve/response/tts_irodori.py` の SERVER_MARKER と同じ
+
+
+def _owner_pid(cmdline: list) -> int:
+    """`--owner-pid N` を取り出す（無ければ 0＝手で起動したサーバ）。"""
+    for i, a in enumerate(cmdline):
+        if a == "--owner-pid" and i + 1 < len(cmdline):
+            try:
+                return int(cmdline[i + 1])
+            except ValueError:
+                return 0
+        if a.startswith("--owner-pid="):
+            try:
+                return int(a.split("=", 1)[1])
+            except ValueError:
+                return 0
+    return 0
+
+
+def sweep_orphan_tts_servers(*, process_iter=None, pid_exists=None) -> int:
+    """**持ち主の EVE がもういない** Irodori サーバを止める（起動時のみ）。戻り値=止めた数。
+
+    EVE が起動したサーバは Job Object で EVE と一緒に落ち、サーバ自身も持ち主を見張って
+    終わるので、ここに来るのは両方が効かなかった時だけ（保険の三段目）。
+    **手で起動したサーバ（`--owner-pid` が無い）と、生きている EVE のサーバは止めない**
+    （前者は「EVE が既にあるサーバを使う」前提の運用・後者は別の EVE が使用中）。
+    """
+    try:
+        import psutil
+    except Exception:
+        logger.debug("psutil が無いので取り残しサーバの掃除をスキップ")
+        return 0
+    it = process_iter or (lambda: psutil.process_iter(["pid", "cmdline"]))
+    alive = pid_exists or psutil.pid_exists
+    n = 0
+    for p in it():
+        try:
+            cmd = list(p.info.get("cmdline") or ())
+            if TTS_SERVER_MARKER not in cmd:
+                continue
+            owner = _owner_pid(cmd)
+            if owner <= 0 or alive(owner):
+                continue
+            try:  # venv のランチャの子（本体の python）は親の側で止めるので数えない
+                par = p.parent()
+                if par is not None and TTS_SERVER_MARKER in (par.cmdline() or ()):
+                    continue
+            except Exception:
+                pass
+            for c in p.children(recursive=True):  # venv のランチャ → 本体の python
+                try:
+                    c.kill()
+                except Exception:
+                    pass
+            p.kill()
+            n += 1
+        except Exception:
+            continue  # 消えた/権限なし。掃除は best-effort
+    if n:
+        logger.info("🧹 前回の Irodori サーバを %d 個止めた（startup）", n)
     return n
 
 

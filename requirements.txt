@@ -26,3 +26,5 @@ ImageHash  # pHash 変化ゲート
 opencv-python  # 黒/空白フレーム判定
 requests  # VOICEVOX HTTP・E2E ハーネス
 psutil  # pc_status 能力のメモリ情報（未導入でも動くが情報が減る）
+# S3 フィラー: fillers.yaml を読む（FILLER_ENABLED=1 の時だけ・遅延 import）
+PyYAML

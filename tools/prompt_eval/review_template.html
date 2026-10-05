@@ -1,0 +1,373 @@
+<title>イブの話し方レビュー</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=BIZ+UDPGothic:wght@400;700&family=Zen+Maru+Gothic:wght@500;700&display=swap">
+<style>
+/* レビュー机: 上にタブ、場面ごとのカード。話しかけ→Neuro（ローズ）→イブの返事（ティール）→評価の順に縦に積む */
+:root {
+  --bg: #f3f5f7; --surface: #ffffff; --ink: #1c2230; --muted: #5d6676; --line: #d8dde5;
+  --eve: #1c7571; --eve-soft: #e1f1ef; --neuro: #ad3657; --neuro-soft: #f8e6ec;
+  --good: #2c7a4b; --good-soft: #e0f1e6; --bad: #b1402f; --bad-soft: #f8e3df;
+  --meh: #5f6776; --meh-soft: #eceef1; --ai: #8f6200; --ai-soft: #f7ecd2;
+  --font-display: "Zen Maru Gothic", "Hiragino Maru Gothic ProN", "Yu Gothic UI", sans-serif;
+  --font-body: "BIZ UDPGothic", "Hiragino Sans", "Yu Gothic UI", Meiryo, sans-serif;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #111418; --surface: #191d23; --ink: #e5e9ef; --muted: #9aa3b1; --line: #2a3039;
+  --eve: #6ec6bf; --eve-soft: #173331; --neuro: #f08aa6; --neuro-soft: #3a1c26;
+  --good: #7ccf9a; --good-soft: #17301f; --bad: #f09b8d; --bad-soft: #3a1d18;
+  --meh: #aab1bd; --meh-soft: #242a32; --ai: #efc255; --ai-soft: #33290e; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #111418; --surface: #191d23; --ink: #e5e9ef; --muted: #9aa3b1; --line: #2a3039;
+  --eve: #6ec6bf; --eve-soft: #173331; --neuro: #f08aa6; --neuro-soft: #3a1c26;
+  --good: #7ccf9a; --good-soft: #17301f; --bad: #f09b8d; --bad-soft: #3a1d18;
+  --meh: #aab1bd; --meh-soft: #242a32; --ai: #efc255; --ai-soft: #33290e; color-scheme: dark; }
+body { background: var(--bg); color: var(--ink); font-family: var(--font-body); font-size: 15px; line-height: 1.7; }
+main { max-width: 900px; margin: 0 auto; padding-inline: 16px; padding-block: 24px 64px; display: grid; gap: 20px; }
+h1, h2, h3 { font-family: var(--font-display); line-height: 1.35; margin: 0; text-wrap: balance; }
+h1 { font-size: 1.7rem; } h2 { font-size: 1.2rem; } h3 { font-size: 1rem; }
+p { margin: 0; max-width: 68ch; }
+.muted { color: var(--muted); font-size: .88rem; }
+.bar { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
+.status { font-size: .85rem; padding: 2px 10px; border-radius: 999px; background: var(--meh-soft); color: var(--meh); }
+.status.ok { background: var(--good-soft); color: var(--good); }
+.status.ng { background: var(--bad-soft); color: var(--bad); }
+.tabs { display: flex; flex-wrap: wrap; gap: 6px; position: sticky; top: env(safe-area-inset-top, 0px); z-index: 2;
+  background: var(--bg); padding-block: 8px; border-bottom: 1px solid var(--line); }
+.tab { font: inherit; font-size: .92rem; border: 1px solid var(--line); background: var(--surface); color: var(--ink);
+  padding: 6px 12px; border-radius: 8px; cursor: pointer; }
+.tab[aria-selected="true"] { background: var(--eve); border-color: var(--eve); color: var(--surface); font-weight: 700; }
+.tab .n { font-variant-numeric: tabular-nums; opacity: .8; margin-left: 4px; }
+.opts { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: .88rem; color: var(--muted); }
+.opts label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+.list { display: grid; gap: 14px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; display: grid; gap: 10px; min-width: 0; }
+.card-head { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: baseline; }
+.sid { font-variant-numeric: tabular-nums; color: var(--muted); font-size: .8rem; }
+.said { font-weight: 700; }
+.said::before { content: "ユーザ："; color: var(--muted); font-weight: 400; font-size: .82rem; }
+.badge { font-size: .74rem; padding: 1px 8px; border-radius: 999px; white-space: nowrap; }
+.badge.rec { background: var(--good-soft); color: var(--good); }
+.badge.note { background: var(--ai-soft); color: var(--ai); }
+.badge.edgy { background: var(--bad-soft); color: var(--bad); }
+.badge.long { background: var(--meh-soft); color: var(--meh); }
+.neuro { border-left: 4px solid var(--neuro); background: var(--neuro-soft); border-radius: 6px; padding: 8px 10px; }
+.neuro .who { color: var(--neuro); font-size: .78rem; font-weight: 700; }
+.exa { border-left: 4px solid var(--neuro); background: var(--neuro-soft); border-radius: 6px; padding: 8px 10px; }
+.exa .who { color: var(--neuro); font-size: .78rem; font-weight: 700; }
+details.en { font-size: .82rem; color: var(--muted); }
+details.en summary { cursor: pointer; }
+.reply { border-left: 4px solid var(--eve); background: var(--eve-soft); border-radius: 6px; padding: 8px 10px; display: grid; gap: 6px; }
+.reply .who { color: var(--eve); font-size: .78rem; font-weight: 700; }
+.reply .rep { color: var(--muted); font-weight: 400; margin-left: 6px; }
+.rate { display: flex; flex-wrap: wrap; gap: 6px; }
+.chip { font: inherit; font-size: .82rem; border: 1px solid var(--line); background: var(--surface); color: var(--ink);
+  padding: 2px 10px; border-radius: 999px; cursor: pointer; }
+.chip[aria-pressed="true"].good { background: var(--good); border-color: var(--good); color: var(--surface); }
+.chip[aria-pressed="true"].meh { background: var(--meh); border-color: var(--meh); color: var(--surface); }
+.chip[aria-pressed="true"].bad { background: var(--bad); border-color: var(--bad); color: var(--surface); }
+.chip[aria-pressed="true"].ai { background: var(--ai); border-color: var(--ai); color: var(--surface); }
+.chip[aria-pressed="true"].use { background: var(--good); border-color: var(--good); color: var(--surface); }
+.chip[aria-pressed="true"].hold { background: var(--meh); border-color: var(--meh); color: var(--surface); }
+.chip[aria-pressed="true"].skip { background: var(--bad); border-color: var(--bad); color: var(--surface); }
+.chip:disabled { opacity: .5; cursor: default; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, summary:focus-visible { outline: 2px solid var(--eve); outline-offset: 2px; }
+textarea { font: inherit; font-size: .85rem; width: 100%; box-sizing: border-box; min-height: 2.2em; resize: vertical;
+  border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--ink); padding: 4px 8px; }
+.test { font-size: .82rem; color: var(--muted); display: grid; gap: 4px; }
+.test b { color: var(--ink); font-variant-numeric: tabular-nums; }
+.test .copy { color: var(--bad); }
+.worst { font-size: .82rem; border: 1px dashed var(--line); border-radius: 6px; padding: 6px 8px; }
+.filters { display: flex; flex-wrap: wrap; gap: 6px; }
+.tbl { overflow-x: auto; min-width: 0; }
+table { border-collapse: collapse; width: 100%; background: var(--surface); font-size: .88rem; }
+th, td { border: 1px solid var(--line); padding: 6px 8px; text-align: left; }
+th { background: var(--eve-soft); }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.explain { display: grid; gap: 8px; }
+@media (prefers-reduced-motion: no-preference) { .chip, .tab { transition: background-color .12s, color .12s; } }
+</style>
+<main>
+  <header class="explain">
+    <h1>イブの話し方レビュー</h1>
+    <p>性格を N6（N5＋安全の決まり文句をやめる一文）にした時の返事を、Neuro-sama の実際の返事と並べています。
+    似ているほど良いわけではないので、いいと思うかどうかで付けてください。実例の候補は「採用」にしたものだけを本番に入れます。</p>
+    <p class="muted">付けた評価と選定はこのページに保存され、Claude が読み取って本番の実例ファイル（persona_examples.yaml）を作ります。
+    案の名前は最初は伏せています（A/B/C は場面ごとに入れ替え）。</p>
+    <div class="bar"><span id="save" class="status">保存の準備中…</span><span id="progress" class="muted"></span></div>
+  </header>
+  <nav class="tabs" role="tablist" aria-label="表示">
+    <button class="tab" role="tab" id="tab-cand" aria-selected="true" aria-controls="pane-cand">実例の候補<span class="n" id="n-cand"></span></button>
+    <button class="tab" role="tab" id="tab-nq" aria-selected="false" aria-controls="pane-nq">Neuro と比べる<span class="n" id="n-nq"></span></button>
+    <button class="tab" role="tab" id="tab-own" aria-selected="false" aria-controls="pane-own">自前の場面<span class="n" id="n-own"></span></button>
+    <button class="tab" role="tab" id="tab-sum" aria-selected="false" aria-controls="pane-sum">集計</button>
+  </nav>
+  <div class="opts">
+    <label><input type="checkbox" id="opt-names"> 案の名前を表示</label>
+    <label><input type="checkbox" id="opt-rep2"> 2回目の返事も表示</label>
+  </div>
+  <section id="pane-cand" role="tabpanel" aria-labelledby="tab-cand" class="list">
+    <p class="muted">Neuro-sama の実際のやりとり（<a href="https://huggingface.co/datasets/neifuisan/Neuro-sama-QnA">neifuisan/Neuro-sama-QnA</a>・Apache-2.0）を、
+    イブとユーザの会話に移したもの。<b>丸写しの検証</b>は、この実例を必ず見せた最悪の条件で、同じ話しかけ・言い換え・同じ話題の別の一言をした時に、
+    イブが実例の返事を写したか（2回中）。本番では今の話しかけと意味が近い実例は見せないので、同じ話しかけ・言い換えでの丸写しは起きません。
+    残るのは同じ話題の別の一言の時です。所見（おすすめ・注意・きわどい）はアシスタントの参考意見で、決めるのはあなたです。</p>
+    <div class="filters" id="filters"></div>
+    <div id="cand-list" class="list"></div>
+  </section>
+  <section id="pane-nq" role="tabpanel" aria-labelledby="tab-nq" class="list" hidden>
+    <p class="muted">ユーザの一言と Neuro-sama の実際の返事（日本語訳・英語の原文は開くと出ます）。イブの返事は3つの案。</p>
+    <div id="nq-list" class="list"></div>
+  </section>
+  <section id="pane-own" role="tabpanel" aria-labelledby="tab-own" class="list" hidden>
+    <p class="muted">これまでの検証で使った自前の場面（いじり・からかい・イエスマン）。Neuro の返事はありません。</p>
+    <div id="own-list" class="list"></div>
+  </section>
+  <section id="pane-sum" role="tabpanel" aria-labelledby="tab-sum" class="list" hidden>
+    <div id="sum"></div>
+  </section>
+</main>
+<script id="data" type="application/json">/*__DATA__*/</script>
+<script>
+(() => {
+  const DATA = JSON.parse(document.getElementById("data").textContent);
+  const VARS = Object.keys(DATA.variants);
+  const picks = new Map();    // candidate id -> {d, note}
+  const ratings = new Map();  // key -> {r, ai, note}
+  let db = null, canWrite = true;
+  const chains = new Map();   // 1文書につき1書き込みずつ
+
+  const $ = (s, el = document) => el.querySelector(s);
+  const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text != null) e.textContent = text; return e; };
+
+  // 場面ごとに案の並びを入れ替える（名前を伏せた評価のため・同じ場面はいつも同じ並び）
+  function order(id) {
+    let h = 0; for (const c of id) h = (h * 31 + c.charCodeAt(0)) >>> 0;
+    const a = VARS.slice();
+    for (let i = a.length - 1; i > 0; i--) { h = (h * 1103515245 + 12345) >>> 0; const j = h % (i + 1); [a[i], a[j]] = [a[j], a[i]]; }
+    return a;
+  }
+
+  function save(path, body) {
+    if (!db || !canWrite) return;
+    const prev = chains.get(path) || Promise.resolve();
+    const next = prev.then(() => db.doc(path).set(body)).catch((e) => {
+      if (e && e.code === "invalid_argument") { canWrite = false; setStatus("ng", "保存できません（書き込み権限がありません）"); }
+      else setStatus("ng", "保存に失敗しました（" + ((e && e.code) || "不明") + "）。もう一度押してください");
+    });
+    chains.set(path, next);
+  }
+  function setStatus(kind, text) { const s = $("#save"); s.className = "status " + kind; s.textContent = text; }
+
+  // ---- 実例の候補 ----
+  const FILTERS = [["all", "全部"], ["rec", "おすすめ"], ["warn", "注意・きわどい"], ["open", "未決"], ["use", "採用"]];
+  let filter = "all";
+  function renderFilters() {
+    const box = $("#filters"); box.textContent = "";
+    for (const [k, label] of FILTERS) {
+      const b = el("button", "chip", label); b.setAttribute("aria-pressed", String(filter === k)); b.className = "chip use";
+      b.addEventListener("click", () => { filter = k; renderFilters(); applyFilter(); });
+      box.append(b);
+    }
+  }
+  function applyFilter() {
+    for (const c of DATA.candidates) {
+      const card = document.getElementById("c-" + c.id); if (!card) continue;
+      const p = picks.get(c.id);
+      const show = filter === "all" || (filter === "rec" && c.rec) || (filter === "warn" && (c.note || c.edgy))
+        || (filter === "open" && !(p && p.d)) || (filter === "use" && p && p.d === "use");
+      card.hidden = !show;
+    }
+  }
+  const COND = { same: "同じ話しかけ", para: "言い換え", near: "同じ話題の別の一言" };
+  function candCard(c) {
+    const card = el("article", "card"); card.id = "c-" + c.id;
+    const head = el("div", "card-head");
+    head.append(el("span", "sid", c.id));
+    if (c.rec) head.append(el("span", "badge rec", "おすすめ: " + c.rec));
+    if (c.note) head.append(el("span", "badge note", "注意: " + c.note));
+    if (c.edgy) head.append(el("span", "badge edgy", "きわどい: " + c.edgy));
+    if (c.long) head.append(el("span", "badge long", "長い（" + c.len + "字・返事が長くなりやすい）"));
+    card.append(head, el("div", "said", c.q));
+    const exa = el("div", "exa"); exa.append(el("div", "who", "イブ（Neuro-sama の返事の訳）"), el("div", "", c.a));
+    const en = el("details", "en"); en.append(el("summary", "", "英語の原文"), el("div", "", c.en_q + " → " + c.en_a));
+    exa.append(en); card.append(exa);
+    const t = el("div", "test");
+    if (Object.keys(c.test).length) {
+      const line = el("div");
+      line.append("丸写しの検証: ");
+      for (const k of ["same", "para", "near"]) {
+        const x = c.test[k]; if (!x) continue;
+        const s = el("span", x.copy ? "copy" : "");
+        s.append(COND[k] + " ", el("b", "", x.copy + "/" + x.n));
+        line.append(s, "　");
+      }
+      t.append(line);
+      if (c.worst) {
+        const w = el("div", "worst");
+        w.append(el("div", "", "一番似た例（" + COND[c.worst.cond] + "「" + c.worst.said + "」→ " + c.worst.lcs + "字一致・" + c.worst.verdict + "）"),
+                 el("div", "", "イブ: " + c.worst.reply));
+        t.append(w);
+      }
+    } else t.append(el("div", "", "丸写しの検証: なし（70字を超えるので今回は候補から外して測った）"));
+    card.append(t);
+    const rate = el("div", "rate");
+    for (const [k, label] of [["use", "採用"], ["hold", "保留"], ["skip", "不採用"]]) {
+      const b = el("button", "chip " + k, label); b.dataset.pick = c.id; b.dataset.v = k; b.setAttribute("aria-pressed", "false");
+      b.addEventListener("click", () => {
+        const cur = picks.get(c.id) || {}; const d = cur.d === k ? "" : k;
+        const body = { d, note: cur.note || "", t: new Date().toISOString() };
+        picks.set(c.id, body); paintPick(c.id); save("picks/" + c.id, body); updateProgress(); applyFilter();
+      });
+      rate.append(b);
+    }
+    card.append(rate);
+    const ta = el("textarea"); ta.id = "pn-" + c.id; ta.placeholder = "メモ（任意）"; ta.rows = 1;
+    ta.addEventListener("change", () => {
+      const cur = picks.get(c.id) || { d: "" }; const body = { d: cur.d || "", note: ta.value, t: new Date().toISOString() };
+      picks.set(c.id, body); save("picks/" + c.id, body);
+    });
+    card.append(ta);
+    return card;
+  }
+  function paintPick(id) {
+    const p = picks.get(id) || {};
+    document.querySelectorAll('[data-pick="' + id + '"]').forEach((b) => b.setAttribute("aria-pressed", String(p.d === b.dataset.v)));
+    const ta = document.getElementById("pn-" + id); if (ta && document.activeElement !== ta) ta.value = p.note || "";
+  }
+
+  // ---- 返事の評価 ----
+  const RATES = [["good", "いい"], ["meh", "ふつう"], ["bad", "だめ"]];
+  function replyBlock(scene, v, label, rep, text) {
+    const key = scene.id + ":" + v + ":" + rep;
+    const box = el("div", "reply"); box.dataset.rep = String(rep); if (rep > 0) box.hidden = !$("#opt-rep2").checked;
+    const who = el("div", "who");
+    who.append(el("span", "vname", label), el("span", "rep", rep > 0 ? "（2回目）" : ""));
+    who.dataset.var = v; who.dataset.label = label;
+    box.append(who, el("div", "", text));
+    const rate = el("div", "rate");
+    for (const [k, l] of RATES) {
+      const b = el("button", "chip " + k, l); b.dataset.key = key; b.dataset.r = k; b.setAttribute("aria-pressed", "false");
+      b.addEventListener("click", () => {
+        const cur = ratings.get(key) || {}; const r = cur.r === k ? "" : k;
+        const body = { r, ai: !!cur.ai, note: cur.note || "", t: new Date().toISOString() };
+        ratings.set(key, body); paintRating(key); save("ratings/" + key, body); updateProgress();
+      });
+      rate.append(b);
+    }
+    const ai = el("button", "chip ai", "AI臭い"); ai.dataset.key = key; ai.dataset.ai = "1"; ai.setAttribute("aria-pressed", "false");
+    ai.addEventListener("click", () => {
+      const cur = ratings.get(key) || {}; const body = { r: cur.r || "", ai: !cur.ai, note: cur.note || "", t: new Date().toISOString() };
+      ratings.set(key, body); paintRating(key); save("ratings/" + key, body); updateProgress();
+    });
+    rate.append(ai);
+    box.append(rate);
+    const ta = el("textarea"); ta.id = "rn-" + key.replace(/:/g, "_"); ta.placeholder = "メモ（任意）"; ta.rows = 1;
+    ta.addEventListener("change", () => {
+      const cur = ratings.get(key) || {}; const body = { r: cur.r || "", ai: !!cur.ai, note: ta.value, t: new Date().toISOString() };
+      ratings.set(key, body); save("ratings/" + key, body);
+    });
+    box.append(ta);
+    return box;
+  }
+  function paintRating(key) {
+    const x = ratings.get(key) || {};
+    document.querySelectorAll('[data-key="' + key + '"]').forEach((b) => {
+      b.setAttribute("aria-pressed", String(b.dataset.ai ? !!x.ai : x.r === b.dataset.r));
+    });
+    const ta = document.getElementById("rn-" + key.replace(/:/g, "_")); if (ta && document.activeElement !== ta) ta.value = x.note || "";
+  }
+  function sceneCard(scene, withNeuro) {
+    const card = el("article", "card");
+    const head = el("div", "card-head"); head.append(el("span", "sid", scene.id)); card.append(head, el("div", "said", scene.q));
+    if (withNeuro) {
+      const n = el("div", "neuro"); n.append(el("div", "who", "Neuro-sama の実際の返事（訳）"), el("div", "", scene.neuro));
+      const en = el("details", "en"); en.append(el("summary", "", "英語の原文"), el("div", "", scene.en_q + " → " + scene.neuro_en));
+      n.append(en); card.append(n);
+    } else if (scene.expect) card.append(el("div", "muted", "見どころ（検証で使った観点）: " + scene.expect));
+    const ord = order(scene.id);
+    ord.forEach((v, i) => {
+      const label = "ABC"[i];
+      (scene.replies[v] || []).forEach((text, rep) => card.append(replyBlock(scene, v, label, rep, text)));
+    });
+    return card;
+  }
+  function paintNames() {
+    const on = $("#opt-names").checked;
+    document.querySelectorAll(".who[data-var]").forEach((w) => {
+      $(".vname", w).textContent = on ? w.dataset.label + "：" + DATA.variants[w.dataset.var] : "案 " + w.dataset.label;
+    });
+  }
+
+  // ---- 集計 ----
+  function updateProgress() {
+    const decided = DATA.candidates.filter((c) => (picks.get(c.id) || {}).d).length;
+    const used = DATA.candidates.filter((c) => (picks.get(c.id) || {}).d === "use").length;
+    let rated = 0; for (const x of ratings.values()) if (x.r || x.ai) rated++;
+    $("#progress").textContent = "候補 " + decided + "/" + DATA.candidates.length + " 決定（採用 " + used + "）・返事の評価 " + rated;
+    $("#n-cand").textContent = DATA.candidates.length; $("#n-nq").textContent = DATA.nq.length; $("#n-own").textContent = DATA.own.length;
+    renderSummary();
+  }
+  function renderSummary() {
+    const box = $("#sum"); box.textContent = "";
+    box.append(el("h2", "", "返事の評価（あなたが付けたもの）"));
+    for (const [name, scenes] of [["Neuro と比べる", DATA.nq], ["自前の場面", DATA.own]]) {
+      box.append(el("h3", "", name));
+      const wrap = el("div", "tbl"); const t = el("table");
+      const hr = el("tr"); for (const h of ["案", "いい", "ふつう", "だめ", "AI臭い", "未評価"]) hr.append(el("th", "", h));
+      t.append(hr);
+      for (const v of VARS) {
+        let g = 0, m = 0, b = 0, ai = 0, none = 0;
+        for (const s of scenes) (s.replies[v] || []).forEach((_, rep) => {
+          const x = ratings.get(s.id + ":" + v + ":" + rep) || {};
+          if (x.r === "good") g++; else if (x.r === "meh") m++; else if (x.r === "bad") b++; else none++;
+          if (x.ai) ai++;
+        });
+        const tr = el("tr"); tr.append(el("td", "", DATA.variants[v]));
+        for (const n of [g, m, b, ai, none]) tr.append(el("td", "num", String(n)));
+        t.append(tr);
+      }
+      wrap.append(t); box.append(wrap);
+    }
+    box.append(el("h2", "", "実例の候補"));
+    const used = DATA.candidates.filter((c) => (picks.get(c.id) || {}).d === "use");
+    box.append(el("p", "", "採用 " + used.length + "組: " + (used.map((c) => c.id).join("、") || "まだありません")));
+    box.append(el("p", "muted", "採用が少ないと同じ実例が何度も出て口癖になりやすいので、40組くらいあると安心です（足りなければ候補を増やせます）。"));
+  }
+
+  // ---- 組み立て ----
+  function build() {
+    renderFilters();
+    const cl = $("#cand-list"); for (const c of DATA.candidates) cl.append(candCard(c));
+    const nl = $("#nq-list"); for (const s of DATA.nq) nl.append(sceneCard(s, true));
+    const ol = $("#own-list"); for (const s of DATA.own) ol.append(sceneCard(s, false));
+    paintNames(); updateProgress();
+    const tabs = [["tab-cand", "pane-cand"], ["tab-nq", "pane-nq"], ["tab-own", "pane-own"], ["tab-sum", "pane-sum"]];
+    for (const [t, p] of tabs) document.getElementById(t).addEventListener("click", () => {
+      for (const [t2, p2] of tabs) { document.getElementById(t2).setAttribute("aria-selected", String(t2 === t)); document.getElementById(p2).hidden = p2 !== p; }
+    });
+    $("#opt-names").addEventListener("change", paintNames);
+    $("#opt-rep2").addEventListener("change", () => document.querySelectorAll('.reply[data-rep="1"]').forEach((b) => { b.hidden = !$("#opt-rep2").checked; }));
+  }
+  build();
+
+  // ---- 保存（db）: 読めたら反映・書けない時は知らせる ----
+  (async () => {
+    try {
+      const user = await window.claude?.use?.("user");
+      if (user && user.can) { const ok = await user.can("data.write"); if (ok === false) canWrite = false; }
+      db = await window.claude?.use?.("db");
+    } catch (e) { db = null; }
+    if (!db) { setStatus("ng", "このページを開いている場所では保存できません（評価は残りません）"); return; }
+    setStatus(canWrite ? "ok" : "ng", canWrite ? "押した評価は自動で保存されます" : "閲覧のみ（保存できません）");
+    db.collection("picks").onSnapshot((snap) => {
+      for (const d of snap.docs) if (d.exists) picks.set(d.id, d.data() || {});
+      for (const c of DATA.candidates) paintPick(c.id);
+      updateProgress(); applyFilter();
+    }, (e) => setStatus("ng", "読み込みが止まりました（" + e.code + "）。開き直してください"));
+    db.collection("ratings").limit(1000).onSnapshot((snap) => {
+      for (const d of snap.docs) if (d.exists) { ratings.set(d.id, d.data() || {}); paintRating(d.id); }
+      updateProgress();
+    }, (e) => setStatus("ng", "読み込みが止まりました（" + e.code + "）。開き直してください"));
+  })();
+})();
+</script>

@@ -42,12 +42,64 @@ class Config:
     GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
     ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
     YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+    # OpenRouter（Jev＝typesafe/jev-1.13 の decisions API・S8 フィラーの1段目を場面に寄せる）
+    OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
     TARGET_CHANNEL_ID = os.getenv("TARGET_CHANNEL_ID", "")
 
     # 外部アプリ
     VOICEVOX_URL = os.getenv("VOICEVOX_URL", "http://127.0.0.1:50021")
     VTS_PATH = os.getenv("VTS_PATH", "")
     VOICEVOX_PATH = os.getenv("VOICEVOX_PATH", "")
+
+    # 応答の TTS。既定 = irodori（ユーザ裁定 2026-09-25「応答もフィラーも Irodori」
+    # 「感情乗ってないと正確に判別しにくい」）。voicevox は切り替えで残す。
+    # **自動フォールバックはしない**（「急に切り替わると不自然だから話者はこっちで選択」）。
+    TTS_BACKEND = os.getenv("TTS_BACKEND", "irodori")  # irodori | voicevox
+    # Irodori サーバ（`tools/irodori_server.py`）。EVE が全自動で起動する（Irodori の venv の python で）。
+    IRODORI_REPO = os.getenv(
+        "IRODORI_REPO", str(Path(__file__).resolve().parent.parent.parent / "irodori-bench" / "Irodori-TTS"))
+    IRODORI_PYTHON = os.getenv(
+        "IRODORI_PYTHON", str(Path(IRODORI_REPO) / ".venv" / "Scripts" / "python.exe"))
+    IRODORI_PORT = int(os.getenv("IRODORI_PORT", "50030"))
+    # 話者の参照音声（リポジトリ基準の相対パス可）。**フィラーのバンク（fillers.yaml の voices）と同じ声にする**。
+    # 話者は未定（当面 cand_04・ユーザ裁定 2026-09-25）。no_ref は seed ごとに話者が変わるので使わない。
+    IRODORI_VOICE_REF = os.getenv("IRODORI_VOICE_REF", "voice_candidates/cand_04.wav")
+    # 合成の steps と seed。**聴き比べて決める（未決）**。steps 6 は今のフィラーバンクと同じ値
+    # （実測 短い語 約211ms / steps 12 で 約338ms）。seed を固定すると同じ文は同じ音になる。
+    IRODORI_STEPS = int(os.getenv("IRODORI_STEPS", "6"))
+    IRODORI_SEED = int(os.getenv("IRODORI_SEED", "0"))
+    # イブの発話の区切り（「、」「。」＝再生の1項目）ごとの間[秒]。出力を開きっぱなしにした（2026-09-26）ので、
+    # 以前は項目ごとの開き直しで空いていた間をここで作る。0.29 は試聴で良しとされた値（listen/clause/・
+    # 開き直しの実測 約0.2秒＋出力の遅れ 約0.09秒）。直前の音が終わってからこれだけ空けて次を鳴らす
+    SPEECH_GAP_SEC = float(os.getenv("SPEECH_GAP_SEC", "0.29"))
+
+    # 応答非依存フィラー（S3・ユーザ指定 2026-09-25）。**機能フラグ**（既定 off・.env で明示する）。
+    # ユーザの話し終わり（VAD の確定）に「あー」「えー」等を鳴らし、応答の音声ができたら畳む。
+    # 語・抽選の比率・上限4秒・最短発話0.6秒・つなぎの間は fillers.yaml 側（ここには書かない）。
+    # つなぎの間（fillers.yaml の timing.join_gap_sec）が未決の間は ON にしても鳴らない。
+    FILLER_ENABLED = os.getenv("FILLER_ENABLED", "0") == "1"
+    FILLER_TABLE = os.getenv("FILLER_TABLE", "fillers.yaml")  # リポジトリ基準の相対パス可
+    # bank/<voice>/（tools/build_filler_bank.py で作る）。eve_calm＝語尾が上がらない候補（ユーザ採用 2026-09-26）
+    FILLER_VOICE = os.getenv("FILLER_VOICE", "eve_calm")
+    # 応答依存フィラー（S4）。**機能フラグ**（既定 off）。fillers.yaml の表 B 以下と注記を、ユーザ発話への
+    # 応答の system に入れて、応答の書き出しで言わせる（イメージを掴む目的・ユーザ裁定 2026-09-25）。
+    # 音を鳴らす S3（FILLER_ENABLED）とは独立に ON/OFF できる。
+    FILLER_DEPENDENT_ENABLED = os.getenv("FILLER_DEPENDENT_ENABLED", "0") == "1"
+    # 笑い（S6・ユーザ裁定 2026-09-26）。**機能フラグ**（既定 off）。ユーザの話の「、」「。」ごとに
+    # gpt-6-luna（ModelRegistry の laugh_judge 役・LAUGH_MODEL）で「イブが思わず笑う場面か」を判定し、
+    # 確率が fillers.yaml の laugh.immediate 以上ならその場で笑い、laugh.filler 以上ならフィラーの中で笑う（laugh.filler_style: tone なら笑いの声色）。
+    # ストリーミング文字起こし（STT_BACKEND=openai_live）とフィラー（FILLER_ENABLED）が前提。
+    LAUGH_ENABLED = os.getenv("LAUGH_ENABLED", "0") == "1"
+    # 感情（S5・ユーザ裁定 2026-09-26）。**機能フラグ**（既定 off）。イブの今の感情（喜怒哀楽笑い）を、ユーザの話の
+    # 「、」「。」ごと（gpt-6-luna・emotion_judge 役・EMOTION_MODEL）とフィードバックで更新し、応答LLM・
+    # フィードバックLLM・Irodori の声（emotion.yaml の voice_emoji）に使う（`eve/emotion.py`）。
+    # 「、」「。」ごとの判定はストリーミング文字起こし（STT_BACKEND=openai_live）が前提（無ければフィードバックだけ）。
+    EMOTION_ENABLED = os.getenv("EMOTION_ENABLED", "0") == "1"
+    EMOTION_TABLE = os.getenv("EMOTION_TABLE", "emotion.yaml")  # リポジトリ基準の相対パス可
+    # フィラーの1段目を場面に寄せる（S8・ユーザ指定 2026-09-27）。**機能フラグ**（既定 off）。ユーザの話の「、」「。」ごとに
+    # Jev（OpenRouter・OPENROUTER_API_KEY）へ聞き手の反応の種類（通常・悩む・驚く・悲しむ・不満）を聞き、強い時（fillers.yaml の
+    # mood.threshold 以上）だけ1段目をその種類の語にする。前提: FILLER_ENABLED・STT_BACKEND=openai_live
+    FILLER_MOOD_ENABLED = os.getenv("FILLER_MOOD_ENABLED", "0") == "1"
 
     # VOICEVOX 合成パラメータ
     VV_SPEAKER = int(os.getenv("VV_SPEAKER", "1"))
@@ -79,10 +131,27 @@ class Config:
     # 小声が拾われないと感じたら下げる。自己ループが残るならイヤホン音量を下げる方が先
     # （マイクゲインを上げても声と漏れが同率で増えるだけで比は改善しない）。
     MIC_MIN_PEAK = float(os.getenv("MIC_MIN_PEAK", "0.045"))
+    # 最短発話ゲート[秒]（0=長さでは捨てない）。判定は**声の長さ**（発話開始の確認窓の頭〜最後に発話と判定した
+    # チャンクの終わり）。以前は pre-roll と無音の尾（SILENCE_LIMIT 分）込みの長さを 0.3秒と比べていたので
+    # 一度も効いていなかった（2026-06-18 の初版から。2026-09-29 にユーザ指示「ノイズカットは修正」で直した）。
+    # 既定 0 はその「効いていなかった」挙動のまま。実測（2026-09-29・VOICEVOX の合成音6話者×速さ2通り・本番と
+    # 同じ VAD と判定）: 「はい」「え？」「ね」「へー」の声の長さは最短 0.096秒（確認窓ちょうど）まで短くなり、
+    # 長さだけでは短い返事と物音を分けられない。自分の声と物音を `tools/short_utterance_probe.py` で測ってから決める。
+    MIN_SPEECH_SEC = float(os.getenv("MIN_SPEECH_SEC", "0"))
 
-    # STT バックエンド（既定 = gpt-4o-transcribe。groq は幻聴多く非推奨=ロールバック用）
-    STT_BACKEND = os.getenv("STT_BACKEND", "openai")  # openai | groq
-    STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-transcribe")
+    # STT バックエンド。既定 = openai_live（gpt-live-transcribe のストリーミング・ユーザ裁定
+    # 2026-09-25「応答も早くなるし金銭的にもあまり高くない」）。openai = gpt-4o-transcribe の一括
+    # （話し終わってから全体を送る）。groq は幻聴多く非推奨=ロールバック用。
+    # **openai_live が失敗しても一括方式へ自動で切り替えない**（ユーザ裁定: その発話は捨てて張り直す）。
+    STT_BACKEND = os.getenv("STT_BACKEND", "openai_live")  # openai_live | openai | groq
+    STT_MODEL = os.getenv("STT_MODEL", "gpt-4o-transcribe")  # openai（一括）用
+    STT_LIVE_MODEL = os.getenv("STT_LIVE_MODEL", "gpt-live-transcribe")
+    # delay: 実測（JVNV 18件・2026-09-25）で low が minimal より誤り率・確定の速さとも良かった
+    # （low 6.2%・commit→確定 中央0.55s / minimal 6.5%・0.62s）。
+    STT_LIVE_DELAY = os.getenv("STT_LIVE_DELAY", "low")
+    # commit 後に確定が来ない時の打ち切り[秒]。実測の commit→確定は 中央0.55s・最大0.94s
+    # （JVNV 18件を実時間で送った場合）。その約5倍。超えたらその発話は捨てて接続を張り直す。
+    STT_LIVE_COMMIT_TIMEOUT_SEC = float(os.getenv("STT_LIVE_COMMIT_TIMEOUT_SEC", "5.0"))
 
     # 短期記憶（F3 ConversationCache）
     # 会話ログの永続先（タイムスタンプ付き JSONL・ロケット鉛筆方式）。
@@ -124,9 +193,11 @@ class Config:
     # 発話判定 / 自発発話（F5）
     # 沈黙監視 tick（軽い周期チェック）。
     SILENCE_TICK_SEC = float(os.getenv("SILENCE_TICK_SEC", "0.7"))
-    # ユーザ 5秒無言で発話判定LLM を回す（企画書準拠）。trigger 兼フラット再評価カデンス。
-    # ＝バックオフで間隔を伸ばさず 5秒ごとに連続評価し続ける（実世界を細かく観測する意図）。
+    # ユーザ 5秒無言で発話判定LLM を回す（企画書準拠）。以後は判定のたびに間隔を倍にする（5→10→20→…秒）。
+    # 2026-10-05 ユーザ裁定「両方無言なら間隔を指数関数的に広げる・最大5分」（それまではフラット5秒で
+    # 放置中も1時間に数百回判定していた）。ユーザかイブが話すと 5秒に戻る。画面の変化による判定はこの間隔を通らない。
     SILENCE_THRESHOLD_SEC = float(os.getenv("SILENCE_THRESHOLD_SEC", "5.0"))
+    SILENCE_MAX_INTERVAL_SEC = float(os.getenv("SILENCE_MAX_INTERVAL_SEC", "300"))
     # 自律発話を**起動時に**有効にするか（既定 on＝これまでの挙動）。UI メニューの ON/OFF は
     # 「今このセッションだけ」で、こちらは「次の起動時の初期値」。両者は別物（UI_DESIGN 裁定 A）。
     AUTOSPEECH_ENABLED = os.getenv("AUTOSPEECH_ENABLED", "1") == "1"
@@ -239,6 +310,14 @@ class Config:
 
     # Call-Function（J-0 即時 Call-Function・increment 1 は read-only 能力のみ）。
     CALLFUNCTION_ENABLED = os.getenv("CALLFUNCTION_ENABLED", "0") == "1"  # 既定 off（実機で明示 on）
+    # 応答LLM（RESPONSE_MODEL）に渡す reasoning_effort。空＝渡さない（モデルの既定）。
+    # gpt-6-luna（ユーザ採用 2026-09-29）は chat completions で**ツール付きだと none しか通らない**
+    # （既定・low は BadRequest「Function tools with reasoning_effort are not supported for gpt-6-luna」・実測 2026-09-28）。
+    # ツールはユーザ発話のターンで必ず渡るので、ルナなら none が必須
+    RESPONSE_REASONING_EFFORT = os.getenv("RESPONSE_REASONING_EFFORT", "")
+    # 話し方の実例（`eve/persona_examples.py`・2026-10-01 ユーザ「N5＋実例で」）: ユーザ発話への応答で毎回見せる数（0＝使わない）。
+    # 実測で 8（0/2/4/8/16 を比べ、8 で Neuro-sama の実際の返事に近づき 16 で横ばい）。実例は persona_examples.yaml（人が選ぶ）
+    PERSONA_EXAMPLES_K = int(os.getenv("PERSONA_EXAMPLES_K", "8"))
 
     # タスク管理（J-1 inc1 = 土台ハーネス・単純な予約タスクのみ）。CALLFUNCTION_ENABLED 前提。
     TASK_ENABLED = os.getenv("TASK_ENABLED", "0") == "1"  # 既定 off
@@ -264,6 +343,11 @@ class Config:
     SEARCH_MIN_INTERVAL_SEC = float(os.getenv("SEARCH_MIN_INTERVAL_SEC", "5.0"))  # 実検索の最小間隔（auto=多エンジン分散なら3s連打8/8成功の実測。単一エンジン時の保険として維持）
     SEARCH_RETRY_EMPTY_DELAY_SEC = float(os.getenv("SEARCH_RETRY_EMPTY_DELAY_SEC", "8.0"))  # 0件時の1回だけ再検索の待ち（0=無効）
     SEARCH_BACKEND = os.getenv("SEARCH_BACKEND", "auto")  # ddgs バックエンド（auto=マルチエンジン自動フォールバック。DNS 修正後 5 エンジン生存・3s連打8/8の実測 2026-07-18。DNS遮断回線では "duckduckgo" 固定に戻す）
+    # ddgs が中で使う HTTP クライアント（primp）の名前解決。既定 system＝OS と同じ名前解決（ブラウザと同じ）。
+    # primp の既定は**独自の名前解決**で、この PC の Wi-Fi が配る IPv6 の DNS（問い合わせを拒否する）に聞いて
+    # 「dns error: Query Refused」で諦めていた（実測 2026-09-28・Windows 自体はルータの DNS で引ける）。
+    # 空にするとライブラリの既定に戻す（DNS サーバの IP を書けばそれを使う・例 192.168.0.1）
+    SEARCH_DNS_RESOLVER = os.getenv("SEARCH_DNS_RESOLVER", "system")
 
     # 作業フォルダ（J-3 inc1 = AI 専用ワークスペース）。TASK_ENABLED 前提（TaskAgent 専用能力）。
     WS_ENABLED = os.getenv("WS_ENABLED", "0") == "1"  # 既定 off（実機で明示 on）

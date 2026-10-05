@@ -188,18 +188,16 @@ def t_hooks() -> None:
 
 
 def t_barge_in_closes_mouth() -> None:
-    print("\n[8] barge-in で必ず口が閉じる（終了通知が出る）")
+    print("\n[8] barge-in でも必ず口が閉じる（言い切った後に終了通知が出る）")
 
     async def run() -> None:
         starts: list = []
         ends: list = []
         stopped = asyncio.Event()
 
-        async def play_fn(audio, should_stop=None):
-            # 途中停止をシミュレート: should_stop が True になるまで待つ
-            for _ in range(200):
-                if should_stop is not None and should_stop():
-                    break
+        async def play_fn(audio):
+            # 節を鳴らす（割り込まれても最後まで鳴る＝言い切る）
+            for _ in range(20):
                 stopped.set()
                 await asyncio.sleep(0.005)
 
@@ -215,7 +213,7 @@ def t_barge_in_closes_mouth() -> None:
             if ends:
                 break
             await asyncio.sleep(0.01)
-        check("途中停止でも終了通知が出る（口を閉じられる）", ends == ["長い文。"], f"{ends}")
+        check("割り込まれても言い切った後に終了通知が出る（口を閉じられる）", ends == ["長い文。"], f"{ends}")
 
         # barge-in で捨てられた文のメタが残らない
         q.note_meta(q.current_generation(), 0, [(0.0, 1.0, 1.0, 1.0)])
@@ -241,8 +239,8 @@ def t_signatures() -> None:
 
     from eve.response.player import RealAudioPlayer
     play = list(inspect.signature(RealAudioPlayer().play_fn).parameters)
-    check("play_fn の引数順が変わっていない（_play_takes_stop 判定の前提）",
-          play[:2] == ["audio", "should_stop"], f"{play}")
+    # 割り込みでも鳴っている節は止めない（言い切る・2026-09-22）＝止める合図は受け取らない
+    check("play_fn は音声だけを受ける（割り込みで途中停止しない）", play == ["audio"], f"{play}")
 
     from eve.response.tts import VoicevoxTTS
     check("generate は従来どおり（bytes を返す契約の呼び出し元を守る）",

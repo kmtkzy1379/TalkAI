@@ -319,7 +319,7 @@ async def t_orchestrator_stale_vision_block() -> bool:
     return ("# 画面（直前に見えていたもの）" in sysmsg
             and "Agents Window" in sysmsg
             and "能力が無いとは言わない" in sysmsg
-            and "画面情報なし" not in sysmsg)
+            and "読み取れていない" not in sysmsg)
 
 
 def t_vision_for_user_marker_not_held() -> bool:
@@ -587,12 +587,14 @@ async def t_vision_absence_marker() -> bool:
     unwired = ctx.assemble(user_text="今何が見えてる?", vision=None)[0]["content"]
     present = ctx.assemble(user_text="今何が見えてる?", vision="メモ帳が開いている")[0]["content"]
     return (
-        "画面情報なし" in absent and "過去の記憶から作らない" in absent
-        and "今は画面が見えていない" in absent
+        "今は画面の中身を読み取れていない" in absent and "過去の記憶から作らない" in absent
+        and "今は読み取れていないと伝える" in absent
+        # 2026-09-30: 「今は画面が見えていない」と言わせない（能力が無いように聞こえた・ユーザ指摘と実測 3/3）
+        and "見えていない" not in absent and "画面情報なし" not in absent
         # 会話から言えることまで潰さない（強い文言だと全部「見えないから分からない」になる実測）
         and "これまでどおり普通に話してよい" in absent
         and "# 画面" not in unwired      # VLM 未配線: ブロック自体を出さない
-        and "画面情報なし" not in present and "メモ帳が開いている" in present
+        and "読み取れていない" not in present and "メモ帳が開いている" in present
     )
 
 
@@ -611,7 +613,39 @@ async def t_orchestrator_reports_vision_absence() -> bool:
     sysmsg = orch._build_messages(Stimulus(StimulusKind.USER_UTTERANCE, "今何が見えてる?"))[0]["content"]
     no_vlm = ResponseOrchestrator(AudioPlayQueue(), stream_fn, tts)._build_messages(
         Stimulus(StimulusKind.USER_UTTERANCE, "やあ"))[0]["content"]
-    return "画面情報なし" in sysmsg and "# 画面" not in no_vlm
+    return "今は画面の中身を読み取れていない" in sysmsg and "# 画面" not in no_vlm
+
+
+async def t_static_screen_for_auto_and_report() -> bool:
+    """⭐ユーザ提案 2026-09-30: 自発発話・機能報告でも、静止しているだけの画面は「以降ずっと変化なし」付きで渡す
+    （以前は7秒を過ぎると「画面情報なし・今この瞬間の画面は届いていない」になり誤解を生んだ）。
+    本当に読めていない時（実況がまだ無い）は、どの刺激でも「読み取れていない」。"""
+    from eve.clock import now_mono
+    from eve.pipeline import AudioPlayQueue, Stimulus, StimulusKind
+    from eve.pipeline.stimulus import CallFunctionResult
+    from eve.response import ResponseOrchestrator
+    from eve.speech.decider import AutonomousSpeech
+
+    async def stream_fn(m):
+        yield "ok"
+
+    async def tts(s):
+        return b"x"
+    n = now_mono()
+    vs = VisionState()
+    vs.add_frame(_frame(0), True, now=n - 130.0)
+    vs.set_latest("ブラウザでカレーのレシピが表示されている", mono=n - 120.0)
+    vs.add_frame(_frame(1), False, now=n - 0.3)  # 変化なし・capture 生存
+    orch = ResponseOrchestrator(AudioPlayQueue(), stream_fn, tts, vision_state=vs)
+    auto = orch._build_messages(Stimulus(StimulusKind.AUTONOMOUS_SPEECH,
+                                         AutonomousSpeech(content="晩ごはん決めた？", reason="夕方")))[0]["content"]
+    report = orch._build_messages(Stimulus(StimulusKind.CALLFUNCTION_RESULT, CallFunctionResult(
+        function_name="delegate_task", content="ラーメンの画像を表示したよ。")))[0]["content"]
+    unknown = ResponseOrchestrator(AudioPlayQueue(), stream_fn, tts, vision_state=VisionState())._build_messages(
+        Stimulus(StimulusKind.AUTONOMOUS_SPEECH, AutonomousSpeech(content="やあ", reason="r")))[0]["content"]
+    ok = all("カレーのレシピ" in s and "以降ずっと変化なし" in s and "読み取れていない" not in s
+             for s in (auto, report))
+    return ok and "今は画面の中身を読み取れていない" in unknown
 
 
 async def t_vision_injected_into_messages() -> bool:
@@ -918,8 +952,93 @@ def t_capture_thread_a10_safe_stop() -> bool:
     return ct._step() is False  # 例外を投げず安全停止シグナル（A10）
 
 
+def t_parse_prediction() -> bool:
+    """予想（ユーザ裁定 2026-09-30）: prediction タグを読む。無い出力（旧形式）は空文字で壊れない。"""
+    r = parse_vision("narration: メモ帳で日記を入力中\nnotable: no\nprediction: 日記の続きが入力されそう\n"
+                     "surprise: 10\nvisible: yes")
+    old = parse_vision("narration: メモ帳に文章を入力中\nnotable: yes\nsurprise: 45")
+    return r.prediction == "日記の続きが入力されそう" and r.surprise_diff == 10 and old.prediction == ""
+
+
+def t_parse_prediction_not_invisible() -> bool:
+    """予想の行に「真っ黒」「見えない」があっても、**今の画面**を視認不可にしない（未来の話）。"""
+    r = parse_vision("narration: 映画の暗い場面が再生されている\nnotable: no\n"
+                     "prediction: 次は画面が真っ黒になって何も見えない場面になりそう\nsurprise: 15\nvisible: yes")
+    bad = parse_vision("narration: 画面が真っ黒で何も見えない\nprediction: そのまま\nvisible: yes")
+    return r.visible and r.narration.startswith("映画") and not bad.visible
+
+
+def t_build_messages_prediction() -> bool:
+    """前回の予想を user に添える（無ければ初回と明示）。system は surprise を「予想との食い違い」と定義する。"""
+    from eve.vlm.narrator import VLM_SYSTEM, build_messages
+    frames = [Frame(frame_id=1, mono_ts=0.0, jpeg_b64="x")]
+    with_pred = build_messages(frames, (), "同じ記事がスクロールされそう")[1]["content"][0]["text"]
+    first = build_messages(frames)[1]["content"][0]["text"]
+    return ("前回のあなたの予想: 同じ記事がスクロールされそう" in with_pred
+            and "前回のあなたの予想: なし（初回）" in first
+            and "prediction:" in VLM_SYSTEM and "「前回の予想」と今の画面の食い違い" in VLM_SYSTEM)
+
+
+async def t_prediction_chain() -> bool:
+    """⭐予想の連なり: 1回目の予想が2回目の呼び出しに「前回のあなたの予想」として渡る（本番の make_narrate_fn 経由）。
+    見えなかった回と reset で予想を捨てる（古い予想で ON 直後や黒画面明けを「予想外」にしない）。"""
+    from eve.vlm.narrator import make_narrate_fn
+
+    sent: list[str] = []
+    outputs = iter([
+        "narration: 記事を表示中\nnotable: no\nprediction: 記事がさらに下へスクロールされそう\nsurprise: 20\nvisible: yes",
+        "narration: 動画サイトに切り替わった\nnotable: yes\nprediction: 動画が再生されそう\nsurprise: 90\nvisible: yes",
+        "visible: no",
+        "narration: 動画を再生中\nnotable: no\nprediction: 再生が続きそう\nsurprise: 20\nvisible: yes",
+    ])
+
+    class _Reg:
+        async def complete(self, role, messages, **kw):
+            sent.append(messages[1]["content"][0]["text"])
+            return {"choices": [{"message": {"content": next(outputs)}}]}
+
+    class _Resp:  # narrator の _content_of は属性アクセスなので dict を包む
+        def __init__(self, d):
+            self.choices = [type("C", (), {"message": type("M", (), {"content": d["choices"][0]["message"]["content"]})()})()]
+
+    reg = _Reg()
+    orig = reg.complete
+
+    async def complete(role, messages, **kw):
+        return _Resp(await orig(role, messages, **kw))
+    reg.complete = complete
+
+    vs, pred = VisionState(), PredictionState()
+    holder: dict = {}
+    narr = make_narrate_fn(reg, prediction_fn=lambda: holder["w"].last_prediction)
+    w = _mkworker(vs, pred, narr)
+    holder["w"] = w
+    w.start()
+    for i in range(3):
+        w.on_frame(_frame(i), True)
+        await _pump()
+    after_invisible = w.last_prediction
+    w.on_frame(_frame(9), True)
+    await _pump()
+    before_reset = w.last_prediction
+    w.reset()
+    await w.stop()
+    return (len(sent) == 4
+            and "前回のあなたの予想: なし（初回）" in sent[0]
+            and "前回のあなたの予想: 記事がさらに下へスクロールされそう" in sent[1]
+            and "前回のあなたの予想: 動画が再生されそう" in sent[2]
+            and after_invisible == ""                      # 見えなかった回で連なりを切る
+            and "前回のあなたの予想: なし（初回）" in sent[3]  # 黒画面明けは初回扱い
+            and before_reset == "再生が続きそう" and w.last_prediction == ""
+            and pred.surprise == 20)
+
+
 async def main() -> None:
     check("parse valid", t_parse_valid())
+    check("予想: prediction タグを読む（旧形式は空）", t_parse_prediction())
+    check("⭐予想の行の「真っ黒/見えない」で今の画面を視認不可にしない", t_parse_prediction_not_invisible())
+    check("予想: 前回の予想を user に添える・surprise の定義", t_build_messages_prediction())
+    check("⭐予想の連なり（2回目に1回目の予想が渡る・黒画面と reset で切る）", await t_prediction_chain())
     check("parse garbage 安全(raise しない)", t_parse_garbage_safe())
     check("parse 全角コロン", t_parse_fullwidth_colon())
     check("A11 parse 視認不可マーカ→中身/驚き不採用", t_parse_invisible_marker())
@@ -963,6 +1082,7 @@ async def main() -> None:
     check("vision を応答文脈に注入(# 画面)", await t_vision_injected_into_messages())
     check("⭐画面不在マーカ: 無い事を明示し捏造を禁じる(3値規約)", await t_vision_absence_marker())
     check("⭐配線: 画面情報なしは None でなく不在明示を渡す", await t_orchestrator_reports_vision_absence())
+    check("⭐自発発話・報告でも静止画面は「以降ずっと変化なし」で渡す", await t_static_screen_for_auto_and_report())
     check("⭐E15 変化後・実況待ちの空白を断り付きで埋める", t_vision_after_change_fills_gap())
     check("E15 据え置きと担当が排他（静止/TTL内/視認不可は None）", t_vision_after_change_exclusive())
     check("⭐E15 配線: 不在明示でなく「直前に見えていたもの」", await t_orchestrator_stale_vision_block())

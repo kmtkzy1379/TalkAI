@@ -15,6 +15,7 @@ import logging
 import os
 import sys
 import tempfile
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logging.disable(logging.CRITICAL)
@@ -23,6 +24,7 @@ from eve.context_assembler import ContextAssembler  # noqa: E402
 from eve.persona import (  # noqa: E402
     PERSONA_HEADING,
     PERSONA_MAX_CHARS,
+    _default_path,
     load_persona,
     parse_persona,
 )
@@ -83,15 +85,28 @@ long_body = "# x\n\n---\n\n## 性格\n\n" + "".join(f"- {'あ' * 80}\n" for _ in
 check("長すぎるペルソナは切り詰める（肥大の再発を上限で止める）",
       len(load_persona(_write(long_body))) <= PERSONA_MAX_CHARS + len(PERSONA_HEADING) + 1)
 
-# ==== 実ファイル（リポジトリの persona.md）====
-real = load_persona()
+# ==== 実ファイル（リポジトリの persona.md＝書式の見本）====
+# 本物の性格は手元だけの persona.local.md（あればそちらを読む・.gitignore 済み）。2026-10-06 ユーザ「コミットはコードと
+# システムプロンプトフォーマットだけで、実例データや詳細なペルソナは除外」→ リポジトリのテストは書式の見本で、中身は見ない
+REPO_PERSONA = str(Path(__file__).resolve().parent.parent / "persona.md")
+real = load_persona(REPO_PERSONA)
 check("実ファイルが読める", real.startswith(PERSONA_HEADING) and len(real) > 50, f"{len(real)}字")
-check("性格と口調が両方入る", "悪友" in real and "丁寧語" in real)
+check("性格と口調が両方入る", "- 性格: " in real and "- 口調: " in real)
 check("**好み・趣向が混ざっていない**（自己モデルの領分）",
       not any(w in real for w in ("好きな食べ物", "好物", "好きな色")))
 check("**規律が混ざっていない**（style.py とコードゲートの領分）",
       not any(w in real for w in ("delegate_task", "予約タスク", "関数", "tool")))
-check("ペルソナは短い（system 全体の予算を圧迫しない）", len(real) < 600, f"{len(real)}字")
+check("ペルソナは短い（system 全体の予算を圧迫しない）", len(real) < 900, f"{len(real)}字")
+# 実際に読む性格（手元の persona.local.md があればそれ）も同じ予算に収まる
+check("実際に読む性格も短い（手元の本物があればそれ）", len(load_persona()) < 900, f"{len(load_persona())}字")
+
+# 手元の persona.local.md があればそちらを読む（無ければリポジトリの persona.md）
+_root = Path(tempfile.mkdtemp(prefix="eve_persona_root_"))
+(_root / "persona.md").write_text("x", encoding="utf-8")
+check("手元の persona.local.md が無ければ persona.md（書式の見本）", _default_path(_root) == _root / "persona.md")
+(_root / "persona.local.md").write_text("x", encoding="utf-8")
+check("手元の persona.local.md があればそちらを読む（本物の性格はコミットしない）",
+      _default_path(_root) == _root / "persona.local.md")
 
 # ==== 既存ブロックとの共存（今回の事故領域）====
 ctx = ContextAssembler(system_prompt=SPEECH_STYLE + "\n\n" + real)
@@ -116,8 +131,9 @@ check("役割アンカーが残る（話者取り違え防止）", "assistant �
 sys_novision = ctx.assemble(user_text="画面なにが見えてる？", vision="")[0]["content"]
 check("画面不在の禁止規則がペルソナに潰されない",
       "推測や過去の記憶から作らない" in sys_novision
-      and "今は画面が見えていない" in sys_novision)
-check("ペルソナ側も推測を禁じている（同じ方向を向く）", "推測で埋めない" in sys_novision)
+      and "今は読み取れていないと伝える" in sys_novision)
+# 性格の側の文面（知ったかぶりの扱い等）は中身なので見ない。画面を読めていない時に中身を作らないことは
+# Gemini と本物の性格で確かめた（読めていない場面 4/4 で作らなかった・prod_check 2026-10-04）
 
 # 肥大していないこと（≤5s のハード制約に効く）
 check("system 全体が肥大していない", len(sysmsg) < 4500, f"{len(sysmsg)}字")

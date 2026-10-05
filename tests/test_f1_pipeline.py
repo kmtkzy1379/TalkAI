@@ -253,28 +253,35 @@ async def t3_generation_drop() -> bool:
     return played == ["old0", "new0", "new1"]  # old2 と stale は流れない
 
 
-async def t3_midsentence_stop() -> bool:
-    """B3: 再生中に世代が変わったら文の途中でも停止する（should_stop）。"""
-    chunks: list = []
+async def t3_barge_in_finishes_item() -> dict:
+    """割り込み: 鳴っている項目（節）は言い切り、次の項目は鳴らさない（ユーザ裁定 2026-09-22
+    「今まではユーザーしゃべったら速攻黙ったけど不自然。、。までは喋らせる」。旧 B3 の即停止は廃止）。"""
+    chunks: dict = {}
     started = asyncio.Event()
 
-    async def play_fn(audio, should_stop):  # 2引数=should_stop を受ける
-        for i in range(100):  # 長い文を模擬（100チャンク）
-            if should_stop():
-                break
-            chunks.append(i)
-            if i == 0:
-                started.set()
+    async def play_fn(audio):
+        chunks[audio] = 0
+        for _ in range(20):  # 節を模擬（20チャンク）
+            chunks[audio] += 1
+            started.set()
             await asyncio.sleep(0.001)
 
     audio = AudioPlayQueue(play_fn=play_fn)
     worker = asyncio.create_task(audio.play_worker())
-    audio.enqueue(audio.current_generation(), 0, "S")
-    await started.wait()  # 再生中
+    g = audio.current_generation()
+    audio.enqueue(g, audio.reserve_seq(g), "節1")
+    audio.enqueue(g, audio.reserve_seq(g), "節2")
+    await started.wait()  # 節1 の再生中
     audio.bump_generation()  # barge-in（世代を進める）
-    await asyncio.sleep(0.05)
+    playing_after = audio.is_playing()
+    for _ in range(200):
+        if not audio.is_playing():
+            break
+        await asyncio.sleep(0.005)
+    await asyncio.sleep(0.02)
     worker.cancel()
-    return 0 < len(chunks) < 100  # 全チャンクは鳴らない＝途中で停止した
+    return {"finished": chunks.get("節1") == 20, "next_dropped": "節2" not in chunks,
+            "still_playing_after_bump": playing_after}
 
 
 # ---------- P2 単一ループ所有（cross-thread 機構削除の回帰ガード）----------
@@ -343,17 +350,15 @@ async def t7_e2e() -> dict:
 # 戻った後（数十ms 遅れ）に発火する一方、cancel を受けた orchestrator は**同期で**記憶に
 # 書き込むため、`spoken` が空のまま記録されていたこと。
 
-async def _play_until_stopped(audio, should_stop=None):
-    """鳴り続け、should_stop が立ったら戻る偽 play（実 player の B3 相当）。"""
-    for _ in range(1000):
-        if should_stop is not None and should_stop():
-            return
-        await asyncio.sleep(0.001)
+async def _play_clause(audio):
+    """節を1つ鳴らす偽 play（約0.1秒・割り込まれても最後まで鳴る＝実 player と同じ）。"""
+    for _ in range(10):
+        await asyncio.sleep(0.01)
 
 
 async def t_c5_flush_on_interrupt() -> bool:
     spoken: list[str] = []
-    q = AudioPlayQueue(play_fn=_play_until_stopped)
+    q = AudioPlayQueue(play_fn=_play_clause)
     worker = asyncio.create_task(q.play_worker())
     q.enqueue(0, q.reserve_seq(0), b"a", text="ほぼ最後まで喋った文。", on_played=spoken.append)
     await asyncio.sleep(0.05)  # 再生開始まで待つ
@@ -365,12 +370,16 @@ async def t_c5_flush_on_interrupt() -> bool:
 
 async def t_c5_no_double_report() -> bool:
     spoken: list[str] = []
-    q = AudioPlayQueue(play_fn=_play_until_stopped)
+    q = AudioPlayQueue(play_fn=_play_clause)
     worker = asyncio.create_task(q.play_worker())
     q.enqueue(0, q.reserve_seq(0), b"a", text="一回だけ。", on_played=spoken.append)
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(0.03)
     q.interrupt()
-    await asyncio.sleep(0.05)  # play が戻り、通常経路の on_played 判定を通過させる
+    for _ in range(100):  # 節を言い切って play が戻り、通常経路の on_played 判定を通過させる
+        if not q.is_playing():
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.02)
     ok = spoken == ["一回だけ。"]
     worker.cancel()
     return ok
@@ -379,15 +388,50 @@ async def t_c5_no_double_report() -> bool:
 async def t_c5_unplayed_not_reported() -> bool:
     # まだ鳴っていない（queue で待っている）文は「聞かれた」扱いにしない＝C5 の芯。
     spoken: list[str] = []
-    q = AudioPlayQueue(play_fn=_play_until_stopped)
+    q = AudioPlayQueue(play_fn=_play_clause)
     worker = asyncio.create_task(q.play_worker())
-    q.enqueue(0, q.reserve_seq(0), b"a", text="1文目。", on_played=spoken.append)
+    q.enqueue(0, q.reserve_seq(0), b"a", text="1文目、", on_played=spoken.append)
     q.enqueue(0, q.reserve_seq(0), b"b", text="2文目。", on_played=spoken.append)
-    await asyncio.sleep(0.05)
+    await asyncio.sleep(0.03)
     q.interrupt()
-    ok = spoken == ["1文目。"]  # 2文目は一度も鳴っていない
+    ok = spoken == ["1文目、"]
+    await asyncio.sleep(0.25)  # 1文目を言い切った後も、2文目は鳴らない
+    ok = ok and spoken == ["1文目、"]
     worker.cancel()
     return ok
+
+
+async def t_c5_interrupt_in_start_listener() -> bool:
+    """鳴り始めの通知の中で割り込まれても（話している途中に鳴り始めた＝この節で譲る）、
+    その節は「喋った」と確定してから世代が進む（応答の cancel より先＝記憶から消えない）。
+    その節は最後まで鳴り、次の節は鳴らない。"""
+    spoken: list[str] = []
+    played: list[str] = []
+
+    async def play_fn(audio):
+        await _play_clause(audio)
+        played.append(audio)
+
+    q = AudioPlayQueue(play_fn=play_fn)
+    fired: list = []
+
+    def listener():
+        if not fired:
+            fired.append(1)
+            q.interrupt()
+            fired.append(list(spoken))  # 世代を進めた直後（await を挟まない）に確定済みか
+
+    q.add_start_listener(listener)
+    worker = asyncio.create_task(q.play_worker())
+    q.enqueue(0, q.reserve_seq(0), "a", text="うん、", on_played=spoken.append)
+    q.enqueue(0, q.reserve_seq(0), "b", text="それでね。", on_played=spoken.append)
+    for _ in range(100):
+        if played:
+            break
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.2)
+    worker.cancel()
+    return (fired[1:] == [["うん、"]] and played == ["a"] and spoken == ["うん、"])
 
 
 async def main() -> None:
@@ -398,7 +442,10 @@ async def main() -> None:
 
     check("T3 seq 順再生", await t3_seq_order())
     check("T3 世代で古い音声を破棄", await t3_generation_drop())
-    check("T3 barge-inで文の途中でも停止", await t3_midsentence_stop())
+    r3 = await t3_barge_in_finishes_item()
+    check("T3 割り込み: 鳴っている節は最後まで鳴る（言い切る）", r3["finished"])
+    check("T3 割り込み: 世代を進めた直後もまだ鳴っている（即停止しない）", r3["still_playing_after_bump"])
+    check("T3 割り込み: 次の節は鳴らない", r3["next_dropped"])
 
     check("P2 単一ループ所有(set_loop/_loop 削除・interrupt は世代+1)", t_p2_single_loop_only())
 
@@ -416,6 +463,8 @@ async def main() -> None:
     check("C5: 再生中の barge-in で途中文が即座に確定する", await t_c5_flush_on_interrupt())
     check("C5: 二重発火しない（確定後に play が戻っても1回）", await t_c5_no_double_report())
     check("C5: 一度も鳴っていない文は確定しない", await t_c5_unplayed_not_reported())
+    check("C5: 鳴り始めの通知の中の割り込みでも、その節は確定・言い切り・次は鳴らない",
+          await t_c5_interrupt_in_start_listener())
 
     r = await t7_e2e()
     check("T7 例外なし", r["raised"] is None)

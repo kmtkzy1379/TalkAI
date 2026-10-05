@@ -69,7 +69,7 @@ def _t(key, label, note="", warn=""):
 
 
 MODEL_CHOICES = (
-    "openai/gpt-5.5", "openai/gpt-5.4", "openai/gpt-5.4-mini",
+    "openai/gpt-6-luna", "openai/gpt-5.5", "openai/gpt-5.4", "openai/gpt-5.4-mini",
     "openai/gpt-4o", "openai/gpt-4o-mini",
     "gemini/gemini-2.5-pro", "gemini/gemini-2.5-flash",
     "groq/llama-3.3-70b-versatile",
@@ -83,7 +83,33 @@ def _model(key, label, note):
 # --- 設定（常時表示）------------------------------------------------------
 
 BASIC: tuple = (
-    Group("声", "VOICEVOX の合成パラメータ。話者は VOICEVOX の話者IDです。", (
+    Group("声", "応答の声。Irodori が既定（フィラーと同じ声）。VOICEVOX の項目は VOICEVOX を選んだ時だけ効きます。", (
+        _c("TTS_BACKEND", "声の提供元", ("irodori", "voicevox"),
+           "失敗しても**もう片方へ自動では切り替えません**（急に声が変わるのを避けるため）"),
+        _b("FILLER_ENABLED", "考えている間のつなぎ言葉（フィラー）",
+           "話し終わりに「あー」「えー」等を鳴らし、応答ができたら畳みます。語や比率は fillers.yaml"),
+        _b("FILLER_DEPENDENT_ENABLED", "応答の書き出しの言葉（あー・へー・そっか 等）",
+           "fillers.yaml の opener_prompt（フィラーの表・一例）を応答モデルに渡し、合う時だけ書き出しに使わせます"
+           "（置かない場面も大事・特定の語に偏らない）"),
+        _b("LAUGH_ENABLED", "面白い所で笑う",
+           "ユーザの話を「、」「。」ごとに判定し、面白い所でその場で笑う／フィラーの中で笑う"
+           "（閾値と笑い方は fillers.yaml の laugh）"),
+        _b("FILLER_MOOD_ENABLED", "つなぎ言葉の1語目を場面に合わせる",
+           "ユーザの話を「、」「。」ごとに Jev で見て、はっきり驚く・悲しむ・悩む・不満の時だけ1語目をその語に"
+           "（驚く→お 等・しきい値と語は fillers.yaml の mood）"),
+        _b("EMOTION_ENABLED", "感情に沿って話す",
+           "イブの今の感情（喜怒哀楽笑い）を、ユーザの話の「、」「。」ごととフィードバックで更新し、"
+           "応答・内省・声（emotion.yaml）に使います"),
+        _i("PERSONA_EXAMPLES_K", "話し方の実例の数", 0, 16, 1,
+           "返事のたびに persona_examples.yaml からこの数だけランダムに見せます（0＝使わない・実測で 8 が最良）。"
+           "今の話しかけと意味が近い実例は見せません（丸写しを防ぐため）"),
+        _f("SPEECH_GAP_SEC", "区切り（「、」「。」）の間[秒]", 0.00, 1.00, 0.01,
+           "0.29 は試聴で良しとされた値"),
+        _t("IRODORI_VOICE_REF", "Irodori の話者（参照音声）",
+           "wav のパス。フィラーのバンク（fillers.yaml の voices）と同じ声にしてください"),
+        _i("IRODORI_STEPS", "Irodori の steps", 1, 40, 1,
+           "大きいほど高音質・遅い（実測 6→約0.21秒 / 12→約0.34秒）"),
+        _i("IRODORI_SEED", "Irodori の seed", 0, 99999, 1, "固定すると同じ文は同じ音になる"),
         _i("VV_SPEAKER", "話者ID", 0, 200),
         _f("VV_SPEED", "話す速さ", 0.50, 2.00, 0.05, "1.00 が標準。大きいほど速い"),
         _f("VV_PITCH", "声の高さ", -0.15, 0.15, 0.01,
@@ -144,6 +170,10 @@ ADVANCED: tuple = (
           )),
     Group("モデル（残り）",
           "会話の見た目には出ないところ。安いモデルで十分なことが多いです。", (
+              _c("RESPONSE_REASONING_EFFORT", "応答モデルの考える深さ（reasoning_effort）",
+                 ("", "none", "low", "medium", "high"),
+                 "設定タブの「応答」に渡す。空＝モデルの既定。**gpt-6-luna は none でないとツール付きの応答が失敗します**",
+                 editable=True),
               _model("FEEDBACK_MODEL", "内省", "各応答のあと、自分の予測とのズレを振り返る"),
               _model("SUMMARIZE_MODEL", "要約", "長い記憶をまとめる"),
               _model("SEARCH_SUMMARIZE_MODEL", "検索結果の要約",
@@ -151,6 +181,10 @@ ADVANCED: tuple = (
               _model("SELF_MODEL_MODEL", "自己形成",
                      "イブの好み・趣向の台帳を会話から育てる。**合図が出た時だけ**呼ばれる"
                      "（実測でイブ発話の約15%）＝稀なので賢いモデルを選ぶ"),
+              _model("LAUGH_MODEL", "笑い判定",
+                     "「、」「。」ごとに呼ぶ。yes/no の確率（logprobs）を出せる軽いモデルが要る"),
+              _model("EMOTION_MODEL", "感情の判定",
+                     "「、」「。」ごとに呼ぶ。JSON を出せる軽いモデル（実測は gpt-6-luna）"),
               _model("DELIVERY_CHECK_MODEL", "報告の配達確認",
                      "報告が実際に伝わったかを見る。**決定論で決められない時だけ**呼ばれる"
                      "＝呼び出しは稀なので、安いモデルより賢いモデルを選ぶ"),
@@ -165,9 +199,13 @@ ADVANCED: tuple = (
                  "検知は喋り始めより遅れるので、その分だけ手前を足す（頭欠け防止）"),
               _f("VAD_ONSET_SEC", "発話開始の確認窓[秒]", 0.00, 1.00, 0.02,
                  "これだけ続いて初めて「話し始めた」とする。打鍵の単発音で割り込ませないため"),
-              _c("STT_BACKEND", "聞き取りの提供元", ("openai", "groq"),
+              _f("MIN_SPEECH_SEC", "最短の発話[秒]", 0.00, 1.00, 0.02,
+                 "声の長さがこれより短いと物音として捨てる（0=捨てない）。上げすぎると「うん」「はい」も"
+                 "捨てるので、tools/short_utterance_probe.py で自分の声を測ってから"),
+              _c("STT_BACKEND", "聞き取りの提供元", ("openai_live", "openai", "groq"),
+                 "openai_live=話している間に送る（既定・速い）/ openai=話し終わってから一括 / "
                  "groq は幻聴が多く非推奨（切り戻し用）"),
-              _t("STT_MODEL", "聞き取りモデル", "既定は gpt-4o-transcribe"),
+              _t("STT_MODEL", "聞き取りモデル（一括）", "openai（一括）のとき。既定は gpt-4o-transcribe"),
           )),
     Group("画面認識のコスト",
           "**ここは直接 API の請求に効きます。**鈍い側に倒すのが既定です。", (

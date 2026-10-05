@@ -12,6 +12,9 @@ UI（別スレッド）へ渡すのは `MouthPlan`＝**float のタプルのリ�
 
 **このモデルでは母音別の口の"形"は作れない**（`ParamA/I/U/E/O` が nun model に無い＝実測）。
 作れるのは開き"量"だけなので、母音ごとに量を変えて自然に見せる。
+
+**Irodori（S1）は音ごとの時刻を出さない**ので `plan_from_wav`（音量方式）を使う
+（ユーザ裁定 2026-09-25「当面は音量で。気になったら強制アライメント」）。
 """
 from __future__ import annotations
 
@@ -126,6 +129,58 @@ def _f(v: Any) -> float:
         return float(v or 0.0)
     except (TypeError, ValueError):
         return 0.0
+
+
+def plan_from_wav(wav: bytes, *, hop_sec: float = 0.02, range_db: float = 30.0) -> Optional[MouthPlan]:
+    """WAV（mono PCM16）の**音量**から口の開閉計画を作る（Irodori 用・S1）。
+
+    Irodori は音ごとの時刻（VOICEVOX の `audio_query` のモーラ長）を出さないので、モーラ方式は
+    使えない。ユーザ裁定 2026-09-25「口パクは当面 音量で開閉。気になったら強制アライメント」。
+    上の注記のとおり音量方式は VOICEVOX で「開きっぱなしに見える」実測があるので、見た目は
+    ユーザが UI で確かめる前提の初期値。
+
+    - hop_sec ごとの RMS を dB にし、その音声で一番大きい区間から `range_db` 下までを 0..1 に割り当てる
+      （声の大きさの絶対値に依らず、文の中の強弱で開閉させる）
+    - 区間の間は線形補間（`level_at` と同じ計画の形）
+    壊れた WAV は None（音声だけは出す＝口パクで TTS を壊さない）。
+    """
+    import io
+    import math
+    import wave
+
+    try:
+        with wave.open(io.BytesIO(wav), "rb") as wf:
+            sr = wf.getframerate()
+            ch = wf.getnchannels()
+            width = wf.getsampwidth()
+            raw = wf.readframes(wf.getnframes())
+    except Exception:
+        return None
+    if width != 2 or sr <= 0 or not raw:
+        return None
+    import numpy as np
+
+    x = np.frombuffer(raw[: len(raw) - len(raw) % (2 * ch)], dtype="<i2").astype(np.float32) / 32768.0
+    if ch > 1:
+        x = x.reshape(-1, ch).mean(axis=1)
+    hop = max(1, int(sr * hop_sec))
+    n = len(x) // hop
+    if n < 2:
+        return None
+    frames = x[: n * hop].reshape(n, hop)
+    rms = np.sqrt(np.mean(frames * frames, axis=1)) + 1e-9
+    db = 20.0 * np.log10(rms)
+    top = float(db.max())
+    if top < -60.0:  # ほぼ無音
+        return None
+    lv = np.clip((db - (top - range_db)) / range_db, 0.0, 1.0)
+    plan: MouthPlan = []
+    for i in range(n - 1):
+        t0 = (i + 0.5) * hop_sec
+        plan.append((t0, t0 + hop_sec, float(lv[i]), float(lv[i + 1])))
+    if plan:  # 頭の半区間（0 から最初の中心まで）も埋める
+        plan.insert(0, (0.0, 0.5 * hop_sec, float(lv[0]), float(lv[0])))
+    return plan if not math.isnan(plan[-1][3]) else None
 
 
 def plan_from_query_safe(query: Optional[dict]) -> Optional[MouthPlan]:

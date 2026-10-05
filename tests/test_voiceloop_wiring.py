@@ -57,7 +57,10 @@ try:
           vl.speech_decider._state is vl.speech_state and vl.speech_decider._queue is vl.queue and vl.speech_decider._pred is vl.prediction)
     check("SilenceMonitor に state/decider を配線",
           vl.silence_monitor._state is vl.speech_state and vl.silence_monitor._decider is vl.speech_decider)
-    check("SilenceMonitor の busy ガード=runner.is_busy", vl.silence_monitor._is_busy == vl.runner.is_busy)
+    # S3: ガードは「応答中 or フィラー中」（フィラー既定 off なら runner.is_busy と同じ値）
+    check("SilenceMonitor の busy ガード=応答中 or フィラー中",
+          vl.silence_monitor._is_busy == vl._busy_for_autospeech
+          and vl._busy_for_autospeech() == vl.runner.is_busy())
     check("input に発話到着フック(沈黙時計リセット)を配線", vl.input._on_utterance == vl.speech_state.mark_user_utterance)
     check("runner に orchestrator を配線", vl.runner._orch is vl.orchestrator)
     check("runner と input が同じ queue を共有", vl.runner._queue is vl.queue and vl.input._queue is vl.queue)
@@ -73,8 +76,9 @@ try:
     check("VlmWorker の発話トリガが speech_decider を起こす", vl.speech_decider._event.is_set())
     vl.speech_decider._event.clear()  # 後続チェックへの汚染防止
     check("VLM 既定 off では capture スレッド未生成(構築は可)", vl.capture_thread is None)
-    # play_fn が should_stop を取れる＝文途中 barge-in(B3) の配線が生きている
-    check("audio が mid-sentence stop 対応 play_fn を保持", vl.audio._play_takes_stop is True)
+    # 話している途中にイブの音が鳴り始めたら最初の節で譲る（割り込みのかけ直し・2026-09-26）
+    check("再生開始の通知に『話している途中なら譲る』を配線",
+          vl._yield_if_user_speaking in vl.audio._start_listeners)
     # リップシンク: 実起動では (WAV, 口の開閉計画) を返す TTS が刺さっていること。
     # ここが `tts.generate` に戻ると、UI は口を動かせないのに Tier-1 は全部 PASS する。
     check("tts_fn が generate_with_meta（リップシンク計画つき）",
@@ -147,6 +151,41 @@ try:
           vl.orchestrator._is_suppressed == vl.queue.is_suppressed)
     check("CancelResolver が runner と同じ queue を持つ",
           vl.cancel_resolver is None or vl.cancel_resolver._queue is vl.queue)
+
+    # 応答LLM の reasoning_effort（2026-09-29 ルナ採用・gpt-6-luna はツール付きだと none 必須＝実測）が設定どおり渡る
+    import asyncio as _aio0  # noqa: E402
+
+    _prev_eff = _Cfg.RESPONSE_REASONING_EFFORT
+    _got: list = []
+
+    async def _fake_stream(**kw):
+        _got.append(kw)
+        yield "はい。"
+
+    async def _drive(v, tools) -> list:
+        msgs = [{"role": "user", "content": "x"}]
+        gen = (v.orchestrator._stream_fn(msgs, tools=tools, tool_sink=[]) if tools
+               else v.orchestrator._stream_fn(msgs))
+        return [d async for d in gen]
+
+    try:
+        _Cfg.RESPONSE_REASONING_EFFORT = "none"
+        v6 = VoiceLoop()
+        v6.registry._stream_fn = _fake_stream
+        _aio0.run(_drive(v6, [{"type": "function", "function": {"name": "delegate_task"}}]))
+        _aio0.run(_drive(v6, None))
+        check("応答LLM: RESPONSE_REASONING_EFFORT=none をツール有り/無しの両方で渡す",
+              len(_got) == 2 and all(k.get("reasoning_effort") == "none"
+                                     and k.get("allowed_openai_params") == ["reasoning_effort"] for k in _got))
+        _got.clear()
+        _Cfg.RESPONSE_REASONING_EFFORT = ""
+        v7 = VoiceLoop()
+        v7.registry._stream_fn = _fake_stream
+        _aio0.run(_drive(v7, None))
+        check("応答LLM: 空なら reasoning_effort を渡さない（モデルの既定）",
+              len(_got) == 1 and "reasoning_effort" not in _got[0])
+    finally:
+        _Cfg.RESPONSE_REASONING_EFFORT = _prev_eff
 
     import asyncio as _aio  # noqa: E402
     from eve.pipeline.stimulus import CallFunctionResult as _CFR, Stimulus as _St, StimulusKind as _SK  # noqa: E402

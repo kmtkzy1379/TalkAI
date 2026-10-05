@@ -36,6 +36,7 @@ from eve.speech import (  # noqa: E402
     parse_speech_decision,
     should_speak,
 )
+from eve.speech.decider import SPEECH_DECIDE_SYSTEM  # noqa: E402
 
 _tmpdir = tempfile.mkdtemp(prefix="eve_f5_")
 _counter = 0
@@ -248,6 +249,90 @@ async def t_decidefn_valid() -> bool:
     return d.speak and d.content == "こんにちは"
 
 
+async def t_decidefn_persona() -> dict:
+    """2026-10-05: 発話判定にも性格（下書きが性格・口調どおりになる）。先頭の「…」は渡さない（相手の発言と読まれた）。"""
+    from eve.persona import PERSONA_HEADING
+
+    seen: list = []
+
+    async def fake(model, messages, **kw):
+        seen.append(messages)
+        return {"choices": [{"message": {"content": "speak: no\nreason: r\ncontent:"}}]}
+
+    await make_decide_fn(ModelRegistry(completion_fn=fake), persona=PERSONA_HEADING + "\n- 口調: 丁寧語。")(
+        surprise=10, silence_seconds=5, recent_turns=[], topic_seeds=[])
+    await make_decide_fn(ModelRegistry(completion_fn=fake))(surprise=10, silence_seconds=5, recent_turns=[], topic_seeds=[])
+    with_p, without = seen[0][0]["content"], seen[1][0]["content"]
+    return {
+        "性格を system の最後に添える": with_p.startswith(SPEECH_DECIDE_SYSTEM) and with_p.endswith("- 口調: 丁寧語。")
+        and PERSONA_HEADING not in with_p,
+        "性格が無ければ従来の system": without == SPEECH_DECIDE_SYSTEM,
+        "入力の先頭に「…」を置かない": not seen[0][1]["content"].startswith("…"),
+        "内部の仕組みを話題にしない規則（黙っていること自体に触れるのはよい）":
+            "内部の仕組み" in SPEECH_DECIDE_SYSTEM and "黙っていること" in SPEECH_DECIDE_SYSTEM,
+    }
+
+
+def t_silence_facts() -> dict:
+    """2026-10-05: 相手が最後に話してからの経過と、そのあとイブだけが話した回数（省略マーカの件数も数える）。
+
+    沈黙の時計はイブが話すと戻るので、これが無いと「相手がずっと黙っている」ことが判定にも応答にも見えない。
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from eve.clock import Stamp
+    from eve.context_assembler import OMITTED_SPEAKER, SPEAKER_EVE, Turn, silence_facts
+
+    base = datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc)
+
+    def at(sec):
+        return Stamp(iso=(base + timedelta(seconds=sec)).isoformat(), mono=float(sec))
+
+    now = (base + timedelta(seconds=1500)).isoformat()
+    u = Turn("user", "ちょっとネット見てる", at(0))
+    e1 = Turn(SPEAKER_EVE, "はーい。", at(3))
+    marker = Turn(OMITTED_SPEAKER, "3", at(1400))
+    e2 = Turn(SPEAKER_EVE, "ねえ", at(1400))
+    msgs = build_decide_messages(surprise=10, silence_seconds=100, recent_turns=[u, e1, marker, e2], topic_seeds=[],
+                                 now=now)
+    user_text = msgs[1]["content"]
+    asm = ContextAssembler(system_prompt="s").assemble(
+        autonomous_content="猫の件でボケる", recent_turns=[u, e1, marker, e2],
+        now=Stamp(iso=now, mono=1500.0))
+    cue = asm[-1]["content"]
+    return {
+        "ユーザがまだ話していない": silence_facts([], now) == "この起動から、相手はまだ何も話していない。",
+        "直後（イブはまだ話していない）": silence_facts([u], now) == "相手が最後に話したのは25分前。",
+        "そのあとイブだけが話した回数（中略の件数も数える）":
+            silence_facts([u, e1, marker, e2], now) == "相手が最後に話したのは25分前。それ以降、相手は何も言っておらず、イブだけが5回話した。",
+        "判定の状況に入る（誰かが話してからの秒数と並べる）":
+            "最後に誰かが話してから100秒。相手が最後に話したのは25分前。" in user_text,
+        "判定の会話に中略を描画する（以前は落としていた）": "（中略: この間にイブだけが話した発言 3件）" in user_text,
+        "応答の指示にも入る（呼び方は「あなた」）": "あなただけが5回話した" in cue,
+        "応答には言い回しを任せる（判定の文をそのまま言わせない）":
+            "言い回しや切り出し方はあなたが決める" in cue and "これを自分の発話にする" not in cue,
+    }
+
+
+def t_decide_rules_2026_10_05() -> dict:
+    """2026-10-05: 黙ってほしい意思・きっかけの広げ方・既出の用件・content の意味。"""
+    from eve.speech.decider import _PRIOR_RULES
+
+    return {
+        # 裁定 2026-10-06: 強いて黙るのは「黙って」「静かにして」とはっきり言われた時だけ。集中する・席を外す等は
+        # イブの判断（お風呂のからかいはよい結果）
+        "はっきり黙ってと言われたら、相手から話しかけてくるまで待つ（集中・席を外す等はイブが判断）":
+            "はっきり言われた" in SPEECH_DECIDE_SYSTEM and "相手から" in SPEECH_DECIDE_SYSTEM
+            and "話しかけてくるまで" in SPEECH_DECIDE_SYSTEM and "イブが判断する" in SPEECH_DECIDE_SYSTEM,
+        "きっかけはイブ自身の気持ちや相手の沈黙でもよい": "イブ自身の気持ち" in SPEECH_DECIDE_SYSTEM,
+        "既出の用件の後は「記憶の別の話題」だけに寄せない（繰り返さないは維持）":
+            "別のこと" in _PRIOR_RULES and "**別の話題**" not in _PRIOR_RULES and "繰り返しになる" in _PRIOR_RULES,
+        "content は中身のメモ（言い回しは話す側）": "言い回しや切り出し方は" in SPEECH_DECIDE_SYSTEM,
+        # 言い回しを話す側に任せたら、6日前の記憶を「さっき言ってた」と言った（シミュ 2026-10-06）
+        "メモに記憶がいつの話かを入れる": "いつの話か" in SPEECH_DECIDE_SYSTEM,
+    }
+
+
 async def t_decidefn_garbage_silence() -> bool:
     fn = make_decide_fn(_reg("???"))
     d = await fn(surprise=40, silence_seconds=5, recent_turns=[], topic_seeds=[])
@@ -346,15 +431,40 @@ def t_speechlog_rocket_pencil() -> bool:
 
 
 def t_flat_cadence() -> bool:
+    """1回目は5秒（連打しない）。2026-10-05 から2回目以降は倍々（t_backoff_cadence）。"""
     clk = [1000.0]
     state = SpeechState(now_fn=lambda: clk[0])
     clk[0] = 1006.0
-    due1 = state.eval_due(5.0)  # baseline から 6s → 評価可
+    due1 = state.eval_due(5.0, 300.0)  # baseline から 6s → 評価可
     state.record_decision(speak=False, reason="x", content="")  # last_eval=1006
-    due2 = state.eval_due(5.0)  # 直後 → 不可（5秒連打しない）
+    due2 = state.eval_due(5.0, 300.0)  # 直後 → 不可（5秒連打しない）
     clk[0] = 1012.0
-    due3 = state.eval_due(5.0)  # 6s 経過 → 再び可（フラット5秒）
-    return due1 and (not due2) and due3
+    due3 = state.eval_due(5.0, 300.0)  # 6s → まだ（2回目は10秒）
+    clk[0] = 1016.0
+    due4 = state.eval_due(5.0, 300.0)  # 10s → 可
+    return due1 and (not due2) and (not due3) and due4
+
+
+def t_backoff_cadence() -> dict:
+    """2026-10-05 ユーザ裁定: お互い黙っている間は判定の間隔を倍々に（最大5分）。ユーザかイブが話すと戻る。"""
+    clk = [1000.0]
+    state = SpeechState(now_fn=lambda: clk[0])
+    seq = []
+    for _ in range(9):
+        seq.append(state.eval_interval(5.0, 300.0))
+        state.record_decision(speak=False, reason="x", content="")
+    out = {"seq": seq == [5, 10, 20, 40, 80, 160, 300, 300, 300]}
+    # イブが喋っても戻す（戻さないと、話しかけて無視された直後に「無視ですか？」と言う機会が無い）
+    state.mark_eve_activity()
+    out["eve_resets"] = state.eval_interval(5.0, 300.0) == 5
+    for _ in range(4):
+        state.record_decision(speak=False, reason="x", content="")
+    state.mark_user_utterance()
+    out["user_resets"] = state.eval_interval(5.0, 300.0) == 5
+    state.record_decision(speak=False, reason="ユーザ発話により中止", content="", count=False)
+    out["abort_not_counted"] = state.eval_interval(5.0, 300.0) == 5
+    out["cap_below_threshold"] = state.eval_interval(5.0, 1.0) == 5  # 上限が閾値未満なら閾値（フラット）
+    return out
 
 
 def t_monitor_guards() -> bool:
@@ -1273,6 +1383,12 @@ async def main() -> None:
     check("parse …→silence", t_parse_ellipsis_silence())
     check("parse content のみ(タグ無)→silence", t_parse_content_no_tag_silence())
     check("decide_fn 正常", await t_decidefn_valid())
+    for k, v in (await t_decidefn_persona()).items():
+        check(f"decide_fn 性格: {k}", v)
+    for k, v in t_silence_facts().items():
+        check(f"沈黙の事実: {k}", v)
+    for k, v in t_decide_rules_2026_10_05().items():
+        check(f"判定の規則: {k}", v)
     check("decide_fn ゴミ→silence", await t_decidefn_garbage_silence())
     check("decide_fn API 例外→silence", await t_decidefn_apierror_silence())
     # C2
@@ -1280,7 +1396,9 @@ async def main() -> None:
     check("C2 runner.is_busy()", await t_is_busy())
     # C3
     check("C3 発話判定ログ ロケット鉛筆(T/F両方・maxlen10)", t_speechlog_rocket_pencil())
-    check("C3 フラット5秒カデンス(連打しない)", t_flat_cadence())
+    check("C3 1回目は5秒・2回目は10秒(連打しない)", t_flat_cadence())
+    for k, v in t_backoff_cadence().items():
+        check(f"C3b 判定の間隔を倍々に（最大5分）: {k}", v)
     check("C3 SilenceMonitor ガード(busy/user/閾値/idle)", t_monitor_guards())
     check("C3 decider speak→AUTONOMOUS 刺激+ログ", await t_decider_speak_injects())
     check("C3 decider silence→刺激なし+ログ記録", await t_decider_silence_no_stimulus())

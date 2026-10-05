@@ -26,6 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ["VLM_ENABLED"] = "1"
 os.environ["TASK_ENABLED"] = "1"
 os.environ["AUTOSPEECH_ENABLED"] = "1"
+# [13]「tool があるときは有効」は CALLFUNCTION_ENABLED を見る（.env の無い環境で反転していた・2026-10-06）
+os.environ["CALLFUNCTION_ENABLED"] = "1"
 
 from eve.pipeline.orchestrator import PipelineRunner, StubOrchestrator  # noqa: E402
 from eve.pipeline.audio_play_queue import AudioPlayQueue  # noqa: E402

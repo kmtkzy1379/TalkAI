@@ -26,6 +26,9 @@ class FeedbackResult:
     prediction_diff: Optional[int] = None  # 0-100。None=抽出失敗（carry-forward）
     reason: str = ""
     topic_tags: list[str] = field(default_factory=list)
+    # S5: イブの今の感情（喜怒哀楽笑いのどれか・感情の機能が ON の時だけ聞く）。知らない値でも文字のまま持つ
+    # （使う側 `EmotionState.note` がラベルを確かめる）
+    emotion_label: str = ""
 
     def is_empty(self) -> bool:
         """有意な抽出が1つも無い（完全なゴミ/空応答）。"""
@@ -48,6 +51,7 @@ _ALIASES: dict[str, tuple[str, ...]] = {
     "next_prediction": ("next_prediction", "prediction", "次の予測", "予測"),
     "reason": ("reason", "理由"),
     "topic_tags": ("topic_tags", "tags", "タグ", "話題タグ"),
+    "emotion_label": ("emotion_label", "感情ラベル"),
 }
 _DIFF_ALIASES: tuple[str, ...] = ("prediction_diff", "surprise", "予測差", "驚き")
 
@@ -94,4 +98,5 @@ def parse_feedback(text: Optional[str]) -> FeedbackResult:
         prediction_diff=_extract_int(text, _DIFF_ALIASES),
         reason=_extract_line(text, _ALIASES["reason"]),
         topic_tags=_extract_tags(text, _ALIASES["topic_tags"]),
+        emotion_label=_extract_line(text, _ALIASES["emotion_label"]).strip("「」『』 "),
     )

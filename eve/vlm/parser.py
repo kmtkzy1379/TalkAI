@@ -21,6 +21,10 @@ _NARR_ALIASES = ("narration", "ナレーション", "実況", "描写", "説明"
 _NOTABLE_ALIASES = ("notable", "notability", "注目", "重要", "言及")
 _VISIBLE_ALIASES = ("visible", "視認", "見える")
 _DIFF_ALIASES = ("surprise", "surprise_diff", "予測差", "驚き")
+_PRED_ALIASES = ("prediction", "予想", "次の予想")
+# 予想の行（視認不可の語の判定から外す。「動画が見えない位置へ流れそう」のような**未来の予想**で
+# 今の画面を視認不可扱いにしない）
+_PRED_LINE = re.compile(r"^\s*(?:prediction|予想|次の予想)\s*[:：].*$", re.IGNORECASE | re.MULTILINE)
 
 
 def _extract_line(text: str, aliases: tuple[str, ...]) -> str:
@@ -56,19 +60,21 @@ def _truthy(value: str, default: bool) -> bool:
 def parse_vision(text: Optional[str]) -> VisionResult:
     """タグ付きテキストを VisionResult に。raise しない・安全既定。"""
     text = text or ""
-    lower = text.lower()
+    lower = _PRED_LINE.sub("", text).lower()
     narration = _extract_line(text, _NARR_ALIASES) or ""
 
     visible_raw = _extract_line(text, _VISIBLE_ALIASES)
     visible = _truthy(visible_raw, default=True)
-    # 本文/タグに視認不可マーカがあれば不可視（A11・中身を信用しない）
+    # 本文/タグに視認不可マーカがあれば不可視（A11・中身を信用しない）。予想の行は見ない（今の画面の話ではない）
     if any(m.lower() in lower for m in _INVISIBLE_MARKERS):
         visible = False
 
     notable = _truthy(_extract_line(text, _NOTABLE_ALIASES), default=False)
     diff = _extract_int(text, _DIFF_ALIASES)
+    prediction = _extract_line(text, _PRED_ALIASES)
 
     if not visible:
-        # 視認不可: 中身は採用せず surprise も上げない（捏造防止）。
+        # 視認不可: 中身は採用せず surprise も上げない（捏造防止）。予想も持ち越さない（見えていない画面の予想）。
         return VisionResult(narration="", notable=False, surprise_diff=None, visible=False)
-    return VisionResult(narration=narration, notable=notable, surprise_diff=diff, visible=True)
+    return VisionResult(narration=narration, notable=notable, surprise_diff=diff, visible=True,
+                        prediction=prediction)

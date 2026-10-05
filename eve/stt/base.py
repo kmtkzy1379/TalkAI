@@ -24,6 +24,10 @@ def pcm_to_wav(pcm: bytes) -> bytes:
 
 
 class Stt(ABC):
+    # 話している間に音声を受け取る方式か（S0）。True の backend は `start/feed/commit/clear/reset`
+    # を持ち、`MicSttInputSource` がマイクの区間フックからそれらを呼ぶ（`openai_live.py`）。
+    streaming = False
+
     @abstractmethod
     async def transcribe(self, audio_bytes: bytes) -> str:
         """発話PCM → 文字列。失敗/非音声は "" を返す（落とさない）。"""
@@ -31,4 +35,8 @@ class Stt(ABC):
 
     async def warmup(self) -> None:
         """起動時のコールドスタート緩和（接続/クライアント初期化）。既定 no-op。"""
+        return
+
+    async def close(self) -> None:
+        """終了時の後片付け（接続を閉じる等）。既定 no-op。"""
         return

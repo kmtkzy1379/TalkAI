@@ -14,6 +14,9 @@ logger = logging.getLogger(__name__)
 
 
 class VoicevoxTTS:
+    # 応答の文ごとの合成を同時にいくつ投げるか（`ResponseOrchestrator.tts_concurrency` の既定と同じ）
+    concurrency = 3
+
     def __init__(
         self,
         base_url: Optional[str] = None,
@@ -84,6 +87,10 @@ class VoicevoxTTS:
         except Exception as e:  # 起こりやすい一時失敗 → ログして None（呼び出し側が文をスキップ）
             logger.warning("TTS 失敗（None を返す）: %s", e)
             return None, None
+
+    async def warmup(self) -> None:
+        """起動時のウォームアップ（従来どおり「。」を1回合成する・失敗しても raise しない）。"""
+        await self.generate("。")
 
     async def close(self) -> None:
         if self._session and not self._session.closed:

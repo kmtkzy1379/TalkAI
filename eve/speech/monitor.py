@@ -18,7 +18,7 @@ from typing import Callable, Optional
 
 from ..clock import humanize, now_iso, now_mono
 from ..config import Config
-from ..context_assembler import OMITTED_SPEAKER, Turn
+from ..context_assembler import Turn
 from ..pipeline.stimulus import Stimulus, StimulusKind
 from .decider import (
     AutonomousSpeech,
@@ -78,7 +78,10 @@ class SpeechState:
         # 最後に「誰かが喋った」時刻（user 発話開始/到着 + eve 応答/自発発話 完了）。
         # eve も含めるのは、Eve が喋った直後に 5秒で自分にモノローグしないため（沈黙=誰も話さない時間）。
         self.last_activity_mono = now_fn()
-        self.last_eval_mono = now_fn()  # 最後に発話判定した時刻（フラット再評価カデンス）
+        self.last_eval_mono = now_fn()  # 最後に発話判定した時刻（再評価の間隔の起点）
+        # 最後に誰か（ユーザかイブ）が話してから何回判定したか。判定の間隔はこの回数で倍々に広げる（上限 SILENCE_MAX_INTERVAL_SEC）。
+        # イブが喋った時も戻す（ユーザ「戻らないと、話しかけて無視された直後に『無視ですか？』と言えない」・2026-10-05）
+        self.evals_since_activity = 0
         self.user_speaking = False
         # ユーザ活動の単調カウンタ。発話判定の最中にユーザが話し始めたら（seq 変化）
         # 自発発話を中止・破棄するために使う（ユーザ優先）。eve 活動では増やさない。
@@ -104,12 +107,14 @@ class SpeechState:
         self.user_speaking = True
         self.user_activity_seq += 1
         self.last_activity_mono = self._now()
+        self.evals_since_activity = 0
 
     def mark_user_utterance(self) -> None:
         """STT 結果が届いた（発話終了）。"""
         self.user_speaking = False
         self.user_activity_seq += 1
         self.last_activity_mono = self._now()
+        self.evals_since_activity = 0
 
     def mark_stt_pending(self) -> None:
         """発話セグメント到着＝STT 開始（テキスト投入までの「見えない待ち窓」を可視化）。"""
@@ -127,21 +132,38 @@ class SpeechState:
         return (self._now() - self.stt_pending_since) < self._stt_pending_max
 
     def mark_eve_activity(self) -> None:
-        """Eve が喋った（応答 or 自発発話 完了）→ 沈黙時計をリセット。"""
+        """Eve が喋った（応答 or 自発発話 完了）→ 沈黙時計と判定の間隔をリセット。"""
         self.last_activity_mono = self._now()
+        self.evals_since_activity = 0
 
     # --- 計測 ---
     def silence_seconds(self) -> float:
         return max(0.0, self._now() - self.last_activity_mono)
 
-    def eval_due(self, threshold: float) -> bool:
-        """5秒沈黙 + フラット再評価カデンス（前回判定/活動から threshold 秒）。"""
-        base = max(self.last_eval_mono, self.last_activity_mono)
-        return (self._now() - base) >= threshold
+    def eval_interval(self, threshold: float, max_interval: Optional[float] = None) -> float:
+        """次の判定までの間隔: 誰かが話してから1回目は threshold 秒、以後は判定のたびに倍（上限 max_interval）。"""
+        cap = Config.SILENCE_MAX_INTERVAL_SEC if max_interval is None else max_interval
+        cap = max(cap, threshold)
+        return min(threshold * (2 ** min(self.evals_since_activity, 32)), cap)
 
-    def record_decision(self, *, speak: bool, reason: str, content: str) -> None:
-        """発話判定ログに記録（True/False とも・処理非関与）+ 再評価時刻を進める。"""
+    def eval_due(self, threshold: float, max_interval: Optional[float] = None) -> bool:
+        """前回判定/活動から eval_interval 秒たったか（2026-10-05 まではフラット5秒）。
+
+        2026-10-05 ユーザ裁定: お互い黙っている間は判定の間隔を倍々に広げ、最大5分。フラット5秒だと
+        放置中も1時間に数百回判定し、どこかで1回「話す」が出ればすぐ話しかけ直していた。
+        画面の変化による判定（SpeechDecider.trigger("vlm")）はこの間隔を通らない＝変化への反応は遅れない。
+        """
+        base = max(self.last_eval_mono, self.last_activity_mono)
+        return (self._now() - base) >= self.eval_interval(threshold, max_interval)
+
+    def record_decision(self, *, speak: bool, reason: str, content: str, count: bool = True) -> None:
+        """発話判定ログに記録（True/False とも・処理非関与）+ 再評価時刻を進める。
+
+        count=False はユーザが話し始めて判定を捨てた時（ユーザ発話で数え直した後なので、数えない）。
+        """
         self.last_eval_mono = self._now()
+        if count:
+            self.evals_since_activity += 1
         self.speech_log.append(
             {"ts": now_iso(), "speak": speak, "reason": reason, "content": content}
         )
@@ -283,9 +305,11 @@ class SpeechDecider:
                 logger.exception("SpeechDecider 処理で例外（継続）")
 
     async def _decide_once(self) -> None:
-        # 値コピー snapshot（live deque を渡さない・省略マーカ除去）
+        # 値コピー snapshot（live deque を渡さない）
         recent = self._cache.recent_for_injection() if self._cache is not None else []
-        recent = [Turn(t.speaker, t.text, t.stamp) for t in recent if t.speaker != OMITTED_SPEAKER]
+        # 省略マーカも残す（判定側で「中略: この間にイブだけが話した発言 N件」と描画し、相手が黙っている間の
+        # イブの発言回数にも数える・2026-10-05。以前は落としていて、イブが何回話しかけたか判定に見えなかった）
+        recent = [Turn(t.speaker, t.text, t.stamp) for t in recent]
         surprise = int(self._pred.surprise)  # 必須・int（指標として渡す）
         last_feedback = getattr(self._pred, "last_feedback", None)  # イブの今の感情/要約
         vision = self._vision_state.fresh_vision(Config.VLM_VISION_TTL_SEC) if self._vision_state else None
@@ -324,14 +348,15 @@ class SpeechDecider:
             self._idle.set()
         # ユーザ優先: 判定中にユーザが話し始めたら自発発話を**中止・破棄**（put しない）。
         if self._state.user_activity_seq != seq0:
-            self._state.record_decision(speak=False, reason="ユーザ発話により自発発話を中止（削除）", content="")
+            self._state.record_decision(speak=False, reason="ユーザ発話により自発発話を中止（削除）", content="",
+                                        count=False)
             return
         # J-2 ③-A: 判定完了時に STT 待ち窓なら破棄。seq は発話終了（＝窓の開始）時に増えるため、
         # 保留イベントで判定が窓の**中**から開始すると seq0 は増えた後の値＝seq チェックを
         # すり抜ける。その最後の隙間をここで塞ぐ（tick/vlm ガードは窓内の新規トリガのみ防ぐ）。
         if self._state.stt_pending:
             self._state.record_decision(
-                speak=False, reason="STT処理中（ユーザ発話が到着直前）のため自発発話を破棄", content="")
+                speak=False, reason="STT処理中（ユーザ発話が到着直前）のため自発発話を破棄", content="", count=False)
             return
         # J-2 ②-4: 根拠なく話題を相手へ丸投げするだけの下書きは抑制（同内容抑制より**前**＝
         # 埋め込み1回分を節約）。材料は判定LLMへ実際に渡したもの（種は `seed_text` と同じ表現）。
@@ -367,7 +392,7 @@ class SpeechDecider:
             # 二段目は await を挟む（埋め込み）。その間にユーザが話し始めていないか再確認。
             if self._state.user_activity_seq != seq0 or self._state.stt_pending:
                 self._state.record_decision(
-                    speak=False, reason="ユーザ発話により自発発話を中止（削除）", content="")
+                    speak=False, reason="ユーザ発話により自発発話を中止（削除）", content="", count=False)
                 return
         # True/False とも発話判定ログに記録（観測専用・処理非関与）+ 再評価カデンス更新
         self._state.record_decision(speak=decision.speak, reason=decision.reason, content=decision.content)
@@ -465,7 +490,7 @@ class SilenceMonitor:
         if self._state.stt_pending:
             return False  # J-2 ③-A: STT待ち窓（ユーザ発話テキストが到着直前）は発火しない
         if not self._state.eval_due(self._threshold):
-            return False  # 5秒沈黙 + フラット再評価カデンス未満
+            return False  # 前回の判定/活動から間隔（5秒から倍々・上限5分）が未満
         if not self._decider.is_idle():
             return False  # single-flight（処理中/保留トリガあり）
         self._decider.trigger("silence")

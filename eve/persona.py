@@ -37,9 +37,16 @@ _BULLET = re.compile(r"^\s*[-*・]\s+(.+?)\s*$")
 _HR = re.compile(r"^\s*-{3,}\s*$")
 
 
-def _default_path() -> Path:
-    """既定は**リポジトリ直下の persona.md**（`.env` の `PERSONA_FILE` で差し替え可）。"""
-    return Path(__file__).resolve().parent.parent / "persona.md"
+def _default_path(root: Optional[Path] = None) -> Path:
+    """既定は**手元だけの persona.local.md**（あれば）、無ければリポジトリ直下の persona.md（書式の見本）。
+
+    `.env` の `PERSONA_FILE` で差し替え可（`persona_path`・`load_persona` の呼び手が優先する）。
+    2026-10-06 ユーザ「コミットはコードとシステムプロンプトフォーマットだけで、実例データや詳細なペルソナは除外」
+    → 本物の性格は .gitignore 済みの persona.local.md に置き、リポジトリには書式の見本だけを置く。
+    """
+    base = root or Path(__file__).resolve().parent.parent
+    local = base / "persona.local.md"
+    return local if local.exists() else base / "persona.md"
 
 
 def parse_persona(markdown: str) -> str:
@@ -93,6 +100,18 @@ def load_persona(path: Optional[str] = None) -> str:
                        len(body), PERSONA_MAX_CHARS)
         body = body[:PERSONA_MAX_CHARS]
     return f"{PERSONA_HEADING}\n{body}"
+
+
+def persona_for(persona: str, how: str) -> str:
+    """応答以外の AI（感情判定・フィードバック）に添える性格ブロック。性格が無ければ空文字。
+
+    応答だけが性格を持つと、口の悪いいじりを感情判定が「哀」と読む等、ちぐはぐになる（2026-10-05 に実測）。
+    見出しは「あなた（イブ）の」ではなく、その AI が何に使うか（how）を書いた形に差し替える。
+    """
+    if not persona:
+        return ""
+    body = persona.split("\n", 1)[1] if persona.startswith(PERSONA_HEADING) else persona
+    return f"\n\n# イブの性格（{how}）\n{body}"
 
 
 def persona_path() -> str:

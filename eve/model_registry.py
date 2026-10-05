@@ -38,6 +38,14 @@ ROLE_ENV: dict[str, tuple[str, str]] = {
     # その世代で、しかも**パイプラインで最も弱いモデルが最も強い権限＝再依頼を持つ**
     # 構図になっていたため。呼び出し頻度が低いので安さより賢さを取る。
     "delivery_check": ("DELIVERY_CHECK_MODEL", "openai/gpt-5.4"),
+    # 笑い判定（S6・ユーザ裁定 2026-09-26）。ユーザの話の「、」「。」ごとに「イブが思わず笑う場面か」を
+    # yes/no で聞き、logprobs を確率にする。実測（名大会話コーパス・2026-09-25）で閾値が機能したのは
+    # gpt-6-luna だけ（Jev は確率が最大 0.67 で 0.85 に届かない）。1件 約0.6〜0.8秒・約$0.00008。
+    "laugh_judge": ("LAUGH_MODEL", "openai/gpt-6-luna"),
+    # 感情（S5・ユーザ裁定 2026-09-26「感情判定はルナでよさそう」）。ユーザの話の「、」「。」ごとに
+    # 「この発話を聞いたイブが次に返す声に乗る感情」（喜怒哀楽笑い）を JSON で聞く。実測（JVNV・2026-09-25）:
+    # 話者の6感情 正解率 97%・1件 中央 1.28秒（8並列）・1件 約$0.00005。
+    "emotion_judge": ("EMOTION_MODEL", "openai/gpt-6-luna"),
 }
 
 CompletionFn = Callable[..., Awaitable[object]]

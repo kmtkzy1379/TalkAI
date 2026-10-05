@@ -37,7 +37,10 @@ MEANS_BOUNDARY = "できるのは、そのとき渡されている手段だけ"
 # ここに挙げた語が登録済み能力の description に現れたら Tier-1 が落ちる＝散文が嘘になった
 # 瞬間にビルドが止まる（`tests/test_f0_foundation.py`）。将来これらを実装するなら、
 # まずこの定数から外すこと。
-NEVER_MEANS = ("メール送信", "買い物", "外部サービスへの書き込み")
+# 2026-10-01: 連絡・予定表・スマホ・家電を足した。一覧に無いと「タスク担当ならできる」と思って
+# delegate_task に回していた（ユーザ「できないこと引き受けるのはハルシネーション」）。
+NEVER_MEANS = ("メール送信", "他の人への連絡", "買い物", "外部サービスへの書き込み", "予定表の確認",
+               "スマホや家電の操作")
 
 
 @dataclass(frozen=True)
@@ -65,6 +68,9 @@ class Capability:
     # - ブロッキング能力は agent_tool 専用とし offered=True にしない（dispatcher は逐次実行のため
     #   後続の cancel_task 等が検索の後ろで数秒待たされる＝CancelResolver 分離と同じ理由）。
     async_handler: Optional[Callable[[dict], Awaitable[str]]] = None
+    # 必須の引数（JSON schema の required）。2026-09-29 `delegate_task` の `reply`（ユーザへの一言）で使う:
+    # 応答LLM（gpt-6-luna）は本文を書かずにツールだけ返すことが多く、必須にしないと書き落とす
+    required: tuple = ()
 
     def __post_init__(self) -> None:
         # 契約の fail-fast: handler / async_handler はちょうど一方（両方/両方None は登録時プログラミングエラー。
@@ -150,7 +156,7 @@ class CapabilityRegistry:
             "function": {
                 "name": c.name,
                 "description": c.description,
-                "parameters": {"type": "object", "properties": c.params_schema, "required": []},
+                "parameters": {"type": "object", "properties": c.params_schema, "required": list(c.required)},
             },
         }
 

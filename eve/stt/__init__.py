@@ -8,6 +8,10 @@ from .filter import clean_transcript
 
 def make_stt(backend: str | None = None) -> Stt:
     backend = backend or Config.STT_BACKEND
+    if backend == "openai_live":
+        from .openai_live import OpenAILiveStt
+
+        return OpenAILiveStt()
     if backend == "openai":
         from .openai_transcribe import OpenAITranscribeStt
 

@@ -1,11 +1,20 @@
 """マイク入力 + Silero VAD（v1 modules/audio_input.py を PORT・整理）。
 
 挙動はユーザ満足の v1 を踏襲: チャンクごとに Silero VAD で発話確率→閾値判定、発話中バッファ、
-無音 SILENCE_LIMIT 秒で終端、最小0.3秒ゲートを通った発話だけ speech_queue に流す。
+無音 SILENCE_LIMIT 秒で終端、最短発話ゲート（声の長さが MIN_SPEECH_SEC 以上・既定 0＝長さでは捨てない）と
+音量ゲートを通った発話だけ speech_queue に流す。
 ＝ endpointing ＋「非音声を STT に渡さない源ゲート」。声の判別はしない（イヤホン前提）。
 
 torch / pyaudio は遅延 import（マイクを使う時だけ要る）。発話開始で callback_on_speech_start
 を呼ぶ（barge-in の発火点。Eve が譲るトリガに使う）。
+
+区間の外向けフック（S0 ストリーミング文字起こし・S3 フィラー用。既定 None＝従来と同じ）:
+- `on_segment_start(pcm)`   発話開始の確定時。pre-roll（確認チャンク込み）を添える
+- `on_segment_audio(pcm)`   発話中に区間へ足した各チャンク（無音の尾も含む＝speech_queue と同じ中身）
+- `on_segment_end(accepted, speech_sec)`  区間の終わり。accepted=speech_queue に流したか
+  （False＝最短発話ゲート・音量ゲートで捨てた）。speech_sec=声の長さ（発話開始の確認窓の頭〜
+  最後に発話と判定したチャンクの終わり。pre-roll の手前と無音の尾は含まない）
+**speech_queue の挙動は変えない**（一括方式の STT はこれまでどおりそちらを使う）。
 """
 from __future__ import annotations
 
@@ -13,6 +22,7 @@ import asyncio
 import logging
 import os
 import time
+from collections import deque
 from typing import Callable, Optional
 
 from .config import Config
@@ -40,8 +50,133 @@ def _load_silero_vad():
     return model
 
 
+def _call_hook(fn: Optional[Callable], name: str, *args) -> None:
+    """外向けフックを呼ぶ。**例外はマイク監視に持ち込まない**（ログして継続）。"""
+    if fn is None:
+        return
+    try:
+        fn(*args)
+    except Exception:
+        logger.exception("%s フックで例外（マイク監視は継続）", name)
+
+
+class _SegmentTracker:
+    """発話区間の状態機械（`AudioInput._process_loop` の判定部分）。
+
+    判定は従来の `_process_loop` と同じ（VAD 確率・音量・時刻をチャンクごとに受け取る形に
+    切り出しただけ）。torch / pyaudio に触らないので、決定論テストで時刻と VAD 確率を差し込める。
+    """
+
+    def __init__(self, *, rate: int, chunk: int, put: Callable[[bytes], None],
+                 on_speech_start: Optional[Callable[[], None]] = None,
+                 on_segment_start: Optional[Callable[[bytes], None]] = None,
+                 on_segment_audio: Optional[Callable[[bytes], None]] = None,
+                 on_segment_end: Optional[Callable[[bool, float], None]] = None) -> None:
+        self.rate = rate
+        self.chunk = chunk
+        self._put = put
+        self._on_speech_start = on_speech_start
+        self._on_segment_start = on_segment_start
+        self._on_segment_audio = on_segment_audio
+        self._on_segment_end = on_segment_end
+        self.audio_buffer: list[bytes] = []
+        self.is_speaking = False
+        self.silence_start: Optional[float] = None
+        # pre-roll: 発話検知の直前チャンクを溜め、開始時に先頭へ継ぎ足す（頭欠け防止）
+        preroll_chunks = max(1, int(Config.PREROLL_SEC * rate / chunk))
+        self.preroll: "deque[bytes]" = deque(maxlen=preroll_chunks)
+        # onset 確認: これだけ連続して発話が続いてから「発話開始」とする（単発スパイク無視）
+        self.onset_chunks = max(1, int(Config.VAD_ONSET_SEC * rate / chunk))
+        self.speech_run = 0
+        # 音量ゲート（`Config.MIC_MIN_PEAK`）。**まとまりの最大振幅**で見る:
+        # run_peak = onset 窓の最大（割り込み発火の判定）/ utt_peak = 発話全体の最大（STT 送りの判定）。
+        # チャンクごとに切ると語尾や語間で落ちて実発話まで捨てるので、必ず max を使う。
+        self.min_peak = float(Config.MIC_MIN_PEAK)
+        self.run_peak = 0.0
+        self.utt_peak = 0.0
+        # 声の長さ（S3: 0.6秒以内の発話にはフィラーを出さない）。チャンクの通し番号で測る。
+        self._idx = 0
+        self._voice_first = 0  # 発話開始の確認窓の頭
+        self._voice_last = 0   # 最後に発話と判定したチャンク
+
+    def step(self, data: bytes, speech_prob: float, peak: float, now: float) -> None:
+        self._idx += 1
+        if speech_prob > Config.VAD_THRESHOLD:
+            self.speech_run += 1
+            self.run_peak = max(self.run_peak, peak)
+            if self.is_speaking:
+                self.utt_peak = max(self.utt_peak, peak)
+                self.silence_start = None
+                self.audio_buffer.append(data)
+                self._voice_last = self._idx
+                _call_hook(self._on_segment_audio, "on_segment_audio", data)
+            else:
+                self.preroll.append(data)  # 確定前は pre-roll に溜める
+                # 単発スパイク(クリック/打鍵)を無視: 連続して発話が続いた時だけ開始。
+                # 加えて音量ゲート: 漏れ音のような極小音では割り込まない。ここで見送っても
+                # speech_run は伸び続けるので、声が大きくなった次のチャンクで発火する
+                # （＝小声の出だしでも数十ms遅れるだけで取りこぼさない）。
+                if self.speech_run >= self.onset_chunks and self.run_peak >= self.min_peak:
+                    self.is_speaking = True
+                    self.utt_peak = self.run_peak
+                    logger.debug("発話開始を確定")
+                    self.audio_buffer = list(self.preroll)  # 確認チャンク+直前を先頭に（頭欠け防止）
+                    self.preroll.clear()
+                    self.silence_start = None
+                    self._voice_first = self._idx - self.speech_run + 1
+                    self._voice_last = self._idx
+                    _call_hook(self._on_segment_start, "on_segment_start", b"".join(self.audio_buffer))
+                    _call_hook(self._on_speech_start, "callback_on_speech_start")
+        else:
+            self.speech_run = 0
+            self.run_peak = 0.0
+            if self.is_speaking:
+                self.utt_peak = max(self.utt_peak, peak)
+                self.audio_buffer.append(data)
+                _call_hook(self._on_segment_audio, "on_segment_audio", data)
+                if self.silence_start is None:
+                    self.silence_start = now
+                if now - self.silence_start > Config.SILENCE_LIMIT:
+                    self._finish()
+            else:
+                self.preroll.append(data)  # 非発話中は直近を pre-roll に溜める
+
+    def _finish(self) -> None:
+        self.is_speaking = False
+        full_audio = b"".join(self.audio_buffer)
+        self.audio_buffer = []
+        reached = self.utt_peak  # ログ用に退避してからリセットする
+        self.utt_peak = 0.0
+        speech_sec = max(0, self._voice_last - self._voice_first + 1) * self.chunk / self.rate
+        # 最短発話ゲートは**声の長さ**で見る（full_audio は pre-roll と無音の尾を含むので長さの判定に使えない）
+        long_enough = speech_sec >= Config.MIN_SPEECH_SEC
+        loud_enough = reached >= self.min_peak
+        accepted = long_enough and loud_enough
+        # **speech_queue に流す前に**知らせる（ストリーミング STT の commit が、
+        # 消費側がこの区間を受け取るより先に積まれている＝待ち札の順序が揃う）。
+        _call_hook(self._on_segment_end, "on_segment_end", accepted, speech_sec)
+        if accepted:
+            self._put(full_audio)
+            return
+        # **黙って捨てない**: 「喋ったのに無視された」を後から追えるようにする。
+        if not loud_enough:
+            # ここが続くなら MIC_MIN_PEAK が高すぎる。
+            logger.info(
+                "音量ゲートで破棄（最大振幅 %.4f < %.4f・声の長さ %.3f秒）。"
+                "自分の声が拾われない場合は MIC_MIN_PEAK を下げてください",
+                reached, self.min_peak, speech_sec)
+        else:
+            logger.info(
+                "最短発話ゲートで破棄（声の長さ %.3f秒 < %.3f秒・最大振幅 %.4f）。"
+                "短い返事が拾われない場合は MIN_SPEECH_SEC を下げてください",
+                speech_sec, Config.MIN_SPEECH_SEC, reached)
+
+
 class AudioInput:
-    def __init__(self, callback_on_speech_start: Optional[Callable] = None) -> None:
+    def __init__(self, callback_on_speech_start: Optional[Callable] = None,
+                 on_segment_start: Optional[Callable[[bytes], None]] = None,
+                 on_segment_audio: Optional[Callable[[bytes], None]] = None,
+                 on_segment_end: Optional[Callable[[bool, float], None]] = None) -> None:
         import pyaudio
 
         self.chunk = 512
@@ -55,7 +190,12 @@ class AudioInput:
         # 判定には一切使わない（書くのは `_process_loop` だけ＝loop 上の単一書込）。
         self.speech_prob = 0.0
         self.callback_on_speech_start = callback_on_speech_start
+        self.on_segment_start = on_segment_start
+        self.on_segment_audio = on_segment_audio
+        self.on_segment_end = on_segment_end
         self.speech_queue: "asyncio.Queue[bytes]" = asyncio.Queue()
+        # 区間の状態機械（`_process_loop` が作る）。`in_speech()` で「今まさに話しているか」を読む。
+        self._tracker: Optional[_SegmentTracker] = None
         logger.info("Silero VAD ロード中...")
         self.model = _load_silero_vad()
         logger.info("Silero VAD ロード完了")
@@ -91,28 +231,39 @@ class AudioInput:
     async def get_audio(self) -> bytes:
         return await self.speech_queue.get()
 
-    async def _process_loop(self) -> None:
-        from collections import deque
+    def in_speech(self) -> bool:
+        """発話区間の中か（発話開始の確定〜`SILENCE_LIMIT` の無音で区間が終わるまで）。
 
+        loop 上から読む（書くのも loop 上の `_process_loop` だけ＝ロック不要）。
+        """
+        t = self._tracker
+        return t is not None and t.is_speaking
+
+    def _fire_speech_start(self) -> None:
+        """発話開始の確定（barge-in の発火点）。coroutine 関数なら task にして即戻る。"""
+        cb = self.callback_on_speech_start
+        if cb:
+            if asyncio.iscoroutinefunction(cb):
+                asyncio.create_task(cb())
+            else:
+                cb()
+
+    def _make_tracker(self) -> "_SegmentTracker":
+        return _SegmentTracker(
+            rate=self.rate, chunk=self.chunk, put=self.speech_queue.put_nowait,
+            on_speech_start=self._fire_speech_start,
+            on_segment_start=self.on_segment_start,
+            on_segment_audio=self.on_segment_audio,
+            on_segment_end=self.on_segment_end,
+        )
+
+    async def _process_loop(self) -> None:
         import numpy as np
         import torch
 
         logger.info("マイク監視を開始（バックグラウンド）")
-        audio_buffer: list[bytes] = []
-        is_speaking = False
-        silence_start = None
-        # pre-roll: 発話検知の直前チャンクを溜め、開始時に先頭へ継ぎ足す（頭欠け防止）
-        preroll_chunks = max(1, int(Config.PREROLL_SEC * self.rate / self.chunk))
-        preroll: "deque[bytes]" = deque(maxlen=preroll_chunks)
-        # onset 確認: これだけ連続して発話が続いてから「発話開始」とする（単発スパイク無視）
-        onset_chunks = max(1, int(Config.VAD_ONSET_SEC * self.rate / self.chunk))
-        speech_run = 0
-        # 音量ゲート（`Config.MIC_MIN_PEAK`）。**まとまりの最大振幅**で見る:
-        # run_peak = onset 窓の最大（割り込み発火の判定）/ utt_peak = 発話全体の最大（STT 送りの判定）。
-        # チャンクごとに切ると語尾や語間で落ちて実発話まで捨てるので、必ず max を使う。
-        min_peak = float(Config.MIC_MIN_PEAK)
-        run_peak = 0.0
-        utt_peak = 0.0
+        tracker = self._make_tracker()
+        self._tracker = tracker
         loop = asyncio.get_running_loop()
 
         while self.running:
@@ -127,61 +278,9 @@ class AudioInput:
 
             audio_f32 = np.frombuffer(data, np.int16).astype(np.float32) / 32768.0
             speech_prob = self.model(torch.from_numpy(audio_f32), self.rate).item()
-            self.speech_prob = speech_prob  # UI 表示専用（判定はこの下の既存ロジックのまま）
+            self.speech_prob = speech_prob  # UI 表示専用（判定は tracker の既存ロジックのまま）
 
             peak = float(np.abs(audio_f32).max())
-
-            if speech_prob > Config.VAD_THRESHOLD:
-                speech_run += 1
-                run_peak = max(run_peak, peak)
-                if is_speaking:
-                    utt_peak = max(utt_peak, peak)
-                    silence_start = None
-                    audio_buffer.append(data)
-                else:
-                    preroll.append(data)  # 確定前は pre-roll に溜める
-                    # 単発スパイク(クリック/打鍵)を無視: 連続して発話が続いた時だけ開始。
-                    # 加えて音量ゲート: 漏れ音のような極小音では割り込まない。ここで見送っても
-                    # speech_run は伸び続けるので、声が大きくなった次のチャンクで発火する
-                    # （＝小声の出だしでも数十ms遅れるだけで取りこぼさない）。
-                    if speech_run >= onset_chunks and run_peak >= min_peak:
-                        is_speaking = True
-                        utt_peak = run_peak
-                        logger.debug("発話開始を確定")
-                        audio_buffer = list(preroll)  # 確認チャンク+直前を先頭に（頭欠け防止）
-                        preroll.clear()
-                        silence_start = None
-                        cb = self.callback_on_speech_start
-                        if cb:
-                            if asyncio.iscoroutinefunction(cb):
-                                asyncio.create_task(cb())
-                            else:
-                                cb()
-            else:
-                speech_run = 0
-                run_peak = 0.0
-                if is_speaking:
-                    utt_peak = max(utt_peak, peak)
-                    audio_buffer.append(data)
-                    if silence_start is None:
-                        silence_start = time.time()
-                    if time.time() - silence_start > Config.SILENCE_LIMIT:
-                        is_speaking = False
-                        full_audio = b"".join(audio_buffer)
-                        audio_buffer = []
-                        reached = utt_peak  # ログ用に退避してからリセットする
-                        utt_peak = 0.0
-                        if len(full_audio) > self.rate * 2 * 0.3:  # 最小0.3秒ゲート
-                            if reached >= min_peak:
-                                self.speech_queue.put_nowait(full_audio)
-                            else:
-                                # **黙って捨てない**: 「喋ったのに無視された」を後から追えるようにする。
-                                # ここが続くなら MIC_MIN_PEAK が高すぎる。
-                                logger.info(
-                                    "音量ゲートで破棄（最大振幅 %.4f < %.4f）。"
-                                    "自分の声が拾われない場合は MIC_MIN_PEAK を下げてください",
-                                    reached, min_peak)
-                else:
-                    preroll.append(data)  # 非発話中は直近を pre-roll に溜める
+            tracker.step(data, speech_prob, peak, time.time())
 
             await asyncio.sleep(0)

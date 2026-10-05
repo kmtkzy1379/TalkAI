@@ -519,7 +519,45 @@ async def t_shallow_gate_strips_url():
     return "https://evil.test/payload" not in out and "記事" in out
 
 
+def t_dns_resolver_patch():
+    """ddgs の primp に OS の名前解決を使わせる（実測 2026-09-28: primp の独自の名前解決が、問い合わせを拒否する
+    IPv6 の DNS に聞いて「dns error: Query Refused」で諦めていた）。偽のモジュールで決定論に確かめる。"""
+    import types
+
+    from eve.search.client import set_dns_resolver
+
+    made = []
+
+    class FakeClient:
+        def __init__(self, **kw):
+            made.append(kw)
+
+    mod = types.SimpleNamespace(Client=FakeClient)
+    ok1 = set_dns_resolver(mod, "system")
+    mod.Client(timeout=5)
+    mod.Client(timeout=5, dns_resolver="1.1.1.1")  # 明示された時はそちらが優先
+    ok2 = not set_dns_resolver(mod, "system")      # 冪等（2回目は何もしない）
+    set_dns_resolver(mod, "192.168.0.1")           # 別の値に替えても元のクラスから作り直す（二重に包まない）
+    mod.Client()
+    return (ok1 and ok2 and made[0] == {"timeout": 5, "dns_resolver": "system"}
+            and made[1]["dns_resolver"] == "1.1.1.1" and made[2] == {"dns_resolver": "192.168.0.1"}
+            and isinstance(mod.Client(), FakeClient) and len(made) == 4)
+
+
+def t_dns_resolver_real_primp():
+    """本物の primp がこの設定（dns_resolver="system"）を受け付けること（ライブラリの更新で口が消えたら気づく）と、
+    既定が system であること（ネットには出ない＝作るだけ）。"""
+    import primp
+
+    from eve.config import Config
+
+    primp.Client(timeout=1, dns_resolver="system")
+    return Config.SEARCH_DNS_RESOLVER == "system"
+
+
 async def main():
+    check("名前解決: primp の既定を差し替える（明示優先・冪等・作り直し）", t_dns_resolver_patch())
+    check("名前解決: 本物の primp が system を受け付ける・既定は system", t_dns_resolver_real_primp())
     check("整形: マーカ非衝突/信頼境界/ドメインのみ/正規化", await t_format_digest())
     check("整形: max_results 上限", await t_max_results_cap())
     check("意味論: 0件=正直な空振り（マーカなし）", await t_zero_hits_honest())

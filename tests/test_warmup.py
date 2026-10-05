@@ -50,7 +50,8 @@ class _Fake:
         self.rag = type("R", (), {"warmup": staticmethod(lambda: mk("rag"))})()
         self.registry = type("M", (), {
             "complete": staticmethod(lambda *a, **k: mk("llm"))})()
-        self.tts = type("T", (), {"generate": staticmethod(lambda *a: mk("tts"))})()
+        # TTS は `warmup()` を持つ（VOICEVOX は「。」を1回合成 / Irodori はサーバを用意・S1）
+        self.tts = type("T", (), {"warmup": staticmethod(lambda: mk("tts"))})()
 
     from eve.voice_loop import VoiceLoop  # 実装を借りる（コピーしない）
     warmup = VoiceLoop.warmup
@@ -126,7 +127,7 @@ def t_wiring() -> None:
     check("gather を使っている（直列に戻していない）", "asyncio.gather" in src)
     check("4種すべてを含む",
           all(s in src for s in ("self.stt.warmup", "self.rag.warmup",
-                                 "self.registry.complete", "self.tts.generate")))
+                                 "self.registry.complete", "self.tts.warmup")))
     # 並列化が持ち込んだ import 競合の再発防止（実起動で踏んだ）:
     # litellm と openai SDK が別スレッドから同時に pydantic を触ると
     # partially-initialized module になり、応答モデルと STT のウォームアップが両方失敗した。

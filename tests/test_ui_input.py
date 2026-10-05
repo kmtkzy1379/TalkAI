@@ -143,8 +143,14 @@ def t_wiring() -> None:
     loop_src = inspect.getsource(AudioInput._process_loop)
     check("speech_prob を毎チャンク更新している", "self.speech_prob = speech_prob" in loop_src)
     # 表示専用であること: 判定は元の speech_prob（ローカル変数）で行われ続けている
+    # S0 で判定部を `_SegmentTracker.step` に切り出した: ループはローカルの確率を渡し、
+    # tracker は引数で判定する（self.speech_prob＝表示専用の値は判定に使わない）
+    from eve.audio_input import _SegmentTracker
+    step_src = inspect.getsource(_SegmentTracker.step)
     check("判定は self.speech_prob ではなくローカル変数のまま（表示専用）",
-          "if speech_prob > Config.VAD_THRESHOLD" in loop_src)
+          "tracker.step(data, speech_prob," in loop_src
+          and "if speech_prob > Config.VAD_THRESHOLD" in step_src
+          and "self.speech_prob" not in step_src)
 
     from eve.ui import app as ui_app
     snap = inspect.getsource(ui_app.VoiceLoopThread._snapshot)

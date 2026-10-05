@@ -61,6 +61,9 @@ class VlmWorker:
         self._idle.set()
         self._last_call_ts = -1e9  # 初回は即時許可
         self._last_narration = ""
+        # 画面認識自身が前回出した「この後の画面の予想」。次の呼び出しに渡して surprise を予想との食い違いにする
+        # （ユーザ裁定 2026-09-30）。**ここ（画面認識）の中だけで使い、他の AI には渡さない**。書き手は _apply だけ。
+        self._last_prediction = ""
         # 変化フレームの単調カウンタ。A1 の「narrate 中に取り残しが出たか」判定はこの差分で行う
         # （ring 末尾の frame_id で見ると capture が変化と無関係に 2fps で積むため常に真になり、
         #  一度起動すると静止画面でも永久に自己再トリガし続ける＝実測 229回/1061s・空白0）。
@@ -86,6 +89,13 @@ class VlmWorker:
         self._last_narration = ""
         self._last_call_ts = -1e9
         self._change_seq = 0
+        # OFF の間に画面は何でも変わりうる。古い予想を持ち越すと ON 直後の1回が「予想外」になる
+        self._last_prediction = ""
+
+    @property
+    def last_prediction(self) -> str:
+        """前回の予想（narrate_fn が次の呼び出しで「前回のあなたの予想」として渡す）。"""
+        return self._last_prediction
 
     async def stop(self, drain_timeout: float = 2.0) -> None:
         self._stopping = True
@@ -169,11 +179,15 @@ class VlmWorker:
 
     def _apply(self, result: VisionResult) -> None:
         if not result.visible:
-            # A11: 視認不可（黒/判読不能）→ 正直マーカ・surprise/発話に触れない。
+            # A11: 視認不可（黒/判読不能）→ 正直マーカ・surprise/発話に触れない。予想の連なりもここで切る
+            # （見えていない間に何が起きたか分からないので、次は「初回」として中立の surprise から）。
             self._vs.set_latest(BLANK_MARKER, self._now(), narration=False)
+            self._last_prediction = ""
             return
         if not result.narration:
             return  # 空（パース失敗等）→ no-op（落とさない）
+        # 実況が取れた回は予想も更新する（重複の実況でも、今の画面から立てた予想が最新）
+        self._last_prediction = result.prediction or ""
         if self._is_dup(result.narration):
             self._vs.set_latest(result.narration, self._now())  # 鮮度は更新するが再トリガしない
             return
