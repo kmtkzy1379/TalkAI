@@ -46,15 +46,9 @@ except ValueError:
     check("未知backendは ValueError", True)
 
 
-# ---- 聞き返し（日本語として受け取れない入力・ユーザ裁定 2026-08-15）----
-import random  # noqa: E402
-
-from eve.stt.askback import (  # noqa: E402
-    ASK_BACK_FALLBACK,
-    ASK_BACK_LINES,
-    AskBackPicker,
-    is_unintelligible,
-)
+# ---- 聞き取れなかった入力（日本語として受け取れない入力・ユーザ裁定 2026-08-15）----
+import eve.stt.askback as _ab  # noqa: E402
+from eve.stt.askback import UNINTELLIGIBLE_PLACEHOLDER, is_unintelligible  # noqa: E402
 
 # 検出: 非ラテン文字の別言語だけを拾う（実データ: user 6件 / eve 5件の韓国語が実在）
 check("韓国語は聞き返し対象", is_unintelligible("오케이."))
@@ -66,31 +60,11 @@ check("記号・数字も対象外", not is_unintelligible("12:00だよ。"))
 # ギリシャ文字は日本語の通常表記に出る（βテスト等）ので**わざと**対象外にしている
 check("βテストは対象外（ギリシャ文字は除外）", not is_unintelligible("βテストの話"))
 
-# 文言選び: 一度使ったものは次に選ばない（同じ文の連発を避ける・ユーザ指示）
-_p = AskBackPicker(rng=random.Random(0))
-_first = _p.next_line()
-_p.reset()
-_second = _p.next_line()
-check("1回目は聞き返し文言から出る", _first in ASK_BACK_LINES)
-check("直前と同じ文言は選ばれない", _second in ASK_BACK_LINES and _second != _first)
-
-# 2回連続で聞き取れなかったら手段を変える（往復ループの遮断）
-_p2 = AskBackPicker(rng=random.Random(1))
-_a = _p2.next_line()
-_b = _p2.next_line()
-check("2回目は打ってもらう案内に切り替わる", _a in ASK_BACK_LINES and _b == ASK_BACK_FALLBACK)
-check("3回目以降も案内のまま", _p2.next_line() == ASK_BACK_FALLBACK)
-_p2.reset()
-check("聞き取れたらカウントが戻る", _p2.next_line() in ASK_BACK_LINES)
-
-# 全文言を引き切っても落ちない（候補が1つに減っても回る）
-_p3 = AskBackPicker(rng=random.Random(2))
-_ok = True
-for _ in range(20):
-    _p3.reset()
-    if _p3.next_line() not in ASK_BACK_LINES:
-        _ok = False
-check("繰り返し引いても常に候補から出る", _ok)
+# 決まり文句は持たない（2026-10-09 ユーザ「例文などで決まり文句や定型文は使わせたくない」）。
+# 何と言うかは応答LLM（イブ）が決め、ここが持つのは「聞き取れなかった」という事実の代替テキストだけ
+check("聞き返しの決まり文句・キーボードの案内を持たない",
+      not any(hasattr(_ab, n) for n in ("ASK_BACK_LINES", "ASK_BACK_FALLBACK", "AskBackPicker")))
+check("代替テキストは生の文字を含まない事実だけ", UNINTELLIGIBLE_PLACEHOLDER == "（聞き取れなかった発話）")
 
 print(f"\n合計: PASS {_passed} / FAIL {_failed}")
 sys.exit(1 if _failed else 0)

@@ -108,7 +108,9 @@ class UsageMeter:
 
     def __init__(self, path: Optional[Path] = None, *, enabled: bool = True,
                  tag: str = "") -> None:
-        self.path = Path(path) if path else DEFAULT_FILE
+        # 相対パスはリポジトリ基準（会話・記憶・タスクと同じ。以前は起動した場所＝cwd 基準だった）
+        p = Path(path) if path else DEFAULT_FILE
+        self.path = p if p.is_absolute() else REPO_ROOT / p
         self.enabled = enabled
         self.tag = tag                     # 計測ラン名（検証と実運用を混ぜないため）
         self.by_role: dict[str, Totals] = {}

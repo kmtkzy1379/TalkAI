@@ -16,7 +16,6 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from eve.pipeline.stimulus import Stimulus, StimulusKind  # noqa: E402
-from eve.stt.askback import AskBackPicker  # noqa: E402
 
 PASS = FAIL = 0
 
@@ -42,8 +41,6 @@ class _FakeLoop:
         self.speech_state = SpeechState()
         self._ui_tasks: set = set()
         self.barge_ins = 0
-        # 打てている＝意思疎通できているので、連続聞き返しのカウントを戻す（本体と同じ持ち物）。
-        self._askback = AskBackPicker()
 
     def _barge_in(self) -> None:
         self.barge_ins += 1

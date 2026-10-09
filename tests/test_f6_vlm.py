@@ -100,15 +100,26 @@ def t_parse_fullwidth_colon() -> bool:
     return "ブラウザ" in r.narration and r.surprise_diff == 30
 
 
-def t_parse_invisible_marker() -> bool:
-    # A11: 本文に視認不可マーカ → 中身は採用せず surprise も上げない
-    r = parse_vision("narration: 黒い画面で視認不可\nsurprise: 90")
-    return (not r.visible) and r.narration == "" and r.surprise_diff is None and not r.notable
+def t_parse_partly_unreadable_kept() -> bool:
+    """一部が読めないと正直に書いた説明は捨てない（2026-10-09 ユーザ「キーワードで説明文破棄をやめる」）。
+
+    以前は本文の語（判読不能・見えない 等）で画面全体を視認不可にしており、読めていた残りの説明ごと
+    捨てて「画面を取得できませんでした」に置き換えていた。読めたかはモデル自身の visible タグだけで決める。
+    """
+    cases = [
+        "narration: 動画が再生中。右下の小さな字幕は判読不能\nnotable: no\nsurprise: 20\nvisible: yes",
+        "narration: エクスプローラーでフォルダを開いている。ファイル名は小さくて見えない\nsurprise: 10\nvisible: yes",
+        "narration: 黒い背景に白い文字の画面。一部は視認不可\nsurprise: 30",  # visible タグなし＝既定は読めた
+    ]
+    rs = [parse_vision(c) for c in cases]
+    return (all(r.visible for r in rs) and "字幕は判読不能" in rs[0].narration
+            and "見えない" in rs[1].narration and rs[2].surprise_diff == 30)
 
 
 def t_parse_visible_false_tag() -> bool:
-    r = parse_vision("visible: no\nnarration: 何か映ってるかも")
-    return (not r.visible) and r.narration == ""
+    """A11: モデルが visible: no（画面全体を読み取れなかった）と返したら中身を採用しない（捏造させない）。"""
+    r = parse_vision("visible: no\nnarration: 何か映ってるかも\nsurprise: 90\nnotable: yes")
+    return (not r.visible) and r.narration == "" and r.surprise_diff is None and not r.notable
 
 
 def t_parse_none() -> bool:
@@ -961,11 +972,13 @@ def t_parse_prediction() -> bool:
 
 
 def t_parse_prediction_not_invisible() -> bool:
-    """予想の行に「真っ黒」「見えない」があっても、**今の画面**を視認不可にしない（未来の話）。"""
+    """予想の行に「真っ黒」「見えない」があっても、**今の画面**を視認不可にしない（未来の話）。
+    読めたかは visible タグだけで決まる（本文や予想の語では決めない・2026-10-09）。"""
     r = parse_vision("narration: 映画の暗い場面が再生されている\nnotable: no\n"
                      "prediction: 次は画面が真っ黒になって何も見えない場面になりそう\nsurprise: 15\nvisible: yes")
-    bad = parse_vision("narration: 画面が真っ黒で何も見えない\nprediction: そのまま\nvisible: yes")
-    return r.visible and r.narration.startswith("映画") and not bad.visible
+    black = parse_vision("narration: 画面が真っ黒\nprediction: そのまま\nvisible: no")
+    return (r.visible and r.narration.startswith("映画") and r.prediction.startswith("次は画面が真っ黒")
+            and not black.visible and black.prediction == "")
 
 
 def t_build_messages_prediction() -> bool:
@@ -1041,8 +1054,8 @@ async def main() -> None:
     check("⭐予想の連なり（2回目に1回目の予想が渡る・黒画面と reset で切る）", await t_prediction_chain())
     check("parse garbage 安全(raise しない)", t_parse_garbage_safe())
     check("parse 全角コロン", t_parse_fullwidth_colon())
-    check("A11 parse 視認不可マーカ→中身/驚き不採用", t_parse_invisible_marker())
-    check("A11 parse visible:no→不可視", t_parse_visible_false_tag())
+    check("⭐一部が読めないと書いた説明は捨てない（本文の語で視認不可にしない）", t_parse_partly_unreadable_kept())
+    check("A11 parse visible:no→不可視・中身/驚き不採用", t_parse_visible_false_tag())
     check("parse None 安全", t_parse_none())
     check("gate 初回は必ず True", t_gate_first_always())
     check("gate 同一→False", t_gate_identical_none())

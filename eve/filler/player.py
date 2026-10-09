@@ -4,7 +4,10 @@
 `on_speech_end(L)` … VAD が発話の終わりを確定した瞬間（loop 上で同期に呼ばれる）
   鳴らさない: つなぎの間が未決 / 発話 L ≤ 0.6秒（「うん」「へー」）/ 応答の生成中 / 応答の再生中 / ミュート中
   鳴らす: **その場で発話権ゲートを閉じ**（この瞬間から応答の音声は待たされる）、常駐タスクを起こす
-常駐タスク … 語を1つずつ鳴らす。**鳴っている語は途中で切らない**（言い切り）。次の語を始める前に畳む条件を見る:
+常駐タスク … まずフィラー前の待ち `start_delay_sec`（本番 0.5秒・ユーザ決定 2026-10-09）。その間にユーザが
+  話し出した・応答が来た等なら1語も鳴らさない（笑いは待たない）。声が止まってから数えると
+  「話し終わりの判定 0.5秒（SILENCE_LIMIT）＋フィラー前の待ち 0.5秒＝1語目は約1.0秒後」。
+  その後、語を1つずつ鳴らす。**鳴っている語は途中で切らない**（言い切り）。次の語を始める前に畳む条件を見る:
   応答の音声ができた / 応答が近い合図（1文目の合成開始）/ ユーザが話し出した / 空認識 / 上限4秒（次の語で超えるなら始めない）
   無言は待っている途中でも畳める（音が無いので切っても不自然にならない）
   finally でゲートを開ける（例外でも・キャンセルでも。**開かないと全ターン無音**）
@@ -76,6 +79,7 @@ class _ChainLog:
     ended_at: Optional[float] = None
     emotion: str = ""  # このチェーンの声の感情（S5・無ければ空）
     mood: str = ""     # 1段目の場面の種類（S8・通常以外の時だけ）
+    wait: Optional[float] = None  # フィラー前の待ちで待った秒（待たなかった時は None）
 
 
 class FillerPlayer:
@@ -89,6 +93,8 @@ class FillerPlayer:
         muted: Callable[[], bool] = lambda: False,
         rng: Optional[random.Random] = None,
         emotion_fn: Callable[[], Optional[str]] = lambda: None,
+        start_delay_sec: float = 0.0,
+        judge_sec: float = 0.0,
     ) -> None:
         self._bank = bank
         self._t = bank.table
@@ -96,6 +102,17 @@ class FillerPlayer:
         self._play = play_fn
         self._is_busy = is_busy
         self._muted = muted
+        # フィラー前の待ち（ユーザ決定 2026-10-09「フィラーはA」）。VAD が話し終わりと判断した（声が止まって
+        # SILENCE_LIMIT＝0.5秒）後、さらにこれだけ待ってから1語目を鳴らす。待っている間にユーザが話し出したら
+        # 鳴らさない（話の途中の 0.5秒を超える間で、まだ話している人にフィラーを被せていた＝「フィラーが多すぎて不自然」。
+        # 前回の実会話では 60発話中10回、イブの返事の前にユーザが話し続けていた）。応答の速さは変わらない
+        # （応答は話し終わりの判断の時点で作り始める・待ちの間に応答が来れば、そのまま応答が鳴る）。
+        # 笑い（その場で笑う／フィラーの中で笑う）は反応なので待たない（チェーンの頭の笑いは今までどおりすぐ鳴る）。
+        self._start_delay = max(0.0, float(start_delay_sec))
+        # 話し終わりの判定にかかる無音（VAD の SILENCE_LIMIT）。**ログの時刻を「話し終わり（声が止まった時）から」で
+        # 出すためだけ**に使う（ユーザ 2026-10-09「話し終わり、0.5秒判定、0.5秒フィラー待ち、計1秒後フィラー」の並びで
+        # 読めるように）。挙動には関わらない。0 なら時刻は判定の瞬間から（テストの偽物はこちら）
+        self._judge_sec = max(0.0, float(judge_sec))
         # S5: イブの今の感情（喜怒哀楽笑い・無ければ None）。チェーンを始める時に1回読み、その発話のフィラーは
         # その感情の声で鳴らす（途中で判定が届いても1つのチェーンの中では変えない）
         self._emotion_fn = emotion_fn
@@ -112,6 +129,7 @@ class FillerPlayer:
         self._stt_seq = 0      # 文字起こしの結果の通し番号（同じ発話の並びを FIFO で追う）
         self._stop_rid = 0     # この番号以下の発話のフィラーは止める
         self._stop_why: dict[int, str] = {}
+        self._stop_when: dict[int, float] = {}  # 止める合図が来た時刻（ログ用・鳴っていた語を言い切った時刻とは別）
         self._spoken: list[str] = []
         self._spoken_rid = 0
         self._spoken_at = 0.0
@@ -304,9 +322,11 @@ class FillerPlayer:
         if rid > self._stop_rid:
             self._stop_rid = rid
         self._stop_why.setdefault(rid, why)
+        self._stop_when.setdefault(rid, time.monotonic())
         if len(self._stop_why) > 32:
             for k in sorted(self._stop_why)[:-16]:
                 self._stop_why.pop(k, None)
+                self._stop_when.pop(k, None)
         if self._poke is not None:
             self._poke.set()
 
@@ -385,11 +405,20 @@ class FillerPlayer:
         used: dict = {}  # このチェーンで鳴らした語 → 回数（同じ語の繰り返しを少し減らす・repeat_factor）
         drew_first = False  # S8: 場面で選ぶのは最初の抽選（1段目）だけ。2段目以降は今までどおり
         try:
+            if self._start_delay > 0 and not req.laugh_first:
+                # フィラー前の待ち（`__init__` の注記）。止める合図（ユーザが話し出した・応答が近い・応答の音声が
+                # できた・空認識）が来たら1語も鳴らさずに畳む。笑いの合図が来たら待つのをやめて先に笑う。
+                # 待った分も上限（max_chain_sec）に数える＝フィラーが終わる時刻は今までと同じで、鳴らし始めが遅れるだけ
+                w0 = time.monotonic()
+                await self._wait_silence(req.rid, self._start_delay, until=lambda: self._laugh_next)
+                log.wait = time.monotonic() - w0
             while True:
                 if self._stopped(req.rid):
                     log.stop_reason = self._stop_why.get(req.rid) or (
                         "応答の音声ができた" if self._audio.head_ready() else "止める合図")
-                    log.stop_at = time.monotonic() - req.t_end
+                    # 合図が**来た**時刻（鳴っていた語を言い切った後に気づくので、気づいた時刻ではなく来た時刻を残す。
+                    # 言い切って畳み終えた時刻は ended_at＝ログの「畳み終え」）
+                    log.stop_at = self._stop_when.get(req.rid, time.monotonic()) - req.t_end
                     break
                 if req.laugh_first or self._laugh_next:
                     # 笑い（その場で笑う ≥ immediate / フィラーに笑い ≥ filler）をこの発話のフィラーの中で鳴らす
@@ -528,10 +557,13 @@ class FillerPlayer:
         await self._wait_silence(rid, sec)
         return not self._stopped(rid)
 
-    async def _wait_silence(self, rid: int, sec: float) -> None:
-        """無言の間。止める合図が来たら途中でやめる（音が無いので切っても不自然にならない）。"""
+    async def _wait_silence(self, rid: int, sec: float, until: Optional[Callable[[], bool]] = None) -> None:
+        """無言の間。止める合図が来たら途中でやめる（音が無いので切っても不自然にならない）。
+
+        until が真になった時も途中でやめる（フィラー前の待ちに笑いの合図が来た時＝先に笑う）。
+        """
         end = time.monotonic() + sec
-        while not self._stopped(rid):
+        while not self._stopped(rid) and not (until is not None and until()):
             remain = end - time.monotonic()
             if remain <= 0:
                 return
@@ -565,25 +597,40 @@ class FillerPlayer:
     # ------------------------------------------------------------------
 
     def _write_log(self, log: _ChainLog) -> None:
-        pieces = " ".join(f"{p}[{a:.2f}-{b:.2f}]" for p, a, b in log.pieces) or "（鳴らさず）"
-        end = (f"{log.stop_reason}(+{log.stop_at:.2f})" if log.stop_reason
+        """1行のログ。秒はどれも**話し終わり（声が止まった時）から**（判定の無音 `judge_sec` を足す）。
+
+        例: 話し終わり 21:40:01.608 … | 判定 0.50 → 待ち 0.50 → あー[1.00-1.99] | 終わり: … （秒は話し終わりから）
+        """
+        off = self._judge_sec
+        steps = []
+        if off > 0:
+            steps.append(f"判定 {off:.2f}")
+        if log.wait is not None:
+            steps.append(f"待ち {log.wait:.2f}")
+        pieces = " ".join(f"{p}[{a + off:.2f}-{b + off:.2f}]" for p, a, b in log.pieces) or "（鳴らさず）"
+        timeline = " → ".join(steps + [pieces])
+        end = (f"{log.stop_reason}(+{log.stop_at + off:.2f})" if log.stop_reason
                else ("上限" if log.limit else "—"))
         extra = []
         if log.near_at is not None:
-            extra.append(f"応答が近い +{log.near_at:.2f}")
+            extra.append(f"応答が近い +{log.near_at + off:.2f}")
         if log.head_at is not None:
-            extra.append(f"1文目の音声 +{log.head_at:.2f}")
-        wall = time.strftime("%H:%M:%S", time.localtime(log.wall)) + f".{int(log.wall * 1000) % 1000:03d}"
-        logger.info("🫧 フィラー #%d: 発話終了 %s・発話 %.2f秒%s | %s | 終わり: %s | 畳み終え +%.2f%s",
-                    log.rid, wall, log.speech_sec,
+            extra.append(f"1文目の音声 +{log.head_at + off:.2f}")
+        t = log.wall - off
+        wall = time.strftime("%H:%M:%S", time.localtime(t)) + f".{int(t * 1000) % 1000:03d}"
+        logger.info("🫧 フィラー #%d: %s %s・発話 %.2f秒%s | %s | 終わり: %s | 畳み終え +%.2f%s%s",
+                    log.rid, "話し終わり" if off > 0 else "話し終わりの判定", wall, log.speech_sec,
                     (f"・感情 {log.emotion}" if log.emotion else "") + (f"・場面 {log.mood}" if log.mood else ""),
-                    pieces, end,
-                    log.ended_at or 0.0, (" | " + " / ".join(extra)) if extra else "")
+                    timeline, end, (log.ended_at or 0.0) + off,
+                    (" | " + " / ".join(extra)) if extra else "",
+                    "（秒は話し終わりから）" if off > 0 else "（秒は話し終わりの判定から）")
 
     def _on_audio_start(self) -> None:
         log, self._await_start = self._await_start, None
         if log is None:
             return
         now = time.monotonic() - log.t_end
-        logger.info("🫧 応答の鳴り始め #%d: 話し終わり +%.2f秒（フィラーを畳んでから +%.2f秒）",
-                    log.rid, now, now - (log.ended_at or now))
+        off = self._judge_sec
+        logger.info("🫧 応答の鳴り始め #%d: %s +%.2f秒（フィラーを畳んでから +%.2f秒）",
+                    log.rid, "話し終わりから" if off > 0 else "話し終わりの判定から", now + off,
+                    now - (log.ended_at or now))

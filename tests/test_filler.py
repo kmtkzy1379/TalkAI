@@ -107,14 +107,15 @@ class Rec:
         self.events.append(("r_end", audio, self.now()))
 
 
-def mk_player(table=None, *, busy=False, muted=False, rec=None, word_sec=0.06, rng_seed=1):
+def mk_player(table=None, *, busy=False, muted=False, rec=None, word_sec=0.06, rng_seed=1, start_delay=0.0):
     table = table or mk_table()
     rec = rec or Rec()
     audio = AudioPlayQueue(play_fn=rec.queue_play)
     texts: list = []
     audio.on_sentence_start = lambda text, meta: texts.append((text, rec.now()))
     pl = FillerPlayer(mk_bank(table, word_sec), audio=audio, play_fn=rec.filler_play,
-                      is_busy=lambda: busy, muted=lambda: muted, rng=random.Random(rng_seed))
+                      is_busy=lambda: busy, muted=lambda: muted, rng=random.Random(rng_seed),
+                      start_delay_sec=start_delay)
     audio.on_head_waiting = pl.on_head_ready
     return pl, audio, rec, texts
 
@@ -510,6 +511,168 @@ async def t_barge_in() -> None:
     await pl.stop()
 
 
+async def t_start_delay() -> None:
+    """フィラー前の待ち（ユーザ決定 2026-10-09「フィラーはA」）: 話し終わりの判定（VAD）の後さらに待ってから
+    1語目を鳴らし、その間に話し出したら鳴らさない（話の途中の間でフィラーを被せない）。応答の速さは変わらない。"""
+    import logging as _lg
+
+    t = mk_table(silence_weight=0.0, max_chain_sec=5.0)
+    # (1) ゲートは話し終わりの瞬間に閉じ、1語目は待ちの後
+    pl, audio, rec, texts = mk_player(t, start_delay=0.15)
+    pl.start()
+    t0 = rec.now()
+    pl.on_speech_end(1.5)
+    check("待ち: ゲートは話し終わりの判断と同時に閉じる（応答の音声は今までどおり待たされる）", audio.floor_held())
+    await asyncio.sleep(0.10)
+    check("待ち: 待っている間は1語も鳴らさない", not [e for e in rec.events if e[0] == "f_start"],
+          f"{rec.events}")
+    await asyncio.sleep(0.15)
+    starts = [e[2] - t0 for e in rec.events if e[0] == "f_start"]
+    check("待ち: 待ち終えたら鳴らす（1語目は待ちの後）", bool(starts) and starts[0] >= 0.14, f"{starts}")
+    pl.on_response_near()
+    await asyncio.sleep(0.15)
+    await pl.stop()
+
+    # (2) 待っている間にユーザが話し出した → 1語も鳴らさず畳む。次の（本当の）話し終わりでは鳴る
+    pl, audio, rec, texts = mk_player(t, start_delay=0.2)
+    pl.start()
+    msgs: list = []
+
+    class H(_lg.Handler):
+        def emit(self, record):
+            msgs.append(record.getMessage())
+
+    prev = _lg.root.manager.disable
+    _lg.disable(_lg.NOTSET)
+    h = H(level=_lg.INFO)
+    lg = _lg.getLogger("eve.filler.player")
+    old_level = lg.level
+    lg.addHandler(h)
+    lg.setLevel(_lg.INFO)
+    try:
+        pl.on_speech_end(1.5)
+        await asyncio.sleep(0.05)
+        pl.on_barge_in()  # 話の途中の間だった（まだ話している）
+        await asyncio.sleep(0.25)
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(old_level)
+        _lg.disable(prev)
+    check("待ち: 待っている間に話し出したら1語も鳴らさない・ゲートを開ける",
+          not [e for e in rec.events if e[0] == "f_start"] and not audio.floor_held() and not pl.active,
+          f"{rec.events}")
+    check("待ち: ログに待ちと畳んだ理由が出る（鳴らさず）",
+          any("待ち 0." in m and "ユーザが話し出した" in m and "（鳴らさず）" in m for m in msgs), f"{msgs}")
+    pl.on_speech_end(1.5)  # 本当に話し終わった
+    await asyncio.sleep(0.35)
+    check("待ち: 次の話し終わりでは鳴る（前の発話への割り込みの合図を持ち越さない）",
+          bool([e for e in rec.events if e[0] == "f_start"]), f"{rec.events}")
+    pl.on_response_near()
+    await asyncio.sleep(0.15)
+    await pl.stop()
+
+    # (3) 待っている間に応答の音声ができた → 待ちを切り上げて応答がすぐ鳴る（フィラーは鳴らさない）
+    pl, audio, rec, texts = mk_player(t, start_delay=0.4)
+    w = asyncio.create_task(audio.play_worker())
+    pl.start()
+    pl.on_speech_end(1.5)
+    await asyncio.sleep(0.05)
+    t_r = rec.now()
+    await _response(audio, ("R",))
+    await asyncio.sleep(0.15)
+    r_starts = [e[2] for e in rec.events if e[0] == "r_start"]
+    check("待ち: 待っている間に応答ができたら、待ちを切り上げて応答が鳴る（応答は遅れない）",
+          bool(r_starts) and r_starts[0] - t_r < 0.1 and not [e for e in rec.events if e[0] == "f_start"],
+          f"{rec.events}")
+    check("待ち: 応答が鳴ったらゲートは開いている", not audio.floor_held() and not pl.active)
+    await pl.stop()
+    w.cancel()
+
+    # (4) 待ちは上限に数える（フィラーが終わる時刻は今までと同じで、鳴らし始めが遅れるだけ）
+    t2 = mk_table(silence_weight=0.0, max_chain_sec=0.4)
+    pl, audio, rec, texts = mk_player(t2, word_sec=0.07, start_delay=0.2)
+    pl.start()
+    t0 = rec.now()
+    pl.on_speech_end(2.0)
+    await asyncio.sleep(0.8)
+    ends = [e[2] - t0 for e in rec.events if e[0] == "f_end"]
+    check("待ち: 待った分も上限に数える（全体が上限以内）", bool(ends) and max(ends) <= 0.4 + 0.05, f"{ends}")
+    await pl.stop()
+
+
+async def t_log_timeline() -> None:
+    """ログは「話し終わり → 判定 → 待ち → 1語目」の並びで、秒は話し終わり（声が止まった時）から（ユーザ 2026-10-09
+    「話し終わりの確認0.50はわかりにくい。正確には話し終わり、0.5秒判定、0.5秒フィラー待ち、計1秒後フィラー」）。"""
+    import logging as _lg
+    import re as _re
+
+    t = mk_table(silence_weight=0.0, max_chain_sec=5.0)
+    rec = Rec()
+    audio = AudioPlayQueue(play_fn=rec.queue_play)
+    pl = FillerPlayer(mk_bank(t, 0.06), audio=audio, play_fn=rec.filler_play, is_busy=lambda: False,
+                      rng=random.Random(1), start_delay_sec=0.1, judge_sec=0.5)
+    msgs: list = []
+
+    class H(_lg.Handler):
+        def emit(self, record):
+            msgs.append(record.getMessage())
+
+    prev = _lg.root.manager.disable
+    _lg.disable(_lg.NOTSET)
+    h = H(level=_lg.INFO)
+    lg = _lg.getLogger("eve.filler.player")
+    old_level = lg.level
+    lg.addHandler(h)
+    lg.setLevel(_lg.INFO)
+    try:
+        pl.start()
+        pl.on_speech_end(1.5)
+        await asyncio.sleep(0.2)
+        pl.on_response_near()
+        await asyncio.sleep(0.15)
+        await pl.stop()
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(old_level)
+        _lg.disable(prev)
+    line = next((m for m in msgs if m.startswith("🫧 フィラー #")), "")
+    m = _re.search(r"→ 待ち (\d\.\d\d) → \S+?\[(\d+\.\d\d)-", line)
+    check("ログ: 話し終わり → 判定 0.50 → 待ち → 1語目 の並び（秒は話し終わりから）",
+          "話し終わり " in line and "判定 0.50 → 待ち 0.1" in line and "（秒は話し終わりから）" in line
+          and m is not None and float(m.group(2)) >= 0.5 + 0.1 - 0.01, line)
+
+    # 1語目の途中でユーザが話し出した: 鳴っている語は言い切り、次の語は出さない。ログの「終わり」は合図が**来た**時刻、
+    # 「畳み終え」は言い切って終わった時刻（2026-10-09 ユーザの問い「1秒後フィラー、1.1秒後ユーザー発話したら途切れる？」）
+    rec2 = Rec()
+    audio2 = AudioPlayQueue(play_fn=rec2.queue_play)
+    pl2 = FillerPlayer(mk_bank(t, 0.3), audio=audio2, play_fn=rec2.filler_play, is_busy=lambda: False,
+                       rng=random.Random(1), start_delay_sec=0.1, judge_sec=0.5)
+    msgs.clear()
+    _lg.disable(_lg.NOTSET)
+    lg.addHandler(h)
+    lg.setLevel(_lg.INFO)
+    try:
+        pl2.start()
+        pl2.on_speech_end(1.5)
+        await asyncio.sleep(0.15)   # 待ち 0.1 → 1語目（0.3秒）の途中
+        pl2.on_barge_in()
+        await asyncio.sleep(0.5)
+        await pl2.stop()
+    finally:
+        lg.removeHandler(h)
+        lg.setLevel(old_level)
+        _lg.disable(prev)
+    line2 = next((m for m in msgs if m.startswith("🫧 フィラー #")), "")
+    ms = _re.search(r"ユーザが話し出した\(\+(\d+\.\d\d)\) \| 畳み終え \+(\d+\.\d\d)", line2)
+    starts = [e for e in rec2.events if e[0] == "f_start"]
+    ends = [e for e in rec2.events if e[0] == "f_end"]
+    check("1語目の途中で話し出した: その語は言い切り、次の語は出さない",
+          len(starts) == 1 and len(ends) == 1, f"{rec2.events}")
+    check("ログ: 「終わり」は合図が来た時刻・「畳み終え」は言い切った時刻（合図 < 畳み終え）",
+          ms is not None and 0.6 <= float(ms.group(1)) < float(ms.group(2)) and float(ms.group(2)) >= 0.5 + 0.1 + 0.3 - 0.02,
+          line2)
+
+
 async def t_empty_stt() -> None:
     t = mk_table(silence_weight=0.0, max_chain_sec=5.0)
     pl, audio, rec, texts = mk_player(t, word_sec=0.08)
@@ -832,6 +995,10 @@ def t_wiring() -> None:
               and vl.audio.on_head_waiting == vl.filler.on_head_ready)
         check("配線: 発話終了・文字起こし結果のフック", vl.input._on_speech_end == vl._on_speech_end
               and vl.input._on_stt_result == vl._on_stt_result)
+        check("配線: フィラー前の待ちは .env（FILLER_START_DELAY_SEC・ユーザ決定 0.5）から・ログの秒は話し終わりから"
+              "（判定 SILENCE_LIMIT を足す）",
+              vl.filler._start_delay == Config.FILLER_START_DELAY_SEC and vl.filler._judge_sec == Config.SILENCE_LIMIT,
+              f"{vl.filler._start_delay} {vl.filler._judge_sec}")
         vl.filler._running_rid = 1  # フィラー中
         check("配線: フィラー中は自発発話を発火しない", vl._busy_for_autospeech() is True)
         check("配線: フィラー中は画面の実況を差し込まない", vl._vision_can_speak() is False)
@@ -885,7 +1052,9 @@ async def main() -> None:
     t_special()
     t_silence_after_word()
     for fn in (t_no_filler, t_fold_on_response, t_fold_on_near, t_fold_in_gap, t_combo, t_limit,
-               t_barge_in, t_empty_stt, t_always_release, t_spoken_and_gap, t_stretch_path, t_orchestrator):
+               t_barge_in, t_start_delay, t_log_timeline, t_empty_stt, t_always_release, t_spoken_and_gap,
+               t_stretch_path,
+               t_orchestrator):
         try:
             await asyncio.wait_for(fn(), 15.0)
         except Exception as e:

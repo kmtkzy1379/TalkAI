@@ -233,6 +233,22 @@ def t_format() -> None:
           text.index("response") < text.index("vlm_leaf"), text)
 
 
+def t_path_repo_relative() -> None:
+    """保存先の相対パスはリポジトリ基準（会話・記憶・タスクと同じ。以前は起動した場所＝cwd 基準だった）。"""
+    print("\n[9] 保存先は起動した場所に依らない")
+    cwd = os.getcwd()
+    away = tempfile.mkdtemp(prefix="eve_cwd_")
+    try:
+        os.chdir(away)  # わざと別の場所から
+        m = U.UsageMeter(Path("usage_path_check.jsonl"), enabled=False)
+        check("相対パスはリポジトリ基準", m.path == U.REPO_ROOT / "usage_path_check.jsonl", f"{m.path}")
+        a = Path(away) / "abs.jsonl"
+        check("絶対パスはそのまま", U.UsageMeter(a, enabled=False).path == a)
+        check("指定なしは既定（リポジトリ直下）", U.UsageMeter(None, enabled=False).path == U.DEFAULT_FILE)
+    finally:
+        os.chdir(cwd)
+
+
 if __name__ == "__main__":
     t_record()
     t_unpriced_not_zero()
@@ -242,5 +258,6 @@ if __name__ == "__main__":
     t_registry_wiring()
     t_tools_schema_counted()
     t_format()
+    t_path_repo_relative()
     print(f"\n合計: PASS {PASS} / FAIL {FAIL}")
     sys.exit(1 if FAIL else 0)

@@ -58,13 +58,19 @@ _COLD_SENTINEL = "（初回・前回の予測なし。surprise は中立でよ�
 
 # S5（ユーザ裁定 2026-09-26「フィードバックでも感情分析してるからフィードバックがきたらそれに更新」
 # 「現感情を…フィードバックに入れれば大きく不自然な感情切り替わりは少ない」）。感情の機能が ON の時だけ足す
-# （OFF なら従来と同じ文面）。ラベルと説明は `eve/emotion.py` の LABELS と同じ。
-EMOTION_LABEL_RULE = (
-    "emotion_label: イブの今の感情を次のどれか1つだけで書く: "
-    "喜（嬉しい・喜んでいる） / 怒（怒っている・苛立っている） / 哀（悲しい・つらい） / "
-    "楽（穏やかで楽しい・リラックスしている） / 笑い（笑っている・可笑しがっている）"
-)
-_NO_EMOTION = "なし（初回）"
+# （OFF なら従来と同じ文面）。2026-10-09 から1つのラベルではなく5つに数値を割り振る（ユーザ「喜怒哀楽笑…に数値0〜100…
+# 0が平常。50が明確にその感情を抱いてる。100がとても激しくその感情を抱いてる。最大合計数値100で割り振る」）。
+# ラベル・説明・数値の意味は `eve/emotion.py` と同じ。
+def _emotion_values_rule() -> str:
+    from ..emotion import LABELS, SCALE
+
+    labels = " / ".join(f"{k}（{v}）" for k, v in LABELS.items())
+    fmt = ", ".join(f"{k}=数値" for k in LABELS)
+    return (f"emotion_values: イブの今の感情を、{labels} の5つに数値で割り振る。"
+            f"各0〜100の整数（{SCALE}）。5つの合計は100以下。どの感情も無ければすべて0。書式: {fmt}")
+
+
+EMOTION_VALUES_RULE = _emotion_values_rule()
 
 
 def _render_turns(turns: list[Turn]) -> str:
@@ -79,12 +85,17 @@ def _render_turns(turns: list[Turn]) -> str:
 
 def build_user_text(turns: list[Turn], last_prediction: Optional[str], *,
                     with_emotion: bool = False, current_emotion: Optional[str] = None) -> str:
-    """前回予測 + 振り返り対象の会話スパンを描画（感情の機能が ON なら、イブの今の感情も添える）。"""
+    """前回予測 + 振り返り対象の会話スパンを描画（感情の機能が ON なら、イブの今の感情も添える）。
+
+    current_emotion は `EmotionState.brief()`（例「喜 40・笑い 15」・全部0なら平常）。
+    """
+    from ..emotion import NEUTRAL
+
     pred = last_prediction.strip() if last_prediction else _COLD_SENTINEL
     convo = _render_turns(turns) or "（会話なし）"
     text = f"# 前回の予測\n{pred}\n\n# 直近の会話（これを振り返る）\n{convo}"
     if with_emotion:
-        text += f"\n\n# イブの今の感情\n{current_emotion or _NO_EMOTION}"
+        text += f"\n\n# イブの今の感情\n{current_emotion or NEUTRAL}"
     return text
 
 
@@ -98,7 +109,7 @@ def build_messages(turns: list[Turn], last_prediction: Optional[str], *,
     """persona（`load_persona()` の文字列）があれば system の最後に性格を添える（応答と食い違わないため）。"""
     from ..persona import persona_for
 
-    system = (FEEDBACK_SYSTEM + ("\n" + EMOTION_LABEL_RULE if with_emotion else "")
+    system = (FEEDBACK_SYSTEM + ("\n" + EMOTION_VALUES_RULE if with_emotion else "")
               + persona_for(persona, PERSONA_HOW))
     return [
         {"role": "system", "content": system},

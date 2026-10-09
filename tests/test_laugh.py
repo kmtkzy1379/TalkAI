@@ -77,6 +77,42 @@ def t_prob() -> None:
     check("確率: 取れない応答は 0（笑わない）", yes_probability(object()) == 0.0)
 
 
+async def t_persona() -> None:
+    """笑い判定にも応答と同じ性格を渡す（2026-10-09 ユーザ「笑い判定にも同じ性格を与える」）。
+    性格の中身は見ない（作り文の性格で形だけ確かめる）。"""
+    import inspect
+
+    from eve.filler.laugh import PERSONA_HOW, laugh_messages, make_judge_fn
+    from eve.persona import PERSONA_HEADING
+    from eve.voice_loop import VoiceLoop
+
+    persona = f"{PERSONA_HEADING}\n- 性格: テスト用の作り文の性格"
+    plain = laugh_messages(["ユーザ: やあ"], "面白い話。")
+    withp = laugh_messages(["ユーザ: やあ"], "面白い話。", persona=persona)
+    check("性格: 無ければ system は今までどおり", plain[0]["content"] == "yes か no の1語だけで答える。", plain[0]["content"])
+    check("性格: あれば system の最後に添える（見出しは使い道つき）",
+          withp[0]["content"].startswith("yes か no の1語だけで答える。")
+          and f"# イブの性格（{PERSONA_HOW}）" in withp[0]["content"]
+          and "テスト用の作り文の性格" in withp[0]["content"] and PERSONA_HEADING not in withp[0]["content"],
+          withp[0]["content"])
+    check("性格: 質問文（user）は変えない", plain[1] == withp[1])
+
+    seen: list = []
+
+    class Reg:
+        async def complete(self, role, messages, **kw):
+            seen.append((role, messages))
+            return _Resp([_Tok("yes", math.log(0.9)), _Tok("no", math.log(0.1))])
+
+    p = await make_judge_fn(Reg(), persona=persona)(["ユーザ: やあ"], "面白い話。")
+    check("性格: 判定の呼び出しに性格が載る", abs(p - 0.9) < 1e-6 and seen and seen[0][0] == "laugh_judge"
+          and "テスト用の作り文の性格" in seen[0][1][0]["content"])
+    init = inspect.getsource(VoiceLoop.__init__)
+    check("配線: 性格は笑い判定を作る前に読み、笑い判定に渡す",
+          init.index("self.persona = load_persona") < init.index("self.laugh = self._build_laugh()")
+          and "make_judge_fn(self.registry, persona=self.persona)" in inspect.getsource(VoiceLoop._build_laugh))
+
+
 async def t_judge() -> None:
     probs = {"とても面白い。": 0.95, "少し面白い、": 0.8, "普通だね。": 0.3, "壊れる。": None}
     calls: list = []
@@ -206,14 +242,14 @@ class Rec:
         self.events.append(("end", len(x) / sr, time.monotonic() - self.t0))
 
 
-def mk_player(t=None, **kw):
+def mk_player(t=None, start_delay=0.0, **kw):
     t = t or mk_table()
     rec = Rec()
     audio = AudioPlayQueue(play_fn=rec.play)
     texts: list = []
     audio.on_sentence_start = lambda text, meta: texts.append(text)
     pl = FillerPlayer(mk_bank(t, **kw), audio=audio, play_fn=rec.play, is_busy=lambda: False,
-                      rng=random.Random(3))
+                      rng=random.Random(3), start_delay_sec=start_delay)
     audio.on_head_waiting = pl.on_head_ready
     return pl, audio, rec, texts
 
@@ -317,6 +353,37 @@ async def t_laugh_in_filler() -> None:
     pl.on_speech_end(0.4, 7)
     await asyncio.sleep(0.15)
     check("フィラーに笑い: フィラーが鳴らない発話では笑わない", not texts, f"{texts}")
+    await pl.stop()
+
+
+async def t_laugh_not_delayed() -> None:
+    """フィラー前の待ち（2026-10-09「フィラーはA」）は、笑いには掛けない（笑いは反応なので待たない・ユーザ確認済み）。"""
+    # 話している途中に「フィラーで笑う」と決まっていた → 待たずにチェーンの頭で笑う
+    pl, audio, rec, texts = mk_player(start_delay=0.3)
+    pl.start()
+    pl.laugh_in_filler(4)
+    t0 = time.monotonic() - rec.t0
+    pl.on_speech_end(1.5, 4)
+    await asyncio.sleep(0.12)
+    starts = [e[2] - t0 for e in rec.events if e[0] == "start"]
+    check("待ち×笑い: 頭の笑いは待たずに鳴る", texts[:1] == ["ふふ"] and bool(starts) and starts[0] < 0.05,
+          f"{texts} {starts}")
+    pl.on_response_near()
+    await asyncio.sleep(0.15)
+    await pl.stop()
+    # 待っている間に笑いの判定が来た → 待つのをやめて先に笑う
+    pl, audio, rec, texts = mk_player(start_delay=0.4)
+    pl.start()
+    pl.on_speech_end(1.5, 5)
+    await asyncio.sleep(0.05)
+    t_l = time.monotonic() - rec.t0
+    pl.laugh_in_filler(5)
+    await asyncio.sleep(0.1)
+    starts = [e[2] - t_l for e in rec.events if e[0] == "start"]
+    check("待ち×笑い: 待ちの途中に笑いの判定が来たら、すぐ笑う",
+          texts[:1] == ["ふふ"] and bool(starts) and starts[0] < 0.05, f"{texts} {starts}")
+    pl.on_response_near()
+    await asyncio.sleep(0.15)
     await pl.stop()
 
 
@@ -449,8 +516,8 @@ async def main() -> None:
         t_filler_style_yaml()
     else:
         print("SKIP 本物の fillers.yaml が無い（手元だけの表）: 笑い方の表")
-    for fn in (t_judge, t_phrases, t_lone_laugh, t_laugh_in_chain, t_laugh_in_filler, t_laughing_tone,
-               t_no_laugh_while_speaking):
+    for fn in (t_persona, t_judge, t_phrases, t_lone_laugh, t_laugh_in_chain, t_laugh_in_filler, t_laugh_not_delayed,
+               t_laughing_tone, t_no_laugh_while_speaking):
         try:
             await asyncio.wait_for(fn(), 15.0)
         except Exception as e:

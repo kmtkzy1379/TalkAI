@@ -63,6 +63,9 @@ system_prompts_review.md
 # 混乱のもと）。表が無い環境ではフィラーは無効・声のトーンは付かない（起動は続く）
 fillers.yaml
 emotion.yaml
+# イブの今の感情の保存（実行時に生成・会話の記憶と同じく手元だけ）
+emotion_state.json
+emotion_state.json.tmp
 docs/FILLER_IMPL_PLAN.md
 docs/FILLER_DESIGN.md
 # エディタ / OS メタファイル

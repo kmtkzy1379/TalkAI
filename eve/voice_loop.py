@@ -37,7 +37,6 @@ from .task import (
 from .response.input_source import MicSttInputSource
 from .response.orchestrator import REDELIVER_MAX_ATTEMPTS, ResponseOrchestrator
 from .response.player import RealAudioPlayer
-from .response.splitter import JapaneseSentenceSplitter
 from .response.style import SPEECH_STYLE
 from .response.tts import VoicevoxTTS
 from .emotion import EmotionState
@@ -47,7 +46,6 @@ from .persona import load_persona, persona_path
 from .persona_examples import StyleExamples, examples_path, load_examples
 from .self_model.worker import SelfModelWorker
 from .stt import make_stt
-from .stt.askback import UNINTELLIGIBLE_PLACEHOLDER, AskBackPicker
 from .vlm import ChangeDetector, VisionState, VlmWorker, make_narrate_fn
 from .vlm.capture import ScreenCapture
 from .vlm.capture_thread import CaptureThread
@@ -93,7 +91,7 @@ class VoiceLoop:
 
             self.usage = UsageMeter(Path(Config.USAGE_LOG_FILE), tag=os.getenv("USAGE_TAG", ""))
             install(self.usage)
-            logger.info("API 使用量の記録 稼働（%s）", Config.USAGE_LOG_FILE)
+            logger.info("API 使用量の記録 稼働（%s）", self.usage.path)
         self.registry = ModelRegistry()
         self.player = RealAudioPlayer()
         self.audio = AudioPlayQueue(play_fn=self.player.play_fn)
@@ -103,14 +101,16 @@ class VoiceLoop:
         self.queue = StimulusQueue()
         self.tts = _make_tts()  # 既定 Irodori（サーバは warmup で用意する＝ここでは起動しない）
         self.stt = make_stt()
+        # 性格（persona.md）は応答だけでなくフィードバック・感情判定・笑い判定にも渡す（食い違わないため・
+        # 2026-10-05・笑い判定は 2026-10-09）。笑い判定を作る前に読む
+        self.persona = load_persona(os.getenv("PERSONA_FILE"))
         # S3 応答非依存フィラー（既定 off）。runner は下で作るので is_busy は遅延 lambda。
         self.filler = self._build_filler()
         # S6 笑い（既定 off）。フィラーの仕組みで鳴らすので、フィラーが無ければ作らない。
         self.laugh = self._build_laugh()
-        # 性格（persona.md）は応答だけでなくフィードバックと感情判定にも渡す（食い違わないため・2026-10-05）
-        self.persona = load_persona(os.getenv("PERSONA_FILE"))
-        # S5 イブの今の感情（既定 off）。「、」「。」ごとの判定（ストリーミング文字起こしの時）とフィードバックで更新
-        self.emotion = EmotionState() if Config.EMOTION_ENABLED else None
+        # S5 イブの今の感情（既定 off）。「、」「。」ごとの判定（ストリーミング文字起こしの時）とフィードバックで更新。
+        # 5つの数値で、判定した会話の時点から時間とともに薄れる。判定のたびに保存し、起動時に前回の分を読む（2026-10-09）
+        self.emotion = EmotionState(path=Config.EMOTION_STATE_FILE) if Config.EMOTION_ENABLED else None
         self.emotion_judge = self._build_emotion_judge()
         # S8 フィラーの1段目を場面に寄せる（既定 off・Jev）
         self.mood = self._build_mood()
@@ -235,7 +235,9 @@ class VoiceLoop:
                 registry=self.capabilities, model_registry=self.registry, store=self.task_store,
                 max_steps=Config.TASK_AGENT_MAX_STEPS, timeout_sec=Config.TASK_AGENT_TIMEOUT_SEC,
                 # goal の「イブの好きな〜」を受け手側で解決できるようにする（会話履歴は渡さない）。
-                self_model_fn=(lambda: self.self_model.render()) if self.self_model else None,
+                # `is not None` で見る（台帳は len を持つので、空で起動すると `if self.self_model` が偽になり、
+                # その起動中に好みが書かれても渡らなかった・2026-10-09）
+                self_model_fn=(lambda: self.self_model.render()) if self.self_model is not None else None,
             )
             self.task_executor = TaskExecutor(
                 store=self.task_store, registry=self.capabilities, queue=self.queue, agent=task_agent,
@@ -350,7 +352,8 @@ class VoiceLoop:
             conversation_cache=self.cache, rag_store=self.rag,
             prediction_state=self.prediction,
             on_response_complete=self._on_response_complete,  # 正常完了で feedback + 沈黙時計リセット
-            self_model_fn=(lambda: self.self_model.render()) if self.self_model else None,
+            # 空の台帳で起動しても配線する（`is not None`・上の TaskAgent と同じ理由）
+            self_model_fn=(lambda: self.self_model.render()) if self.self_model is not None else None,
             vision_state=self.vision_state,  # F6: 応答文脈に直近画面を注入
             dispatcher=self.dispatcher,  # J: tool_calls を応答完了後に submit（gate は CALLFUNCTION_ENABLED）
             tasks_provider=tasks_provider,  # J-1/Fix#2: 予約タスク状態の毎ターン注入（TASK_ENABLED 時のみ）
@@ -381,8 +384,6 @@ class VoiceLoop:
             on_utterance=self.speech_state.mark_user_utterance,  # 発話終了→沈黙時計リセット
             on_stt_start=self.speech_state.mark_stt_pending,     # J-2 ③-A: STT待ち窓を開く
             on_stt_end=self.speech_state.clear_stt_pending,      # J-2 ③-A: 投入完了で窓を閉じる
-            on_unintelligible=self._ask_back,                    # 日本語として受け取れない認識結果
-            on_understood=lambda: self._askback.reset(),         # 聞き取れたら連続カウントを戻す
             on_speech_end=self._on_speech_end,                   # S3: VAD の終了確定＝フィラーの発火点
             on_stt_result=self._on_stt_result,                   # S3: 空認識ならフィラーを止める
             # S6 笑い判定・S5 感情の判定: 途中の文字（「、」「。」ごと）
@@ -391,7 +392,6 @@ class VoiceLoop:
         )
         # イブの音が鳴り始める時、ユーザがまだ話していたら最初の節で譲る（割り込みのかけ直し）
         self.audio.add_start_listener(self._yield_if_user_speaking)
-        self._askback = AskBackPicker()
         self._tasks: list[asyncio.Task] = []
         # 再配達（barge-in で潰れた機能報告）の待機タスク。done で自己除去・stop() で cancel。
         self._redeliver_waiters: "set[asyncio.Task]" = set()
@@ -448,11 +448,17 @@ class VoiceLoop:
             muted=lambda: bool(getattr(self.player, "muted", False)),
             # S5: 今の感情（チェーンを始める時に読む）。感情はこの後で作るので遅延 lambda
             emotion_fn=lambda: (self.emotion.label if getattr(self, "emotion", None) is not None else None),
+            # フィラー前の待ち（ユーザ決定 2026-10-09「フィラーはA」・話の途中の間でフィラーを被せない）
+            start_delay_sec=Config.FILLER_START_DELAY_SEC,
+            # ログの秒を「話し終わり（声が止まった時）から」で出すため（話し終わりの判定 SILENCE_LIMIT の分を足す）
+            judge_sec=Config.SILENCE_LIMIT,
         )
         # ゲートが閉じている間に応答の音声ができた＝畳む合図
         self.audio.on_head_waiting = player.on_head_ready
-        logger.info("フィラー 稼働（%s・%d語・つなぎの間 %.2f秒・伸ばし棒 %s・感情の声 %s）", bank_dir.name,
-                    len(bank.clips), table.join_gap_sec,
+        logger.info("フィラー 稼働（%s・%d語・1語目は話し終わりから %.2f秒（判定 %.2f＋待ち %.2f）・つなぎの間 %.2f秒・"
+                    "伸ばし棒 %s・感情の声 %s）",
+                    bank_dir.name, len(bank.clips), Config.SILENCE_LIMIT + Config.FILLER_START_DELAY_SEC,
+                    Config.SILENCE_LIMIT, Config.FILLER_START_DELAY_SEC, table.join_gap_sec,
                     "使う" if bank.stretch_ok() else "使わない",
                     "/".join(bank.by_emotion) or "なし")
         return player
@@ -495,13 +501,14 @@ class VoiceLoop:
 
         t = bank.table
         judge = LaughJudge(
-            judge_fn=make_judge_fn(self.registry), context_fn=self._laugh_context,
+            judge_fn=make_judge_fn(self.registry, persona=self.persona), context_fn=self._laugh_context,
             on_immediate=lambda seg, p: self.filler.request_laugh(seg),
             on_filler=lambda seg, p: self.filler.laugh_in_filler(seg),
             immediate=t.laugh_immediate, filler=t.laugh_filler,
         )
-        logger.info("笑い 稼働（%s・その場で笑う %.2f 以上 / フィラーに笑い %.2f 以上（%s）・笑いの語 %d・声色 %d語）",
-                    self.registry.resolve("laugh_judge"), t.laugh_immediate, t.laugh_filler,
+        logger.info("笑い 稼働（%s・%s・その場で笑う %.2f 以上 / フィラーに笑い %.2f 以上（%s）・笑いの語 %d・声色 %d語）",
+                    self.registry.resolve("laugh_judge"), "性格あり" if self.persona else "性格なし",
+                    t.laugh_immediate, t.laugh_filler,
                     "笑いの声色" if t.laugh_filler_style == "tone" else "普通に笑う",
                     len(bank.laughs), len(bank.laugh_words))
         return judge
@@ -516,8 +523,8 @@ class VoiceLoop:
             return None
         from .emotion import EmotionJudge, make_judge_fn
 
-        logger.info("感情 稼働（%s・「、」「。」ごと＋フィードバックで更新・喜怒哀楽笑い）",
-                    self.registry.resolve("emotion_judge"))
+        logger.info("感情 稼働（%s・「、」「。」ごと＋フィードバックで更新・喜怒哀楽笑いを各0〜100で・1時間に %g ずつ薄れる）",
+                    self.registry.resolve("emotion_judge"), Config.EMOTION_DECAY_PER_HOUR)
         return EmotionJudge(state=self.emotion, judge_fn=make_judge_fn(self.registry, persona=self.persona),
                             context_fn=self._laugh_context)
 
@@ -568,8 +575,9 @@ class VoiceLoop:
             logger.info("声のトーン: emotion.yaml の voice_emoji が未決なので付けない")
             return None
         emo = self.emotion
-        logger.info("声のトーン: %s（長さは絵文字なしにそろえる）", " / ".join(f"{k}={v}" for k, v in table.items()))
-        return lambda: table.get(emo.label)
+        logger.info("声のトーン: %s（いちばん強い感情が %g 以上の時だけ・長さは絵文字なしにそろえる）",
+                    " / ".join(f"{k}={v}" for k, v in table.items()), Config.EMOTION_TONE_MIN)
+        return lambda: table.get(emo.dominant())
 
     def _on_phrase(self, seg: int, text: str) -> None:
         """途中の文字（「、」「。」ごと・確定時）を笑い判定と感情の判定へ配る（1つの失敗で他を止めない）。"""
@@ -639,57 +647,6 @@ class VoiceLoop:
         if speaking:
             self._barge_in("まだ話している途中で鳴り始めた（この節を言い切って譲る）")
 
-    async def _speak_canned(self, text: str) -> None:
-        """応答LLM を通さず決まり文句を1つ喋る（聞き返し用・raise しない）。
-
-        LLM に投げない理由は2つ: (a) 聞き取れなかった語をモデルに渡すと、それ自体が
-        知ったかぶりの素材になる、(b) 定型で足りる場面に確率的な生成を挟むと、規律が
-        揺れる（CLAUDE.md「規律はコードで強制」）。
-        応答と同じく「、」「。」で区切って1つずつ鳴らす（割り込まれたら鳴っている節で譲る。
-        1項目のままだと、聞き返しに被せて言い直すユーザの上で2文とも言い切ってしまう）。
-        """
-        gen = self.audio.current_generation()
-        sp = JapaneseSentenceSplitter()
-        pieces = sp.feed(text) + sp.flush()
-        seqs = [self.audio.reserve_seq(gen) for _ in pieces]  # 並び順に先に取る（合成は並行）
-
-        async def one(seq: int, piece: str) -> None:
-            wav = meta = None
-            try:
-                wav = await self.tts.generate_with_meta(piece)
-                if isinstance(wav, tuple) and len(wav) == 2:
-                    wav, meta = wav
-            except Exception:
-                logger.exception("聞き返しの音声合成に失敗（seq は埋めて継続）")
-                wav = meta = None
-            if self.audio.current_generation() != gen:
-                return  # 待っている間に barge-in された＝古い世代は鳴らさない
-            if meta is not None:
-                try:
-                    self.audio.note_meta(gen, seq, meta)
-                except Exception:
-                    logger.exception("note_meta 失敗（口パクを諦めて音声は続行）")
-            self.audio.enqueue(gen, seq, wav, text=piece)
-
-        logger.info("🤖 %s", text)
-        await asyncio.gather(*(one(q, x) for q, x in zip(seqs, pieces)))
-
-    async def _ask_back(self, raw_text: str) -> None:
-        """聞き取れなかった入力に、決まり文句で一度だけ聞き返す。
-
-        記憶の扱い（ユーザ裁定 2026-08-15）:
-        - 会話履歴には**残す**。残さないと聞き返しの原因が消え、次ターンでイブが自分の
-          発話に自答する形になる。
-        - ただし**生の誤認識テキストは保存しない**（別言語混入の素材になるため）。
-        - RAG には入れない（`feedback/worker.py` が聞き取り失敗ターンを内省対象から外す）。
-        """
-        line = self._askback.next_line()
-        self.speech_state.mark_eve_activity()  # 沈黙時計をリセット（自発発話と衝突させない）
-        if self.cache is not None:
-            self.cache.add_turn("user", UNINTELLIGIBLE_PLACEHOLDER)
-            self.cache.add_turn("eve", line)
-        await self._speak_canned(line)
-
     def submit_user_text(self, text: str) -> None:
         """キーボードで打った文を**マイク発話と同じ経路**でパイプラインへ入れる。
 
@@ -710,7 +667,6 @@ class VoiceLoop:
             return
         self._barge_in()
         self.speech_state.mark_user_utterance()
-        self._askback.reset()  # 打てている＝意思疎通できている（連続聞き返しを持ち越さない）
         logger.info("⌨ %s", text)
         task = asyncio.create_task(self.queue.put(
             Stimulus(StimulusKind.USER_UTTERANCE, payload=text)))
@@ -828,7 +784,8 @@ class VoiceLoop:
             from .filler.laugh import make_judge_fn
 
             extra.append(step("laugh", "笑い判定",
-                              lambda: make_judge_fn(self.registry)(["ユーザ: こんにちは"], "こんにちは。")))
+                              lambda: make_judge_fn(self.registry, persona=self.persona)(
+                                  ["ユーザ: こんにちは"], "こんにちは。")))
         if getattr(self, "mood", None) is not None:
             # S8 Jev（OpenRouter）の接続を温める（初回だけ TLS の分遅い）
             extra.append(step("mood", "場面の判定",
@@ -999,7 +956,7 @@ class VoiceLoop:
         if self.self_model_worker is not None:
             self.self_model_worker.start()
             logger.info("自己形成 稼働（%s・%d項目）",
-                        Config.SELF_MODEL_FILE, self.self_model.topics)
+                        self.self_model.path, self.self_model.topics)
         # J-1: タスク管理（既定 off）。store 復元 + executor/scheduler 起動。
         if self.task_store is not None:
             await self.task_store.initialize()

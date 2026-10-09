@@ -159,10 +159,82 @@ def t_wiring() -> None:
               __import__("eve.memory.embed.ruri", fromlist=["x"]).RuriEmbedder.embed_query))
 
 
+def t_ruri_single_load() -> None:
+    """埋め込みモデルは同時に呼ばれても1回だけ読む（実測 2026-10-09: ウォームアップと前回分の
+    フィードバックの記憶の書き込みが重なり、同じ時刻に「ロード中」が2回出ていた）。"""
+    print("\n[5] 埋め込みモデル（Ruri）は同時に呼ばれても1回だけ読む")
+    import threading
+    import types
+
+    import numpy as np
+
+    loads: list = []
+    started = threading.Event()
+
+    class FakeST:
+        def __init__(self, name, device=None):
+            loads.append(name)
+            started.set()
+            time.sleep(0.3)  # 読み込みの最中に、もう1つの呼び出しが来る
+
+        def get_sentence_embedding_dimension(self):
+            return 4
+
+        def encode(self, texts, **kw):
+            return np.zeros((len(texts), 4))
+
+    fake_st = types.ModuleType("sentence_transformers")
+    fake_st.SentenceTransformer = FakeST
+    fake_torch = types.ModuleType("torch")
+    fake_torch.cuda = types.SimpleNamespace(is_available=lambda: False)
+    saved = {k: sys.modules.get(k) for k in ("sentence_transformers", "torch")}
+    sys.modules["sentence_transformers"] = fake_st
+    sys.modules["torch"] = fake_torch
+    try:
+        from eve.memory.embed.ruri import RuriEmbedder
+
+        e = RuriEmbedder("fake/ruri")
+
+        async def both():
+            return await asyncio.gather(e.embed_query("ウォームアップ"), e.embed_documents(["記憶の文"]))
+
+        q, docs = asyncio.run(both())
+        check("同時に2つ来ても読み込みは1回", loads == ["fake/ruri"], f"{loads}")
+        check("どちらの呼び出しも結果を返す", len(q) == 4 and len(docs) == 1 and e.dim == 4, f"{len(q)} {e.dim}")
+        check("2回目以降は読み込まない", e._get_model() is e._get_model() and loads == ["fake/ruri"])
+
+        loads.clear()
+        e2 = RuriEmbedder("fake/ruri2")
+        boom = {"n": 0}
+
+        class FailOnce(FakeST):
+            def __init__(self, name, device=None):
+                boom["n"] += 1
+                if boom["n"] == 1:
+                    raise OSError("一時的に読めない")
+                super().__init__(name, device)
+
+        fake_st.SentenceTransformer = FailOnce
+        try:
+            e2._get_model()
+            first_failed = False
+        except OSError:
+            first_failed = True
+        check("読み込みに失敗しても次の呼び出しで読み直せる（固まらない）",
+              first_failed and e2._get_model() is not None and loads == ["fake/ruri2"], f"{loads}")
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+
+
 if __name__ == "__main__":
     t_parallel()
     t_failure_isolated()
     t_progress()
     t_wiring()
+    t_ruri_single_load()
     print(f"\n合計: PASS {PASS} / FAIL {FAIL}")
     sys.exit(1 if FAIL else 0)

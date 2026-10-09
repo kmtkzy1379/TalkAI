@@ -81,6 +81,11 @@ class Config:
     FILLER_TABLE = os.getenv("FILLER_TABLE", "fillers.yaml")  # リポジトリ基準の相対パス可
     # bank/<voice>/（tools/build_filler_bank.py で作る）。eve_calm＝語尾が上がらない候補（ユーザ採用 2026-09-26）
     FILLER_VOICE = os.getenv("FILLER_VOICE", "eve_calm")
+    # フィラー前の待ち[秒]（ユーザ決定 2026-10-09「フィラーはA」）。VAD が話し終わりと判断した後（SILENCE_LIMIT）、さらにこれだけ
+    # 待ってから1語目を鳴らす＝声が止まってから 0.5＋0.5＝約1.0秒。その間にユーザが話し出したら鳴らさない（話の途中の間で
+    # フィラーを被せない）。
+    # 応答の速さは変わらない。0 にすると以前どおり話し終わりの判断と同時に鳴らす（`eve/filler/player.py`）
+    FILLER_START_DELAY_SEC = float(os.getenv("FILLER_START_DELAY_SEC", "0.5"))
     # 応答依存フィラー（S4）。**機能フラグ**（既定 off）。fillers.yaml の表 B 以下と注記を、ユーザ発話への
     # 応答の system に入れて、応答の書き出しで言わせる（イメージを掴む目的・ユーザ裁定 2026-09-25）。
     # 音を鳴らす S3（FILLER_ENABLED）とは独立に ON/OFF できる。
@@ -96,6 +101,15 @@ class Config:
     # 「、」「。」ごとの判定はストリーミング文字起こし（STT_BACKEND=openai_live）が前提（無ければフィードバックだけ）。
     EMOTION_ENABLED = os.getenv("EMOTION_ENABLED", "0") == "1"
     EMOTION_TABLE = os.getenv("EMOTION_TABLE", "emotion.yaml")  # リポジトリ基準の相対パス可
+    # 感情は5つの数値（各0〜100・合計100以下・0＝平常・ユーザ 2026-10-09）。判定した会話の時点から、
+    # 1時間あたりこれだけ引く（起動していない間も同じ時計で減る＝何日も前の会話の感情は平常に戻る）。
+    # ユーザ決定 2026-10-09「感情減衰率もいい感じ」＝10（強さ30は3時間・70は7時間で平常）
+    EMOTION_DECAY_PER_HOUR = float(os.getenv("EMOTION_DECAY_PER_HOUR", "10"))
+    # 声とフィラーに感情を乗せるのは、いちばん強い感情がこの値以上の時だけ（弱い時は普通の声）。
+    # ユーザ決定 2026-10-09「最も強い感情値が30以上の時でいい」（実測で判定の約4割）
+    EMOTION_TONE_MIN = float(os.getenv("EMOTION_TONE_MIN", "30"))
+    # 今の感情の保存先（判定のたびに書き、起動時に読む・リポジトリ基準の相対パス可・.gitignore 済み）
+    EMOTION_STATE_FILE = os.getenv("EMOTION_STATE_FILE", "emotion_state.json")
     # フィラーの1段目を場面に寄せる（S8・ユーザ指定 2026-09-27）。**機能フラグ**（既定 off）。ユーザの話の「、」「。」ごとに
     # Jev（OpenRouter・OPENROUTER_API_KEY）へ聞き手の反応の種類（通常・悩む・驚く・悲しむ・不満）を聞き、強い時（fillers.yaml の
     # mood.threshold 以上）だけ1段目をその種類の語にする。前提: FILLER_ENABLED・STT_BACKEND=openai_live

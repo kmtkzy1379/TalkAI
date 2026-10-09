@@ -40,7 +40,10 @@ def build_messages(vl, sc: dict, cfg: dict, extra_persona: str = ""):
     # イブの今の感情・直前に鳴らしたつなぎ言葉（本番の provider と同じ所から入れる）
     emo = EmotionState()
     if sc.get("emotion"):
-        emo.note(sc["emotion"], source="probe", as_of=time.monotonic())
+        # 場面の感情は1つのラベル（例「哀」）か、判定の数値（`fill_emotions` のキャッシュ）。ラベルは「はっきり」＝50 として渡す
+        # （2026-10-09 から感情は5つの数値）
+        v = sc["emotion"]
+        emo.note({v: 50} if isinstance(v, str) else v, source="probe", as_of=time.time())
     orch._emotion_provider = emo.describe
     orch._filler_provider = (lambda f=sc.get("filler"): f)
     # イブ自身の好み（本番は自己モデルの台帳。場面で指定した時だけ入れる）

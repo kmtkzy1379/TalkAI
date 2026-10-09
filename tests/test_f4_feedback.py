@@ -26,7 +26,7 @@ from eve.feedback import (  # noqa: E402
     parse_feedback,
 )
 from eve.feedback.feedback_llm import render_chunk_text, sanitize_result  # noqa: E402
-from eve.stt.askback import ASK_BACK_LINES, UNINTELLIGIBLE_PLACEHOLDER  # noqa: E402
+from eve.stt.askback import UNINTELLIGIBLE_PLACEHOLDER  # noqa: E402
 from eve.feedback.prompts import build_messages, build_user_text  # noqa: E402
 from eve.memory import ConversationCache, RagStore  # noqa: E402
 from eve.memory.embed import Embedder  # noqa: E402
@@ -519,7 +519,8 @@ async def t_askback_span_not_reflected() -> bool:
     cache = _cache()
     store = _store()
     cache.add_turn("user", UNINTELLIGIBLE_PLACEHOLDER)
-    cache.add_turn("eve", ASK_BACK_LINES[0])
+    # 返事はイブ自身の言葉（決まり文句は 2026-10-09 に撤去）＝文字ではなく並びで見分ける
+    cache.add_turn("eve", "すみません、今のところちょっと聞き取れなかったです。")
     fb = FeedbackLLM(_reg_const("summary: 聞き返しただけ\ntags: 雑談"),
                      rag_store=store, prediction_state=PredictionState())
     worker = FeedbackWorker(fb, cache)
@@ -531,12 +532,56 @@ async def t_askback_span_not_reflected() -> bool:
     return len(store) == 0 and cache.turns_since(fb.state.watermark) == []
 
 
+async def t_askback_reply_in_next_span_not_reflected() -> bool:
+    """聞き取れなかった発話が前のスパンに入り、返事だけが次のスパンに来ても内省しない
+    （前のスパンの内省中に聞き返しが始まった時の並び）。直前のターンを見て返事と分かる。"""
+    cache = _cache()
+    store = _store()
+    cache.add_turn("user", UNINTELLIGIBLE_PLACEHOLDER)
+    fb = FeedbackLLM(_reg_const("summary: 聞き返しただけ\ntags: 雑談"),
+                     rag_store=store, prediction_state=PredictionState())
+    worker = FeedbackWorker(fb, cache)
+    worker.start()
+    worker.trigger()
+    await asyncio.sleep(0.05)  # 1つ目のスパン＝聞き取れなかった発話だけ
+    await asyncio.sleep(0.002)
+    cache.add_turn("eve", "え、もう一回お願いできますか？")
+    worker.trigger()
+    await asyncio.sleep(0.05)  # 2つ目のスパン＝返事だけ
+    await worker.stop()
+    return len(store) == 0 and cache.turns_since(fb.state.watermark) == []
+
+
+async def t_eve_alone_after_normal_talk_is_reflected() -> bool:
+    """聞き取れなかった発話の後でなければ、イブだけのスパン（自発発話など）は通常どおり内省する。"""
+    cache = _cache()
+    store = _store()
+    cache.add_turn("user", "週末は山に行くんだ")
+    n = {"i": 0}
+
+    async def fake(model, messages, **kw):  # 毎回違う要約（同じ要約は記憶の重複として弾かれるため）
+        n["i"] += 1
+        return {"choices": [{"message": {"content": f"summary: 山の話その{n['i']}\ntags: 山{n['i']}"}}]}
+
+    fb = FeedbackLLM(ModelRegistry(completion_fn=fake), rag_store=store, prediction_state=PredictionState())
+    worker = FeedbackWorker(fb, cache)
+    worker.start()
+    worker.trigger()
+    await asyncio.sleep(0.05)
+    await asyncio.sleep(0.002)
+    cache.add_turn("eve", "そういえば山の天気って変わりやすいですよね。")
+    worker.trigger()
+    await asyncio.sleep(0.05)
+    await worker.stop()
+    return len(store) == 2
+
+
 async def t_askback_mixed_span_is_reflected() -> bool:
     """聞き返しに**本物の会話が続いた**スパンは通常どおり内省する（過剰に捨てない）。"""
     cache = _cache()
     store = _store()
     cache.add_turn("user", UNINTELLIGIBLE_PLACEHOLDER)
-    cache.add_turn("eve", ASK_BACK_LINES[0])
+    cache.add_turn("eve", "すみません、今のところちょっと聞き取れなかったです。")
     cache.add_turn("user", "ごめん、好きな食べ物の話ね")
     cache.add_turn("eve", "うん、聞かせて。")
     fb = FeedbackLLM(_reg_const("summary: 食べ物の話に戻った\ntags: 食べ物"),
@@ -644,6 +689,10 @@ async def main() -> None:
     check("B7 shutdown 中断は watermark 未前進で回収可能", await t_shutdown_recovery())
     # 聞き返しターンの扱い
     check("聞き返し: 失敗ターンだけのスパンは RAG に入れない", await t_askback_span_not_reflected())
+    check("⭐聞き返し: 返事だけが次のスパンに来ても RAG に入れない（並びで見分ける）",
+          await t_askback_reply_in_next_span_not_reflected())
+    check("聞き返し: 聞き取れなかった発話の後でなければ、イブだけのスパンも内省する",
+          await t_eve_alone_after_normal_talk_is_reflected())
     check("聞き返し: 本物の会話が続けば通常どおり内省する", await t_askback_mixed_span_is_reflected())
     # 別言語混入の検査（実データ 2026-08-15 の回帰）
     check("混入: 根拠の無い別言語を落とす(実レコード再現)", t_sanitize_drops_ungrounded_foreign())

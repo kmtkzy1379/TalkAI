@@ -5,10 +5,13 @@
 フィードバックがきたらそれに更新。…（現感情を、。やフィードバックに入れれば大きく不自然な感情切り替わりは
 少ないと予想）。感情ラベルは喜怒哀楽笑いでいい。」
 
-  [1] 今の感情: 喜怒哀楽笑いだけ・新しい情報が勝つ（古い時点の判定は上書きしない）
-  [2] 判定の質問文は実測（tools/jvnv_eval.py の FB_SYSTEM）と同じ・今の感情を渡す
+2026-10-09（ユーザ）:「喜怒哀楽笑…に数値0〜100の数値をつけて起動終了時〜起動開始時までの時間で数値を減少させる。
+…0が平常。50が明確にその感情を抱いてる。100がとても激しくその感情を抱いてる。最大合計数値100で割り振る。」
+
+  [1] 今の感情: 喜怒哀楽笑いの5つの数値（各0〜100・合計100以下）・新しい情報が勝つ・判定した時点から時間で薄れる・保存と読み込み
+  [2] 判定の質問文: 5つに数値を割り振らせる・今の感情を渡す
   [3] 「、」「。」ごとの判定: 更新・同じ文字は2回聞かない・遅れて届いた古い判定は捨てる・失敗は変えない
-  [4] フィードバック: 今の感情を入力に添え、emotion_label で更新（感情の機能が OFF なら従来と同じ文面）
+  [4] フィードバック: 今の感情を入力に添え、emotion_values で更新・判定の時点は振り返った会話の最後の発話（何日も前の会話は平常）
   [5] 応答LLM: 「# イブの今の気持ち」
   [6] 声のトーン: emotion.yaml の絵文字を応答の文に付ける（応答を組み立てた時点の感情で1ターン1つ・未決なら付けない）
   [8] フィラーの声: 感情ごとのバンク（絵文字が emotion.yaml と同じ時だけ）・チェーンを始めた時の感情で鳴らす
@@ -23,6 +26,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -31,7 +35,6 @@ sys.path.insert(0, REPO)
 logging.disable(logging.CRITICAL)
 
 from eve import emotion as em  # noqa: E402
-from eve.clock import now_mono  # noqa: E402
 
 _passed = 0
 _failed = 0
@@ -48,39 +51,86 @@ def check(name: str, cond: bool, detail: str = "") -> None:
 
 
 def t_state() -> None:
-    print("\n[1] 今の感情")
-    s = em.EmotionState()
-    check("最初は未判定（None）", s.label is None and s.describe() is None)
+    print("\n[1] 今の感情（5つの数値・時間で薄れる）")
+    now = [1_000_000.0]
+    s = em.EmotionState(decay_per_hour=10, tone_min=30, now_fn=lambda: now[0])
+    check("最初は平常（何も判定していない）", s.values() == {} and s.label is None and s.describe() is None
+          and s.brief() == em.NEUTRAL)
     check("ラベルは喜怒哀楽笑いの5つ", list(em.LABELS) == ["喜", "怒", "哀", "楽", "笑い"])
-    check("知らないラベルは捨てる", s.note("驚き", source="phrase", as_of=1.0) is False and s.label is None)
-    check("更新できる", s.note("楽", source="phrase", as_of=1.0) and s.label == "楽" and s.source == "phrase")
-    check("プロンプト用の説明", s.describe() == "楽（穏やかで楽しい・リラックスしている）", s.describe())
-    check("新しい時点の判定で更新", s.note("哀", source="feedback", as_of=2.0) and s.label == "哀")
+    check("知らないラベルだけの判定は捨てる", s.note({"驚き": 80}, source="phrase", as_of=now[0]) is False
+          and s.values() == {})
+    check("1つのラベルの形（旧形式）は数値ではないので捨てる", s.note("哀", source="phrase", as_of=now[0]) is False)
+    check("更新できる（細かく割り振った値をそのまま持つ）",
+          s.note({"喜": 50, "笑い": 25, "楽": 5}, source="phrase", as_of=now[0])
+          and s.values() == {"喜": 50, "笑い": 25, "楽": 5} and s.source == "phrase", f"{s.values()}")
+    check("短い形（判定・フィードバックに渡す）は強い順", s.brief() == "喜 50・笑い 25・楽 5", s.brief())
+    check("応答用の説明は数値と意味つき",
+          s.describe().startswith("喜（嬉しい・喜んでいる）50・笑い（笑っている・可笑しがっている）25")
+          and "0=平常" in s.describe() and "50=はっきり" in s.describe(), f"{s.describe()}")
+    check("声に乗せるのはいちばん強い感情（しきい値以上）", s.dominant() == "喜" and s.label == "喜")
+    check("合計が100を超えたら比率を保って100に縮める",
+          em.normalize({"喜": 80, "笑い": 80}) == {"喜": 50.0, "怒": 0.0, "哀": 0.0, "楽": 0.0, "笑い": 50.0})
+    check("各値は0〜100に収める・数字でない値は無視", em.normalize({"喜": -5, "哀": "x", "怒": 30})
+          == {"喜": 0.0, "怒": 30.0, "哀": 0.0, "楽": 0.0, "笑い": 0.0})
+    check("全部0は平常として有効（判定を捨てない）", em.normalize({"喜": 0}) is not None)
+    # 時間で薄れる（1時間に10ずつ・0で止まる）
+    now[0] += 2 * 3600
+    check("2時間後: 20ずつ引いた値（弱い感情から消える）", s.values() == {"喜": 30, "笑い": 5}, f"{s.values()}")
+    now[0] += 1 * 3600
+    check("しきい値を下回ったら声には乗せない（普通の声）", s.values() == {"喜": 20} and s.dominant() is None,
+          f"{s.values()}")
+    now[0] += 10 * 3600
+    check("十分たてば平常（応答に気持ちのブロックを出さない）", s.values() == {} and s.describe() is None
+          and s.brief() == em.NEUTRAL)
+    # 新しい情報が勝つ
+    t0 = now[0]
+    check("新しい時点の判定で更新", s.note({"哀": 60}, source="feedback", as_of=t0) and s.values() == {"哀": 60})
     check("古い時点の判定は上書きしない（新しい情報が勝つ）",
-          s.note("喜", source="feedback", as_of=1.5) is False and s.label == "哀")
-    check("同じ時点なら後から来た方", s.note("笑い", source="phrase", as_of=2.0) and s.label == "笑い")
+          s.note({"喜": 70}, source="feedback", as_of=t0 - 1) is False and s.values() == {"哀": 60})
+    check("同じ時点なら後から来た方", s.note({"笑い": 40}, source="phrase", as_of=t0) and s.values() == {"笑い": 40})
+    check("古い会話の判定は、その会話からの経過の分だけ薄れて入る（10日前→平常）",
+          s.note({"哀": 80}, source="feedback", as_of=t0 + 1) and s.values(now=t0 + 1 + 240 * 3600) == {})
+
+    # 保存と読み込み（起動をまたぐ）
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "emotion_state.json")
+        clock = [5_000_000.0]
+        a = em.EmotionState(path=path, decay_per_hour=10, now_fn=lambda: clock[0])
+        a.note({"怒": 40, "笑い": 20}, source="phrase", as_of=clock[0])
+        check("判定のたびに保存する", os.path.exists(path) and not os.path.exists(path + ".tmp"))
+        clock[0] += 3 * 3600  # 3時間止めて起動し直した
+        b = em.EmotionState(path=path, decay_per_hour=10, now_fn=lambda: clock[0])
+        check("起動時に前回の感情を読み、止まっていた間の分だけ薄れている", b.values() == {"怒": 10}
+              and b.source == "phrase", f"{b.values()}")
+        check("読み込んだ後も、それより古い判定は上書きしない",
+              b.note({"喜": 90}, source="feedback", as_of=clock[0] - 4 * 3600) is False)
+        Path(path).write_text("{壊れ", encoding="utf-8")
+        c = em.EmotionState(path=path, now_fn=lambda: clock[0])
+        check("保存が壊れていても平常から始める（落ちない）", c.values() == {})
+        check("保存先が無ければ平常から", em.EmotionState(path=os.path.join(d, "none.json")).values() == {})
+    rel = em.EmotionState(path="emotion_state_relcheck_never_written.json")
+    check("相対パスはリポジトリ基準", rel._path == Path(REPO) / "emotion_state_relcheck_never_written.json"
+          and not rel._path.exists())
 
 
 def t_prompt() -> None:
-    print("\n[2] 判定の質問文（実測と同じ）")
-    sys.path.insert(0, os.path.join(REPO, "tools"))
-    try:
-        import jvnv_eval as jv
-    except Exception as e:  # 計測ツールが無い環境
-        print(f"SKIP 計測ツールを読めない: {e}")
-        jv = None
-    m = em.judge_messages(["ユーザ: 前の話"], "財布を落としちゃって。", "楽")
-    if jv is not None:
-        want = jv.FB_SYSTEM.format(l6=" / ".join(jv.L6), l5=" / ".join(jv.L5), cur="楽")
-        check("system は実測の質問文そのもの（今の感情だけ差し込む）", m[0]["content"] == want)
-        check("user は実測と同じ形（直前の会話＋相手の発話）",
-              m[1]["content"] == jv.ctx_text(["ユーザ: 前の話"]) + "相手の発話: 財布を落としちゃって。")
-    check("今の感情を渡す", "イブの今の感情: 楽" in m[0]["content"])
+    print("\n[2] 判定の質問文（5つに数値を割り振る）")
+    m = em.judge_messages(["ユーザ: 前の話"], "財布を落としちゃって。", "楽 30")
+    sysmsg = m[0]["content"]
+    check("5つの感情に 0〜100 で割り振らせる（数値の意味・合計100以下）",
+          "喜 / 怒 / 哀 / 楽 / 笑い の5つに数値で割り振る" in sysmsg and em.SCALE in sysmsg and "合計は100以下" in sysmsg,
+          sysmsg)
+    check("出力形式は5つの数値", '"eve5": {"喜": 0, "怒": 0, "哀": 0, "楽": 0, "笑い": 0}' in sysmsg)
+    check("今の感情を渡す", "イブの今の感情: 楽 30" in sysmsg)
+    check("user は直前の会話＋相手の発話",
+          m[1]["content"] == "直前の会話:\nユーザ: 前の話\n\n相手の発話: 財布を落としちゃって。")
     m0 = em.judge_messages([], "こんにちは。", None)
-    check("未判定なら「なし（初回）」（実測と同じ）", "イブの今の感情: なし（初回）" in m0[0]["content"])
+    check("今の感情が無ければ平常", f"イブの今の感情: {em.NEUTRAL}" in m0[0]["content"])
     check("会話が無ければ相手の発話だけ", m0[1]["content"] == "相手の発話: こんにちは。")
-    check("eve5 を読む", em.parse_eve5('{"eve5": {"label": "哀", "confidence": 80}}') == "哀")
-    check("知らないラベルは None", em.parse_eve5('{"eve5": {"label": "驚き"}}') is None)
+    check("eve5 の数値を読む", em.parse_eve5('{"eve5": {"喜": 40, "怒": 0, "哀": 0, "楽": 20, "笑い": 30}}')
+          == {"喜": 40.0, "怒": 0.0, "哀": 0.0, "楽": 20.0, "笑い": 30.0})
+    check("1つのラベルの形（旧形式）は読めない＝変えない",
+          em.parse_eve5('{"eve5": {"label": "哀", "confidence": 80}}') is None)
     check("壊れた JSON は None", em.parse_eve5("eve5: 哀") is None and em.parse_eve5("") is None)
 
 
@@ -95,31 +145,34 @@ async def t_judge() -> None:
         ev = gates.get(said)
         if ev is not None:
             await ev.wait()
-        return {"えっとね、": "楽", "財布をなくして、": "哀", "やばい。": "笑い", "ぼろぼろ。": None}.get(said)
+        return {"えっとね、": {"楽": 40}, "財布をなくして、": {"哀": 60}, "やばい。": {"笑い": 70},
+                "ぼろぼろ。": None}.get(said)
 
     j = em.EmotionJudge(state=s, judge_fn=judge, context_fn=lambda: ["ユーザ: 前の話"])
     j.on_phrase(1, "えっとね、")
     await asyncio.sleep(0.01)
-    check("判定して今の感情を更新", s.label == "楽" and s.source == "phrase", f"{s.label}")
-    check("直前の会話と今の感情（判定前の値）を渡す", calls[0] == (("ユーザ: 前の話",), "えっとね、", None), f"{calls}")
+    check("判定して今の感情を更新", s.values() == {"楽": 40} and s.source == "phrase", f"{s.values()}")
+    check("直前の会話と今の感情（判定前の値）を渡す", calls[0] == (("ユーザ: 前の話",), "えっとね、", em.NEUTRAL),
+          f"{calls}")
     j.on_phrase(1, "えっとね、")
     await asyncio.sleep(0.01)
     check("同じ区間の同じ文字は2回聞かない", len(calls) == 1)
     j.on_phrase(2, "財布をなくして、")
     await asyncio.sleep(0.01)
-    check("次の判定には今の感情を渡す", calls[-1][2] == "楽" and s.label == "哀", f"{calls[-1]} {s.label}")
+    check("次の判定には今の感情を渡す", calls[-1][2] == "楽 40" and s.values() == {"哀": 60},
+          f"{calls[-1]} {s.values()}")
     # 先に始めた判定が遅れて届いても、後から始めた判定を上書きしない
     gates["やばい。"] = asyncio.Event()
     j.on_phrase(3, "やばい。")         # 先に始まる（遅れて届く）
     await asyncio.sleep(0.01)
-    later = now_mono()
-    s.note("喜", source="phrase", as_of=later)  # 後から始めた判定が先に届いた
+    later = time.time() + 1
+    s.note({"喜": 50}, source="phrase", as_of=later)  # 後から始めた判定が先に届いた
     gates["やばい。"].set()
     await asyncio.sleep(0.01)
-    check("遅れて届いた古い判定は捨てる", s.label == "喜", f"{s.label}")
+    check("遅れて届いた古い判定は捨てる", s.values() == {"喜": 50}, f"{s.values()}")
     j.on_phrase(4, "ぼろぼろ。")
     await asyncio.sleep(0.01)
-    check("読めない判定は今の感情のまま", s.label == "喜")
+    check("読めない判定は今の感情のまま", s.values() == {"喜": 50})
 
     async def boom(ctx, said, current):
         raise RuntimeError("API")
@@ -127,13 +180,13 @@ async def t_judge() -> None:
     j2 = em.EmotionJudge(state=s, judge_fn=boom, context_fn=lambda: [])
     j2.on_phrase(5, "こわい。")
     await asyncio.sleep(0.01)
-    check("判定の失敗は今の感情のまま（落ちない）", s.label == "喜")
+    check("判定の失敗は今の感情のまま（落ちない）", s.values() == {"喜": 50})
 
     hold = asyncio.Event()
 
     async def slow(ctx, said, current):
         await hold.wait()
-        return "楽"
+        return {"楽": 30}
 
     j3 = em.EmotionJudge(state=em.EmotionState(), judge_fn=slow, context_fn=lambda: [], max_inflight=2)
     for k in range(4):
@@ -149,14 +202,16 @@ async def t_judge() -> None:
     class Reg:
         async def complete(self, role, messages, **kw):
             seen.update(role=role, messages=messages, **kw)
-            return {"choices": [{"message": {"content": '{"eve5": {"label": "怒", "confidence": 70}}'}}]}
+            return {"choices": [{"message": {"content": '{"user6": {"label": "怒り", "confidence": 70}, '
+                                                          '"eve5": {"喜": 0, "怒": 60, "哀": 0, "楽": 0, "笑い": 10}}'}}]}
 
-    got = await em.make_judge_fn(Reg())(["ユーザ: x"], "ふざけないで。", "楽")
+    got = await em.make_judge_fn(Reg())(["ユーザ: x"], "ふざけないで。", "楽 30")
     check("判定の呼び出し: emotion_judge 役・JSON・reasoning_effort=none",
           seen.get("role") == "emotion_judge" and seen.get("response_format") == {"type": "json_object"}
           and seen.get("reasoning_effort") == "none"
           and "reasoning_effort" in (seen.get("allowed_openai_params") or []), f"{seen.keys()}")
-    check("判定の呼び出し: eve5 を返す", got == "怒", f"{got}")
+    check("判定の呼び出し: eve5 の数値を返す", got == {"喜": 0.0, "怒": 60.0, "哀": 0.0, "楽": 0.0, "笑い": 10.0},
+          f"{got}")
 
     # 2026-10-05 性格を感情判定にも渡す（無いと口の悪いいじりを「哀」と読み、応答の性格と食い違った）
     from eve.persona import PERSONA_HEADING
@@ -170,29 +225,38 @@ async def t_judge() -> None:
 
 async def t_feedback() -> None:
     print("\n[4] フィードバック")
-    from eve.context_assembler import Turn
+    from datetime import datetime, timedelta, timezone
+
     from eve.clock import Stamp
+    from eve.context_assembler import Turn
     from eve.feedback.feedback_llm import FeedbackLLM
     from eve.feedback.parser import parse_feedback
-    from eve.feedback.prompts import EMOTION_LABEL_RULE, FEEDBACK_SYSTEM, build_messages
+    from eve.feedback.prompts import EMOTION_VALUES_RULE, FEEDBACK_SYSTEM, build_messages
     from eve.model_registry import ModelRegistry
 
     turns = [Turn("user", "財布なくした", Stamp.now()), Turn("eve", "えっ、大丈夫？", Stamp.now())]
     off = build_messages(turns, None)
     check("感情の機能が OFF なら従来と同じ文面", off[0]["content"] == FEEDBACK_SYSTEM
           and "イブの今の感情" not in off[1]["content"])
-    on = build_messages(turns, None, with_emotion=True, current_emotion="哀")
-    check("ON なら emotion_label を聞く", on[0]["content"].endswith(EMOTION_LABEL_RULE))
-    check("ON なら今の感情を添える", on[1]["content"].endswith("# イブの今の感情\n哀"), on[1]["content"][-30:])
+    on = build_messages(turns, None, with_emotion=True, current_emotion="哀 60")
+    check("ON なら emotion_values（5つの数値）を聞く", on[0]["content"].endswith(EMOTION_VALUES_RULE)
+          and "5つに数値で割り振る" in EMOTION_VALUES_RULE and em.SCALE in EMOTION_VALUES_RULE)
+    check("ON なら今の感情を添える", on[1]["content"].endswith("# イブの今の感情\n哀 60"), on[1]["content"][-30:])
     on0 = build_messages(turns, None, with_emotion=True, current_emotion=None)
-    check("未判定なら「なし（初回）」", on0[1]["content"].endswith("# イブの今の感情\nなし（初回）"))
+    check("今の感情が無ければ平常", on0[1]["content"].endswith(f"# イブの今の感情\n{em.NEUTRAL}"))
 
-    r = parse_feedback("summary: 財布の話\nemotion: ほっとした\nemotion_label: 楽\nsurprise: 20")
-    check("emotion_label を読む（emotion と混ざらない）", r.emotion_label == "楽" and r.emotions == "ほっとした",
-          f"{r.emotion_label!r} {r.emotions!r}")
-    check("かぎかっこ付きでも読む", parse_feedback("emotion_label: 「哀」").emotion_label == "哀")
+    r = parse_feedback("summary: 財布の話\nemotion: ほっとした\n"
+                       "emotion_values: 喜=10, 怒=0, 哀=20, 楽=40, 笑い=0\nsurprise: 20")
+    check("emotion_values を読む（emotion と混ざらない）",
+          r.emotion_values == {"喜": 10.0, "怒": 0.0, "哀": 20.0, "楽": 40.0, "笑い": 0.0} and r.emotions == "ほっとした",
+          f"{r.emotion_values!r} {r.emotions!r}")
+    check("全角の区切り・笑の略・JSON 風でも読む",
+          parse_feedback("emotion_values: 喜＝5、笑=30").emotion_values.get("笑い") == 30.0
+          and parse_feedback('emotion_values: {"喜": 5, "笑い": 30}').emotion_values.get("喜") == 5.0)
+    check("読めなければ空（感情を変えない）", parse_feedback("emotion_values: よくわからない").emotion_values == {}
+          and parse_feedback("summary: x").emotion_values == {})
 
-    out = "summary: ユーザは財布をなくした\nemotion: 心配\nemotion_label: 哀\nsurprise: 30"
+    out = "summary: ユーザは財布をなくした\nemotion: 心配\nemotion_values: 喜=0, 怒=0, 哀=60, 楽=0, 笑い=0\nsurprise: 30"
     captured: list = []
 
     async def fake(model, messages, **kw):
@@ -200,27 +264,38 @@ async def t_feedback() -> None:
         return {"choices": [{"message": {"content": out}}]}
 
     st = em.EmotionState()
-    st.note("楽", source="phrase", as_of=now_mono())
+    st.note({"楽": 30}, source="phrase", as_of=time.time() - 60)
     fb = FeedbackLLM(ModelRegistry(completion_fn=fake), emotion_state=st)
     await fb.run(turns)
-    check("フィードバックに今の感情を渡す", "# イブの今の感情\n楽" in captured[-1][1]["content"])
-    check("フィードバックの emotion_label で更新", st.label == "哀" and st.source == "feedback", f"{st.label}")
+    check("フィードバックに今の感情を渡す", "# イブの今の感情\n楽 30" in captured[-1][1]["content"])
+    check("フィードバックの emotion_values で更新", st.values() == {"哀": 60} and st.source == "feedback",
+          f"{st.values()}")
+
+    # 起動時の取りこぼし分（10日前の会話）の振り返り → 判定の時点は会話の時刻＝薄れて平常（2026-10-09 の実害）
+    old = datetime.now(timezone.utc) - timedelta(days=10)
+    old_turns = [Turn("user", "ごめん", Stamp(iso=(old - timedelta(seconds=5)).isoformat(), mono=0.0)),
+                 Turn("eve", "こちらこそごめん", Stamp(iso=old.isoformat(), mono=0.0))]
+    st_old = em.EmotionState()
+    await FeedbackLLM(ModelRegistry(completion_fn=fake), emotion_state=st_old).run(old_turns)
+    check("⭐10日前の会話の振り返りは「今の感情」にならない（その会話の時点で入り、薄れて平常）",
+          st_old.values() == {} and abs(st_old.as_of - old.timestamp()) < 1 and st_old.describe() is None,
+          f"{st_old.values()} {st_old.as_of}")
 
     # 振り返っている間にユーザの新しい発話で感情が変わった → 古い会話の振り返りでは上書きしない
     gate = asyncio.Event()
 
     async def slow(model, messages, **kw):
         await gate.wait()
-        return {"choices": [{"message": {"content": out.replace("哀", "楽")}}]}
+        return {"choices": [{"message": {"content": out.replace("哀=60", "楽=60")}}]}
 
     st2 = em.EmotionState()
     fb2 = FeedbackLLM(ModelRegistry(completion_fn=slow), emotion_state=st2)
     task = asyncio.create_task(fb2.run(turns))
     await asyncio.sleep(0.01)
-    st2.note("怒", source="phrase", as_of=now_mono())
+    st2.note({"怒": 50}, source="phrase", as_of=time.time())
     gate.set()
     await task
-    check("振り返りの間に新しくなった感情は上書きしない", st2.label == "怒", f"{st2.label}")
+    check("振り返りの間に新しくなった感情は上書きしない", st2.values() == {"怒": 50}, f"{st2.values()}")
 
     fb3 = FeedbackLLM(ModelRegistry(completion_fn=fake))
     await fb3.run(turns)
@@ -270,12 +345,13 @@ async def t_orchestrator() -> None:
 
     audio = AudioPlayQueue(play_fn=play)
     st = em.EmotionState()
-    st.note("笑い", source="phrase", as_of=now_mono())
+    st.note({"笑い": 60, "喜": 20}, source="phrase", as_of=time.time())
     orch = ResponseOrchestrator(audio, stream_fn, tts, emotion_provider=st.describe)
     w = asyncio.create_task(audio.play_worker())
     await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "ねえ"))
     w.cancel()
-    check("応答LLM の system に届く", "# イブの今の気持ち\n笑い（笑っている・可笑しがっている）" in seen[0][0]["content"])
+    check("応答LLM の system に届く（数値つき）",
+          "# イブの今の気持ち\n笑い（笑っている・可笑しがっている）60・喜（嬉しい・喜んでいる）20" in seen[0][0]["content"])
 
 
 class _Cache:
@@ -321,17 +397,17 @@ async def _respond(tone_provider, tts_hook=None) -> tuple:
 async def t_voice_tone() -> None:
     print("\n[6] 声のトーン（Irodori の絵文字・応答ごとに1つ）")
     st = em.EmotionState()
-    st.note("哀", source="phrase", as_of=now_mono())
+    st.note({"哀": 60}, source="phrase", as_of=time.time())
     table = {"哀": "😭", "楽": "😌"}
     reads: list = []
 
     def tone():
-        reads.append(st.label)
-        return table.get(st.label)
+        reads.append(st.dominant())
+        return table.get(st.dominant())
 
     def change(n):
         if n == 1:  # 1節目の合成中に、感情の判定が届いて「楽」になった
-            st.note("楽", source="phrase", as_of=now_mono())
+            st.note({"楽": 60}, source="phrase", as_of=time.time() + 1)
 
     sent, turns = await _respond(tone, change)
     check("TTS に渡す文字にだけ、今の感情の絵文字を付ける", sorted(sent) == sorted(["そっか、😭", "それはつらかったね。😭"]),
@@ -369,10 +445,11 @@ def t_wiring() -> None:
     from eve.config import Config
     from eve.voice_loop import VoiceLoop
 
-    saved = (Config.EMOTION_ENABLED, Config.EMOTION_TABLE)
+    saved = (Config.EMOTION_ENABLED, Config.EMOTION_TABLE, Config.EMOTION_STATE_FILE)
     tmp = tempfile.TemporaryDirectory()
     undecided = Path(tmp.name) / "emotion.yaml"
     undecided.write_text("voice_emoji:\n  喜: null\n", encoding="utf-8")
+    Config.EMOTION_STATE_FILE = str(Path(tmp.name) / "emotion_state.json")  # 本物の保存を汚さない
     try:
         # 本物の emotion.yaml（ユーザが決める中身）に依らないよう、表は一時ファイルで与える
         Config.EMOTION_TABLE = str(undecided)
@@ -386,6 +463,8 @@ def t_wiring() -> None:
         check("EMOTION_ENABLED=1: 今の感情をフィードバックと応答に配線",
               vl.emotion is not None and vl.feedback._emotion is vl.emotion
               and vl.orchestrator._emotion_provider == vl.emotion.describe)
+        check("EMOTION_ENABLED=1: 今の感情は保存先つき（起動をまたいで続く）",
+              vl.emotion._path == Path(Config.EMOTION_STATE_FILE))
         from eve.persona import load_persona
         check("性格を応答・フィードバックで同じものにする（persona.md）",
               vl.persona == load_persona(os.getenv("PERSONA_FILE")) and vl.feedback._persona == vl.persona)
@@ -420,18 +499,22 @@ def t_wiring() -> None:
             if hasattr(vl.tts, "match_emoji_length"):
                 check("声のトーン: 応答の組み立てに配線", vl.orchestrator._tone_provider is vl._voice_tone
                       and vl._voice_tone is not None)
-                vl.emotion.note("哀", source="phrase", as_of=now_mono())
+                t0 = time.time()
+                vl.emotion.note({"哀": 60}, source="phrase", as_of=t0)
                 a = vl.orchestrator._tone_provider()
-                vl.emotion.note("楽", source="phrase", as_of=now_mono())
+                vl.emotion.note({"楽": 60}, source="phrase", as_of=t0 + 1)
                 b = vl.orchestrator._tone_provider()
-                check("声のトーン: 今の感情の絵文字（決まっていない感情は付けない）", a == "😭" and b is None,
-                      f"{a} {b}")
+                vl.emotion.note({"哀": 10, "喜": 5}, source="phrase", as_of=t0 + 2)
+                c = vl.orchestrator._tone_provider()
+                check("声のトーン: いちばん強い感情の絵文字（決まっていない感情・弱い感情は付けない）",
+                      a == "😭" and b is None and c is None, f"{a} {b} {c}")
                 check("長さは絵文字なしにそろえる（サーバへ match_plain）", vl.tts.match_emoji_length is True)
-                check("フィラーの感情: 今の感情を読む", vl.filler is None or vl.filler._emotion_fn() == "楽")
+                vl.emotion.note({"楽": 60}, source="phrase", as_of=t0 + 3)
+                check("フィラーの感情: 今のいちばん強い感情を読む", vl.filler is None or vl.filler._emotion_fn() == "楽")
             else:
                 print("SKIP 声のトーン（TTS が Irodori でない）")
     finally:
-        Config.EMOTION_ENABLED, Config.EMOTION_TABLE = saved
+        Config.EMOTION_ENABLED, Config.EMOTION_TABLE, Config.EMOTION_STATE_FILE = saved
         tmp.cleanup()
 
 

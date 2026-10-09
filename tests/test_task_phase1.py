@@ -264,7 +264,7 @@ async def t_capabilities():
     return (
         "引き受けた" in r_del and len(s) == 1  # dup は作られない
         and "もう予約してる" in r_dup and "ゴールが空" in r_empty
-        and guarded and "今引き受けたばかり" in r_guard  # 自己取消ガード
+        and guarded and "引き受けたばかり" in r_guard and r_guard.startswith("（")  # 自己取消ガード（報告される＝「（」始まり）
         and t.what == "" and t.goal == "30秒後に時刻を教えて"  # goal タスク
         and cancelled and "取り消した" in r_cancel and t.goal in r_cancel  # 空名でなく goal 名で報告(RC4)
         and del_cap.mutates_state is True and del_cap.report_result is False

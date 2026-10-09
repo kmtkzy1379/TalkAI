@@ -16,8 +16,8 @@ from __future__ import annotations
 import logging
 from typing import Optional
 
-from ..clock import now_mono
 from ..context_assembler import Turn
+from ..emotion import span_end_epoch
 from ..model_registry import ModelRegistry
 from ..text_match import strip_ungrounded_foreign
 from .parser import FeedbackResult, parse_feedback
@@ -119,7 +119,7 @@ def sanitize_result(r: FeedbackResult, source: str) -> FeedbackResult:
         prediction_diff=r.prediction_diff,
         reason=clean(r.reason),
         topic_tags=tags,
-        emotion_label=r.emotion_label,  # ラベル（喜怒哀楽笑い）は使う側が確かめる
+        emotion_values=dict(r.emotion_values),  # 数値（喜怒哀楽笑い）は parser で整えてある
     )
     if dropped:
         logger.warning("内省に会話と無関係な別言語が混入→除去: %s", " / ".join(dropped[:5]))
@@ -141,7 +141,7 @@ class FeedbackLLM:
         self._rag = rag_store
         self._state = prediction_state or PredictionState()
         # S5 任意: イブの今の感情（`eve/emotion.py` の EmotionState）。あれば今の感情を入力に添え、
-        # 出力の emotion_label で更新する。None なら従来と同じ文面・同じ挙動
+        # 出力の emotion_values（5つの数値）で更新する。None なら従来と同じ文面・同じ挙動
         self._emotion = emotion_state
 
     @property
@@ -156,11 +156,12 @@ class FeedbackLLM:
         if not turns:
             return None
         emo = self._emotion
-        # 振り返りに使う会話と今の感情は、この時点のもの（届くまでにユーザが話して感情が新しくなって
-        # いたら、この結果では上書きしない＝`EmotionState.note` の as_of）
-        as_of = now_mono()
+        # 感情の判定の時点＝振り返った会話の最後の発話の時刻（2026-10-09）。以前は「この内省を始めた今」にしていて、
+        # 起動時に前回の取りこぼし分（10日前の会話）を振り返った結果が「今の感情」として使われていた。会話の時点にすれば
+        # 経過の分だけ薄れ（`EmotionState.values`）、届くまでにユーザが話して感情が新しくなっていたら上書きもしない
+        as_of = span_end_epoch(turns)
         messages = build_messages(turns, self._state.last_prediction, with_emotion=emo is not None,
-                                  current_emotion=emo.label if emo is not None else None,
+                                  current_emotion=emo.brief() if emo is not None else None,
                                   persona=self._persona)
         try:
             resp = await self._registry.complete("feedback", messages)
@@ -176,8 +177,8 @@ class FeedbackLLM:
         # D1: スパン末尾の iso を渡す（チャンクの時刻は書込時刻ではなく対象会話の時刻）。
         if not await self._apply(result, turns[-1].stamp.iso):
             return None  # RAG 未保存 → state 据え置き・同スパンを次 run で再試行
-        if emo is not None and result.emotion_label:
-            emo.note(result.emotion_label, source="feedback", as_of=as_of)
+        if emo is not None and result.emotion_values:
+            emo.note(result.emotion_values, source="feedback", as_of=as_of)
         return result
 
     async def _apply(self, result: FeedbackResult, span_end_iso: str) -> bool:

@@ -293,5 +293,25 @@ _st8.set("好き", "色", "藍色")
 _async(_run(_m8, [_turn("eve", "藍色はもう好きじゃないかも。", "2026-08-15T00:00:01+00:00")], _st8))
 check("remove で消える", _st8.values("好き", "色") == [])
 
+# 保存先は起動した場所に依らずリポジトリ基準（会話・記憶・タスクと同じ）。以前は cwd 基準で、
+# 別のフォルダから起動すると好みの台帳だけ別の場所に新しく作られ、前回の好みを忘れたように見えた
+from pathlib import Path as _P  # noqa: E402
+
+_repo = _P(__file__).resolve().parent.parent
+_cwd = os.getcwd()
+_away = tempfile.mkdtemp(prefix="eve_cwd_")
+try:
+    os.chdir(_away)  # わざと別の場所から
+    _rel = SelfModelStore("self_model_path_check_never_written.jsonl")
+    check("相対パスはリポジトリ基準で解決（起動した場所に依らない）",
+          _P(_rel.path) == _repo / "self_model_path_check_never_written.jsonl", f"{_rel.path}")
+    check("読むだけでは何も作らない", not (_repo / "self_model_path_check_never_written.jsonl").exists()
+          and not _P(_away, "self_model_path_check_never_written.jsonl").exists())
+    _abs = os.path.join(_away, "abs.jsonl")
+    check("絶対パスはそのまま", SelfModelStore(_abs).path == _abs)
+    check("保存しない時は None", SelfModelStore().path is None)
+finally:
+    os.chdir(_cwd)
+
 print(f"\n合計: PASS {_passed} / FAIL {_failed}")
 sys.exit(1 if _failed else 0)

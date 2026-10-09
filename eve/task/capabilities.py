@@ -142,7 +142,8 @@ def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resol
             # 断る文は必ず「（」始まり: dispatcher は report_result=False の能力の戻り値を
             # `content.startswith("（")` でしか報告しない（`function_dispatcher.py:100,111`）。
             # 付け忘れると「やっとくね」と言った直後に依頼だけ黙って消える。
-            return f"（{int(MAX_WHEN_SEC // 60)}分より先の予約はまだ受けられないよ）"
+            # 文面はイブの台詞にしない（事実だけ。言い方は応答LLM が性格の口調で決める・2026-10-09）
+            return f"（受け付けられなかった。予約は{int(MAX_WHEN_SEC // 60)}分先までしか受け付けられない）"
         when = _iso_in(secs)
         # 重複判定を先に置く: 同じ goal の再委譲には専用の文言がある（RC2）。1件制の一般文より
         # 正確で、かつ**そのタスクは実在して報告される**ので黙っていても実害が無い。
@@ -161,9 +162,11 @@ def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resol
         holder, state = _slot_holder()
         if holder is not None:
             name = _display_name(holder)
+            # 例文は入れない（2026-10-09 ユーザ「例文などで決まり文句や定型文は使わせたくない」・旧例文はタメ口で、
+            # 性格の丁寧語と口調が食い違っていた）。何を伝えるかだけを書き、言い方は応答LLM に任せる
             return (f"（受け付けられなかった。今は「{name[:40]}」を{state}。"
                     f"**さっき引き受けるように言っていたら、ここで必ず訂正する**"
-                    f"（例:「ごめん、今『{name[:20]}』をやってて、それはまだ受けられないんだ」）。"
+                    f"（今何をしているので、この依頼はまだ受けられないと伝える）。"
                     # この依頼はどこにも保存されていない。「あとでやる」と言わせると必ず破る
                     # （実測 2026-08-07 e15_run3 で 2/2 が「終わったら調べるね」と言った）。
                     # ユーザに言い直してもらうのが唯一の確実な引き継ぎ手段。
@@ -189,7 +192,7 @@ def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resol
         # 1件制では候補が常に1件＝この cancel は必ず生まれたてのタスクに当たるので、照合ではなく
         # **時間差**で弾く。ユーザの本物の取消は音声再生後＝必ず次ターンなので巻き込まない。
         if last_add["mono"] and time.monotonic() - last_add["mono"] < SELF_CANCEL_GUARD_SEC:
-            return "（今引き受けたばかりだから、取り消しはしないでおくね）"
+            return "（取り消さなかった。直前に引き受けたばかりのタスクだったため）"
         if cancel_resolver is not None:
             # 本番: タスク側(CancelResolver)がファジー解決＋報告する（非同期）。ここは受付けるだけ。
             cancel_resolver.submit(reference)
@@ -197,7 +200,7 @@ def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resol
         # フォールバック(resolver 未接続・主にテスト): 直近未終了を即キャンセル。
         actives = [t for t in store.list_all() if t.status in (PENDING, RUNNING)]
         if not actives:
-            return "（今は取り消せる予約タスクは無いよ）"
+            return "（取り消せる予約タスクは無かった）"
         t = actives[-1]
         store.set_status(t.task_id, CANCELLED)
         return f"予約していた「{_display_name(t)}」を取り消したよ。"
@@ -229,7 +232,7 @@ def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resol
             "goal": {"type": "string", "description": "達成/報告したいこと（自然文・ユーザの言い回しを保つ）"},
             "when_seconds": {"type": "integer", "description": "何秒後に始めるか（省略=すぐ）"},
             # 応答LLM が本文を書かずにツールだけ返したターンは、定型の「やっとくね。」の代わりにこれを言う
-            # （`response/orchestrator.py` の `_ack_from_tools`・ユーザ採用 2026-09-29）
+            # （`response/orchestrator.py` の `_reply_from_tools`・ユーザ採用 2026-09-29・定型の相槌は 2026-10-09 に撤去）
             "reply": {"type": "string",
                       "description": "ユーザに今すぐ返す短い一言（依頼の中身に合わせた自然な話し言葉・毎回同じ言い方にしない）"},
         },
@@ -243,7 +246,15 @@ def register_task_capabilities(registry: CapabilityRegistry, store, cancel_resol
     registry.register(Capability(
         name="cancel_task",
         description="タスクの取り消し。『キャンセルして』『やっぱりいい』等と言われたら、ユーザの言い回しを"
-                    "reference にそのまま入れて1回呼ぶ（どのタスクかはタスク側が判断する）。",
-        params_schema={"reference": {"type": "string", "description": "取り消したいタスクのユーザの言い回し（省略可）"}},
+                    "reference にそのまま入れて1回呼ぶ（どのタスクかはタスク側が判断する）。"
+                    "呼ぶ時は、取り消しを受けたことを短い一言で返す（毎回同じ言い方にしない）。",
+        params_schema={
+            "reference": {"type": "string", "description": "取り消したいタスクのユーザの言い回し（省略可）"},
+            # 2026-10-09: 定型の「確認するね。」を撤去したら、応答LLM（Gemini）は cancel_task だけを返して何も言わなかった
+            # （2/2・`tools/prompt_eval/delegate_check.py`）。delegate_task と同じく、言う一言を引数で必ず書かせる
+            "reply": {"type": "string",
+                      "description": "ユーザに今すぐ返す短い一言（取り消しを受けた自然な話し言葉・毎回同じ言い方にしない）"},
+        },
         handler=_cancel_task, mutates_state=True, report_result=False,  # 実結果は CancelResolver が報告
+        required=("reply",),
     ))

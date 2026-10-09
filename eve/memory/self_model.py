@@ -47,11 +47,15 @@ import os
 import re
 import unicodedata
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 from ..clock import Stamp
 
 logger = logging.getLogger(__name__)
+
+# 相対パスはリポジトリ基準（会話・記憶・タスクと同じ。起動した場所に依らない）
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
 # 極性（**閉じた2値**）。表示は「{極性}な{対象}」＝「好きな食べ物」「苦手な食べ物」。
 POLARITIES: tuple[str, ...] = ("好き", "苦手")
@@ -103,12 +107,21 @@ class SelfModelStore:
     """(極性, 対象) → 値（最大2件）。loop 単一所有・ロックなし（他サイドカーと同じ前提）。"""
 
     def __init__(self, path: Optional[str] = None) -> None:
+        # 相対パスはリポジトリ基準で解決する（以前は起動した場所＝cwd 基準で、別のフォルダから起動すると
+        # 好みの台帳だけ別の場所に新しく作られ、前回の好みを忘れたように見えた）
+        if path and not Path(path).is_absolute():
+            path = str(_REPO_ROOT / path)
         self._path = path
         self._slots: dict[tuple[str, str], Slot] = {}
         if path:
             self._load()
 
     # --- 読み取り ---------------------------------------------------------
+
+    @property
+    def path(self) -> Optional[str]:
+        """保存先（リポジトリ基準で解決済み・保存しない時は None）。"""
+        return self._path
 
     def __len__(self) -> int:
         return sum(len(s.facts) for s in self._slots.values())

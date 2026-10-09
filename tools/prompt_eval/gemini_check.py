@@ -152,7 +152,7 @@ async def decide_part(vl, results):
 
 
 def summarize(results, scenes):
-    from eve.response.orchestrator import _says_cannot
+    from .refusal_words import says_cannot as _says_cannot
 
     from .analyze_round3 import ASKBACK, CANT_WORDS
 

@@ -19,17 +19,34 @@ import logging
 from typing import Optional
 
 from ..context_assembler import OMITTED_SPEAKER, Turn
-from ..stt.askback import ASK_BACK_FALLBACK, ASK_BACK_LINES, UNINTELLIGIBLE_PLACEHOLDER
+from ..stt.askback import UNINTELLIGIBLE_PLACEHOLDER
 from .feedback_llm import FeedbackLLM
 
 logger = logging.getLogger(__name__)
 
-_ASKBACK_TEXTS = frozenset(ASK_BACK_LINES) | {ASK_BACK_FALLBACK, UNINTELLIGIBLE_PLACEHOLDER}
+
+def _is_unheard(t: Optional[Turn]) -> bool:
+    return t is not None and t.speaker == "user" and t.text == UNINTELLIGIBLE_PLACEHOLDER
 
 
-def _is_askback_turn(t: Turn) -> bool:
-    """聞き取り失敗のプレースホルダ、またはその定型の聞き返しか。"""
-    return t.text in _ASKBACK_TEXTS
+def _askback_only(span: list[Turn], before: Optional[Turn] = None) -> bool:
+    """聞き取れなかった発話と、その直後のイブの返事だけのスパンか（RAG に入れない・ユーザ裁定 2026-08-15）。
+
+    返事はイブ自身の言葉（決まり文句は 2026-10-09 に撤去）なので、文字ではなく**並び**で見分ける:
+    ユーザ側はすべて「聞き取れなかった発話」、イブ側はすべてその直後の発話。`before` はスパンの直前のターン
+    （返事だけが次のスパンに入った時＝前のスパンの内省中に聞き返しが始まった時も、返事と分かるように）。
+    """
+    if not span:
+        return False
+    prev = before
+    for t in span:
+        if t.speaker == "user":
+            if not _is_unheard(t):
+                return False
+        elif not _is_unheard(prev):
+            return False  # 聞き取れなかった発話の直後ではないイブの発話（自発発話・別の話の続き）
+        prev = t
+    return True
 
 
 class FeedbackWorker:
@@ -95,6 +112,24 @@ class FeedbackWorker:
             except Exception:  # サイドカーの失敗で worker を殺さない
                 logger.exception("FeedbackWorker 処理で例外（継続）")
 
+    def _turn_before(self, watermark: Optional[str]) -> Optional[Turn]:
+        """watermark（前回内省したスパンの末尾）のターン＝今回のスパンの直前（無ければ None）。"""
+        if not watermark:
+            return None
+        before = None
+        try:
+            for t in self._cache.turns_since(None):
+                if t.speaker == OMITTED_SPEAKER:
+                    continue
+                if t.stamp.iso <= watermark:
+                    before = t
+                else:
+                    break
+        except Exception:
+            logger.exception("直前のターンの取得に失敗（無しとして続行）")
+            return None
+        return before
+
     async def _process_once(self) -> None:
         span = self._cache.turns_since(self._state.watermark)
         # 値コピー（live deque を渡さない）+ 省略マーカ除去
@@ -107,7 +142,7 @@ class FeedbackWorker:
         # RAG に増やすと検索を汚し、無言時の「話題の種」(RAG_RANDOM_K) として引かれる。
         # 会話履歴には残す（聞き返しの原因を消さないため）が、長期記憶には入れない
         # ＝ユーザ裁定 2026-08-15。**watermark は進める**（同じスパンを永久に再試行しない）。
-        if all(_is_askback_turn(t) for t in snapshot):
+        if _askback_only(snapshot, self._turn_before(self._state.watermark)):
             self._state.watermark = snapshot[-1].stamp.iso
             return
         new_watermark = snapshot[-1].stamp.iso  # 読んだ時点の最新（以後の新着は次サイクル）

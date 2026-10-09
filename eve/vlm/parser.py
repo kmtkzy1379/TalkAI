@@ -3,8 +3,13 @@
 `feedback/parser.py` と同方針: 小モデルの出力は崩れがちなので JSON でなく**タグ付きテキスト
 regex**でフィールド抽出し、**決して raise しない**（全フィールド安全既定・全角コロン `：` 許容）。
 
-A11（ハルシネ防止）: モデルが黒/判読不能と言ったら `visible=False`。本文に「視認不可」等が
-あれば本文有無に関わらず不可視扱い（中身を捏造させない）。
+A11（ハルシネ防止）: モデルが `visible: no`（画面全体を読み取れなかった）と返したら `visible=False`
+（中身を採用しない・捏造させない）。
+
+本文の語（「見えない」「判読不能」等）では判定しない（2026-10-09 ユーザ「キーワードで説明文破棄をやめる。
+そもそもここの仕組みを消す」）。画面認識の指示は「分からない所は、どこがどう分からないかを正直に言う」
+（`narrator.py` の VLM_SYSTEM）なので、本文に「右下の字幕は判読不能」と書くのは正しい振る舞いで、
+それを語で拾うと、読めていた残りの説明ごと捨てて「画面を取得できませんでした」に置き換えていた。
 """
 from __future__ import annotations
 
@@ -13,8 +18,6 @@ from typing import Optional
 
 from .types import VisionResult
 
-# 視認不可を表す語（本文 or visible タグ値に現れたら不可視扱い）。
-_INVISIBLE_MARKERS = ("視認不可", "判読不能", "見えない", "取得できません", "真っ黒", "not visible", "unreadable")
 _NEGATIVE = ("no", "false", "いいえ", "不可", "低", "なし", "0")
 
 _NARR_ALIASES = ("narration", "ナレーション", "実況", "描写", "説明")
@@ -22,9 +25,6 @@ _NOTABLE_ALIASES = ("notable", "notability", "注目", "重要", "言及")
 _VISIBLE_ALIASES = ("visible", "視認", "見える")
 _DIFF_ALIASES = ("surprise", "surprise_diff", "予測差", "驚き")
 _PRED_ALIASES = ("prediction", "予想", "次の予想")
-# 予想の行（視認不可の語の判定から外す。「動画が見えない位置へ流れそう」のような**未来の予想**で
-# 今の画面を視認不可扱いにしない）
-_PRED_LINE = re.compile(r"^\s*(?:prediction|予想|次の予想)\s*[:：].*$", re.IGNORECASE | re.MULTILINE)
 
 
 def _extract_line(text: str, aliases: tuple[str, ...]) -> str:
@@ -60,14 +60,10 @@ def _truthy(value: str, default: bool) -> bool:
 def parse_vision(text: Optional[str]) -> VisionResult:
     """タグ付きテキストを VisionResult に。raise しない・安全既定。"""
     text = text or ""
-    lower = _PRED_LINE.sub("", text).lower()
     narration = _extract_line(text, _NARR_ALIASES) or ""
 
-    visible_raw = _extract_line(text, _VISIBLE_ALIASES)
-    visible = _truthy(visible_raw, default=True)
-    # 本文/タグに視認不可マーカがあれば不可視（A11・中身を信用しない）。予想の行は見ない（今の画面の話ではない）
-    if any(m.lower() in lower for m in _INVISIBLE_MARKERS):
-        visible = False
+    # 読み取れたかはモデル自身の visible タグだけで決める（本文の語では決めない・上の注記）
+    visible = _truthy(_extract_line(text, _VISIBLE_ALIASES), default=True)
 
     notable = _truthy(_extract_line(text, _NOTABLE_ALIASES), default=False)
     diff = _extract_int(text, _DIFF_ALIASES)

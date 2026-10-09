@@ -35,6 +35,7 @@ from ..pipeline.stimulus import (
     StimulusKind,
 )
 from ..speech.decider import AutonomousSpeech
+from ..stt.askback import UNINTELLIGIBLE_PLACEHOLDER
 from .splitter import JapaneseSentenceSplitter
 from .style import SPEECH_STYLE, sanitize_for_speech
 
@@ -55,37 +56,18 @@ REDELIVER_MAX_SPOKEN_CHARS = 5
 # 再配達の上限回数（マイクノイズ等で barge-in が連発しても無限に再試行しない）。
 REDELIVER_MAX_ATTEMPTS = 2
 
-# J-2 P2-1: 機能呼び出しのみで発話ゼロの無言ターン対策（フォールバック相槌）。
-# 応答LLM(gpt-5.4-mini 系)は前置き無しで tool だけ呼ぶことがある（実測 8回中6回・
-# プロンプトの必須化だけでは治らない＝規律はコードで強制）。tool_schemas() で応答LLMに
-# 見えるのは delegate_task/cancel_task のみ（他は agent_tool 専用で tool_sink に出ない）。
-_FALLBACK_ACK = {"delegate_task": "やっとくね。", "cancel_task": "確認するね。"}
-_DEFAULT_ACK = "うん。"
-
-
-def _fallback_ack(tool_sink: list) -> str:
-    """機能呼び出しのみで発話が空だったターン用の最小限の相槌（J-2 P2-1）。"""
-    for tc in tool_sink:
-        fn = tc.get("function") if isinstance(tc, dict) else None
-        name = (fn or {}).get("name") if fn else None
-        if name in _FALLBACK_ACK:
-            return _FALLBACK_ACK[name]
-    return _DEFAULT_ACK
-
-
-# 引数の一言がこれより長い時は使わない（読み上げが長引く・中身の説明を始めている）＝定型へ
-_REPLY_MAX_CHARS = 80
-
-
-def _ack_from_tools(tool_sink: list) -> tuple[str, bool]:
-    """機能呼び出しのみで発話が空だったターンに言う一言と、それを応答LLM が書いたか。
-
-    1. `delegate_task` の `reply`（応答LLM が書いた、依頼に合った一言）
-    2. 無ければ定型（`_fallback_ack`）
+def _reply_from_tools(tool_sink: list) -> Optional[str]:
+    """機能呼び出しのみで本文が空だったターンに言う一言（`delegate_task` / `cancel_task` の `reply`＝応答LLM が書いたもの）。
+    無ければ None。
 
     ユーザ 2026-09-28「タスクやる前に｢やっとくね｣が定型文化してて機械的。出来ればその文脈にあった言い回しとかして
     欲しい」→ 2026-09-29 採用。応答LLM（gpt-6-luna）は本文を書かずにツールだけ返すことが多く（実測 6件中5件）、
     その度に定型の「やっとくね。」になっていた。ツールの引数なら書き落とさない（必須の引数・`task/capabilities.py`）。
+
+    **定型の相槌（旧「やっとくね。」「確認するね。」「うん。」）は 2026-10-09 に撤去**（ユーザ「例文などで決まり文句や
+    定型文は使わせたくない。なるべくレパートリー多く自由に」・性格は丁寧語なのに定型だけタメ口で口調が崩れていた）。
+    本文も reply も無いターンは何も言わない（`handle` が警告を残す＝実機でどれくらい起きるか追える）。
+    長さでは切らない（応答LLM が書いた一言なので、無言にするより言う方がよい）。
     """
     for tc in tool_sink:
         fn = tc.get("function") if isinstance(tc, dict) else None
@@ -96,9 +78,9 @@ def _ack_from_tools(tool_sink: list) -> tuple[str, bool]:
         except (TypeError, ValueError):
             continue
         reply = args.get("reply") if isinstance(args, dict) else None
-        if isinstance(reply, str) and reply.strip() and len(reply.strip()) <= _REPLY_MAX_CHARS:
-            return reply.strip(), True
-    return _fallback_ack(tool_sink), False
+        if isinstance(reply, str) and reply.strip():
+            return reply.strip()
+    return None
 
 
 # 応答の二重化の関門（`handle._emit`）: この文字数以上の節が同じ応答の中でもう一度出たら「2回目に入った」とみなす。
@@ -114,27 +96,12 @@ def _repeat_key(clause: str) -> str:
     return _REPEAT_TAIL.sub("", _REPEAT_IGNORE.sub("", clause or ""))
 
 
-# 「できない」と言ったのに同じ返事で delegate_task も出す矛盾の関門（2026-10-01・ユーザ「不可能作業はタスク依頼しないで。
-# その場でなんでできないか説明させたい。できないこと引き受けるのはハルシネーション」）。実測（`tools/prompt_eval/`）:
-# プロンプトに「できないと伝えた依頼で delegate_task を呼ばない」と書いても、「予約できるのは1時間先までなんだ。明日の朝7時には
-# 起こせないよ」＋委譲（when=3600）、「予定表は確認できないんだ」＋予定を調べる委譲、が出た。言った内容の方を正とし、委譲を捨てる。
-_CANNOT = re.compile(
-    r"(?:でき|行え|起こせ|入れられ|送れ|見られ|見れ|鳴らせ|使え|扱え|触れ|届け)(?:ない|ません)"
-    r"|手段(?:は|が|を)?(?:持って)?(?:い)?ない|手段(?:は|が)?無い|機能(?:は|が)?(?:ない|無い)"
-)
-# 断った上で別の手を引き受けている返事は矛盾ではない（「ドラマを見ることはできないんだ。タイトルは知らないから、ちょっと
-# 調べてみるね」「アラームで起こす機能はないんだ。30分後に通知する予約ならできるけど」）。ここで委譲を捨てると
-# 「調べてみるね」が**破られる約束**になり、矛盾より悪い。引き受けの言い方（〜てみるね・〜しておくね・〜調べるね・
-# 〜しようか・〜ならできる・〜話せるよ）があれば止めない。実測（記録済み 452委譲・声にした文で判定）: 断りの語を含む16件のうち、
-# 引き受けの語を含む6件はすべて正しい委譲（知らないドラマの検索・30分後の通知・手元の情報を探す）、含まない10件はすべて
-# 手段の無い依頼（エアコン・メール・明日の朝7時・予定表）。
-_COMMIT = re.compile(r"[るく]ね|(?:よう|そう)か|ならできる|[せれ]るよ")
-
-
-def _says_cannot(text: str) -> bool:
-    """返事が「それはできない」で終わっていて、別の手も引き受けていないか（delegate_task と矛盾する断り）。"""
-    t = text or ""
-    return bool(_CANNOT.search(t)) and not _COMMIT.search(t)
+# 「できない」と言ったのに同じ返事で delegate_task も出す矛盾は、**指示で止める**（`context_assembler` の
+# 「手段の無いことは delegate_task にも回さない…できないと伝えた依頼で delegate_task を呼ばない」）。以前は返事の語
+# （〜できない・〜てみるね 等）で委譲を捨てる関門（`_says_cannot`）があったが、2026-10-09 に撤去した（ユーザ「そもそも
+# タスクLLMに依頼出してるのは応答AIだから。指示で制御してみる。無理そうなら Jev で判定させる」）。語の一覧は性格の口調
+# （10/05 から丁寧語）が変わると当たらなくなり、「ドラマは見られないんですけど、調べてみますね」の委譲まで捨てて、
+# 言ったのに調べない状態を作っていた。撤去後の実測（Gemini）で食い違いは 0（手段の無い依頼 26/26 で委譲しない）。
 
 
 def _render_recent(turns: Optional[list]) -> str:
@@ -515,6 +482,8 @@ class ResponseOrchestrator:
                 elif stimulus.kind == StimulusKind.CALLFUNCTION_RESULT and isinstance(stimulus.payload, CallFunctionResult):
                     # 機能実行結果は **content** で関連記憶を引く（payload の repr 文字列で検索しない）。
                     rag_chunks = await self._rag.search(stimulus.payload.content)
+                elif str(stimulus.payload) == UNINTELLIGIBLE_PLACEHOLDER:
+                    pass  # 聞き取れなかった発話＝中身が無いので連想する記憶も無い（代替の文字で検索しない）
                 else:
                     rag_chunks = await self._rag.search(str(stimulus.payload))
             except asyncio.CancelledError:
@@ -615,7 +584,7 @@ class ResponseOrchestrator:
                 # on_played は「実際に再生し終えた時」だけ呼ばれる → spoken に積む（C5）。
                 self._audio.enqueue(gen, seq, wav, text=sentence, on_played=spoken.append)
 
-        def _emit(sentence: str, *, auto: bool = False) -> None:
+        def _emit(sentence: str) -> None:
             nonlocal repeating
             clean = sanitize_for_speech(sentence)  # 残留マークダウン除去（コードゲート）
             if not clean or repeating:
@@ -631,9 +600,7 @@ class ResponseOrchestrator:
                 logger.warning("🔁 応答が同じ内容を繰り返し始めた→以降は読み上げない: %.30s", clean)
                 return
             said_keys.add(key)
-            # J-2 P2-1: auto=True(コード生成のフォールバック相槌)はログタグで区別する
-            # （発話内容・記憶には印を付けない＝会話文脈を汚さない。デバッグ識別専用）。
-            logger.info("🤖(auto-ack) %s" if auto else "🤖 %s", clean)
+            logger.info("🤖 %s", clean)
             parts.append(clean)
             seq = self._audio.reserve_seq(gen)  # stream 順に予約（再生は seq 昇順）
             tasks.append(asyncio.create_task(_tts_and_enqueue(seq, clean)))
@@ -665,16 +632,18 @@ class ResponseOrchestrator:
                 # A3: LLM/stream の一時エラーは起こりうる → ログして途中までで打ち切り、継続。
                 logger.exception("応答生成中にエラー（途中までで打ち切り）")
             if stream_complete and tool_sink and not parts:
-                # J-2 P2-1: 機能を呼びつつ発話ゼロで終わったターンへの最小限のフォールバック
-                # （barge-in等で stream_complete=False の時は追加しない＝古い世代を起こさない）。
-                # 応答LLM が引数に一言（reply）を書いていればそれを言う（「、」「。」で区切るのは本文と同じ）
-                ack, from_llm = _ack_from_tools(tool_sink)
-                if from_llm:
-                    ack_splitter = JapaneseSentenceSplitter()
-                    for sentence in ack_splitter.feed(ack) + ack_splitter.flush():
+                # 機能を呼びつつ本文ゼロで終わったターン: 応答LLM が引数に書いた一言（reply）を言う
+                # （「、」「。」で区切るのは本文と同じ。barge-in等で stream_complete=False の時は言わない＝
+                # 古い世代を起こさない）。定型の相槌は使わない（`_reply_from_tools` の注記）。
+                reply = _reply_from_tools(tool_sink)
+                if reply:
+                    reply_splitter = JapaneseSentenceSplitter()
+                    for sentence in reply_splitter.feed(reply) + reply_splitter.flush():
                         _emit(sentence)
                 else:
-                    _emit(ack, auto=True)
+                    names = [((tc.get("function") or {}) if isinstance(tc, dict) else {}).get("name") for tc in tool_sink]
+                    logger.warning("🤐 機能を呼んだが何も言わなかった（本文も reply も無い）: %s",
+                                   ",".join(n or "?" for n in names))
             if tasks:
                 await asyncio.gather(*tasks, return_exceptions=True)
             self.last_response = "".join(parts)
@@ -691,15 +660,6 @@ class ResponseOrchestrator:
             # F4: 正常完了時のみ feedback をトリガ（barge-in=CancelledError 経路では呼ばない）。
             # 直近の eve ターンが記録された後なので、worker のスパンに今回応答が含まれる。
             self._notify_complete()
-            # 「できない」と言った返事では委譲しない（言った内容を正とする・`_says_cannot` の注記）。
-            # 声にした文（本文。空なら reply）で判定する。cancel_task は触らない（取り消しは断りと両立する）。
-            if tool_sink and _says_cannot(self.last_response):
-                dropped = [tc for tc in tool_sink
-                           if ((tc.get("function") or {}) if isinstance(tc, dict) else {}).get("name") == "delegate_task"]
-                if dropped:
-                    tool_sink = [tc for tc in tool_sink if tc not in dropped]
-                    logger.warning("🚫 「できない」と言った返事の委譲を捨てた（%d件）: %.40s",
-                                   len(dropped), self.last_response)
             # J Call-Function: 応答完了後に tool_calls を実行へ submit（O(1)・非ブロッキング＝Eve は即解放）。
             # 実行は背景サイドカーで進む。barge-in(CancelledError)経路はここに到達しない＝submit しない。
             if tool_sink and self._dispatcher is not None:

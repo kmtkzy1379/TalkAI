@@ -85,7 +85,7 @@ async def run() -> int:
                     r = await vl.registry.complete("feedback", msgs)
                     text = r.choices[0].message.content or ""
                     fb = parse_feedback(text)
-                    row[f"fb_{tag}"] = {"label": fb.emotion_label, "emotion": fb.emotions, "summary": fb.summary,
+                    row[f"fb_{tag}"] = {"values": fb.emotion_values, "emotion": fb.emotions, "summary": fb.summary,
                                         "pred": fb.next_prediction}
                 except Exception as e:  # noqa: BLE001
                     row[f"fb_{tag}"] = {"error": str(e)[:150]}

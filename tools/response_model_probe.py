@@ -146,7 +146,8 @@ async def run(args) -> int:
         if vl.emotion is not None:
             vl.emotion = EmotionState()
             if tu["emotion"]:
-                vl.emotion.note(tu["emotion"], source="probe", as_of=time.monotonic())
+                v = tu["emotion"]  # 記録のラベルは「はっきり」＝50 として渡す（2026-10-09 から感情は5つの数値）
+                vl.emotion.note({v: 50} if isinstance(v, str) else v, source="probe", as_of=time.time())
             orch._emotion_provider = vl.emotion.describe
         orch._filler_provider = (lambda f=tu["filler"]: f)
         stim = Stimulus(kind=StimulusKind.USER_UTTERANCE, payload=tu["text"])

@@ -208,6 +208,26 @@ try:
         return during_speech == 0 and after == 1 and aborted == 1 and len(vl._redeliver_waiters) == 0
 
     check("再配達WHEN: 発話中は待機→解除+猶予後に投入 / abort で中止 / waiter 自己除去", _aio.run(_w2()))
+
+    # 自己モデル（好みの台帳）は**空で起動しても**応答と TaskAgent に配線する（2026-10-09）。台帳は len を持つので
+    # `if self.self_model` だと空の時に偽になり、その起動中に好みが書かれても渡らなかった
+    import tempfile as _tf  # noqa: E402
+
+    from eve.config import Config as _C2  # noqa: E402
+    _sm_saved = (_C2.SELF_MODEL_ENABLED, _C2.SELF_MODEL_FILE)
+    try:
+        _C2.SELF_MODEL_ENABLED = True
+        _C2.SELF_MODEL_FILE = os.path.join(_tf.mkdtemp(prefix="eve_sm_"), "self_model.jsonl")  # 空の台帳
+        _vl3 = VoiceLoop()
+        _empty = len(_vl3.self_model) == 0 and _vl3.orchestrator._self_model_fn is not None
+        _vl3.self_model.set("好き", "色", "藍色")
+        _later = "藍色" in (_vl3.orchestrator._self_model_fn() or "")
+        _task_ok = (_vl3.task_executor is None
+                    or getattr(getattr(_vl3.task_executor, "_agent", None), "_self_model_fn", True) is not None)
+        check("自己モデル: 空の台帳で起動しても応答に配線（起動中に書かれた好みが次の応答から届く）",
+              _empty and _later and _task_ok)
+    finally:
+        _C2.SELF_MODEL_ENABLED, _C2.SELF_MODEL_FILE = _sm_saved
 except Exception as e:  # 構築自体が落ちたら配線ドリフト＝即失敗
     check(f"VoiceLoop 構築で例外: {e!r}", False)
 

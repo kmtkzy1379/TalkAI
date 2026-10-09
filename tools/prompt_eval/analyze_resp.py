@@ -36,7 +36,7 @@ REACTION = re.compile(r"えっ|え、|えー|まじ|マジ|うそ|ウソ|本当|
 
 
 def spoken(r: dict) -> str:
-    """実際に声になる文（本文が空でツールだけなら delegate_task の reply＝本番の _ack_from_tools）。"""
+    """実際に声になる文（本文が空でツールだけなら delegate_task の reply＝本番の _reply_from_tools）。"""
     t = (r.get("text") or "").strip()
     if t:
         return t

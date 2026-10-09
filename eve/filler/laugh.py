@@ -11,6 +11,9 @@
   閾値 0.9 で 笑った所の23%を拾い・笑わなかった所の7%で笑う＝話の途中）
 
 判定の呼び出しは `ModelRegistry` の `laugh_judge` 役（既定 gpt-6-luna）。
+
+性格（persona.md）も渡す（2026-10-09 ユーザ「笑い判定にも同じ性格を与える」）。応答・感情判定・フィードバックは
+同じ性格で判断しているのに笑い判定だけ知らないと、ブラックジョークで「感情は笑い」なのに笑わない、が起こりうる。
 """
 from __future__ import annotations
 
@@ -29,9 +32,14 @@ BOUNDARY = "、。？！?!"
 
 JudgeFn = Callable[[list, str], Awaitable[float]]
 
+PERSONA_HOW = "笑うかどうかは、この性格のイブとして判定する"
 
-def laugh_messages(context_lines: list, said: str) -> list:
-    return [{"role": "system", "content": "yes か no の1語だけで答える。"},
+
+def laugh_messages(context_lines: list, said: str, *, persona: str = "") -> list:
+    """persona（`load_persona()` の文字列）があれば system の最後に性格を添える（感情判定・フィードバックと同じ形）。"""
+    from ..persona import persona_for
+
+    return [{"role": "system", "content": "yes か no の1語だけで答える。" + persona_for(persona, PERSONA_HOW)},
             {"role": "user", "content": "直前の会話:\n" + ("\n".join(context_lines) or "（なし）")
              + f"\n\n相手が今話している途中の内容:\n{said}\n\n"
              + f"判定: {QUESTION}。そうなら yes、違うなら no。"}]
@@ -57,12 +65,12 @@ def yes_probability(resp) -> float:
     return py / (py + pn) if (py + pn) > 0 else 0.0
 
 
-def make_judge_fn(registry) -> JudgeFn:
+def make_judge_fn(registry, *, persona: str = "") -> JudgeFn:
     async def judge(context_lines: list, said: str) -> float:
         # reasoning_effort=none は実測と同じ条件（約0.6〜0.8秒）。litellm は gpt-6-luna がこの引数を
         # 受けることを知らず弾く（UnsupportedParamsError・実測 2026-09-26）ので、通すことを明示する。
         r = await registry.complete(
-            "laugh_judge", laugh_messages(context_lines, said),
+            "laugh_judge", laugh_messages(context_lines, said, persona=persona),
             logprobs=True, top_logprobs=5, reasoning_effort="none", max_completion_tokens=5,
             allowed_openai_params=["reasoning_effort"])
         return yes_probability(r)

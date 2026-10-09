@@ -9,7 +9,7 @@
   [1] 鳴っている途中にユーザが話し出す → その節は言い切り、次の節は鳴らない・記憶は鳴った節まで
   [2] ユーザが話している途中にイブの音が鳴り始める → 最初の節を言い切って譲る（割り込みのかけ直し）
   [3] ユーザが話していなければ最後まで話す
-  [4] 聞き返しの決まり文句も節ごとに鳴らす（割り込まれたら、その節で譲る）
+  [4] （欠番: 聞き返しの決まり文句は 2026-10-09 に撤去＝聞き返しも応答と同じ経路で [1]〜[3] の振る舞い）
   [5] 「今まさに話しているか」は VAD の発話区間（発話開始の確定〜SILENCE_LIMIT の無音まで）
 
 実行: $env:PYTHONIOENCODING="utf-8"; python tests\\test_barge_in.py
@@ -63,7 +63,7 @@ CHUNKS = 10  # 1節 = 10チャンク（1チャンク 5ms）
 
 
 class Rig:
-    """VoiceLoop の割り込みまわり（`_barge_in` / `_yield_if_user_speaking` / `_speak_canned`）を
+    """VoiceLoop の割り込みまわり（`_barge_in` / `_yield_if_user_speaking`）を
     本物のメソッドのまま、周り（マイク・応答の実行役・TTS）だけ偽物にして組む。"""
 
     def __init__(self) -> None:
@@ -89,9 +89,6 @@ class Rig:
 
     def _yield_if_user_speaking(self) -> None:
         VoiceLoop._yield_if_user_speaking(self)
-
-    async def speak_canned(self, text: str) -> None:
-        await VoiceLoop._speak_canned(self, text)
 
     # --- 偽物 ---
     def _cancel(self) -> None:
@@ -211,36 +208,6 @@ def t_yield_guard() -> None:
     check("例外を外に出さない・割り込まない", ok and rig.whys == [], f"{rig.whys}")
 
 
-def t_canned() -> None:
-    print("\n[4] 聞き返しの決まり文句も節ごとに鳴らす")
-    line = "ごめん、今の聞き取れなかった。もう一回言ってくれる？"
-
-    async def run() -> None:
-        rig = Rig()
-        worker = asyncio.create_task(rig.audio.play_worker())
-        await rig.speak_canned(line)
-        await rig.settle()
-        check("節ごとに順番どおり鳴る",
-              rig.played == ["ごめん、", "今の聞き取れなかった。", "もう一回言ってくれる？"], f"{rig.played}")
-
-        rig2 = Rig()
-
-        def onset(text):
-            if text == "ごめん、" and not rig2.whys:
-                rig2._barge_in()
-
-        rig2.on_chunk = onset
-        worker2 = asyncio.create_task(rig2.audio.play_worker())
-        await rig2.speak_canned(line)
-        await rig2.settle()
-        check("割り込まれたら、その節で譲る（言い直しに2文とも被せない）",
-              rig2.played == ["ごめん、"] and rig2.full("ごめん、"), f"{rig2.played} {rig2.chunks}")
-        worker.cancel()
-        worker2.cancel()
-
-    asyncio.run(run())
-
-
 def t_in_speech() -> None:
     print("\n[5] 「今まさに話しているか」＝ VAD の発話区間の中")
     from eve.audio_input import AudioInput, _SegmentTracker
@@ -286,7 +253,6 @@ t_onset_during_playback()
 t_start_while_user_speaking()
 t_not_speaking()
 t_yield_guard()
-t_canned()
 t_in_speech()
 print(f"\n合計: PASS {_passed} / FAIL {_failed}")
 sys.exit(1 if _failed else 0)

@@ -5,8 +5,8 @@
 
 2026-10-04 ユーザ「応答AIは Gemini に切り替えたいので報告の修正を。それでおかしな回答をしないか検証」
 - 組み立ては本番（ResponseOrchestrator._build_messages・ツール・実例は本番の StyleExamples でユーザ発話だけ）
-- 呼び方も本番と同じ（stream_with_tools・RESPONSE_REASONING_EFFORT）。喋る前の処理（sanitize_for_speech・二重化の関門・
-  「できない」矛盾の関門）も通した後の文で見る
+- 呼び方も本番と同じ（stream_with_tools・RESPONSE_REASONING_EFFORT）。喋る前の処理（sanitize_for_speech・二重化の関門）も通した後の文で見る（「できない」矛盾の関門は
+  2026-10-09 に撤去＝候補として問題の一覧に出すだけ）
 """
 from __future__ import annotations
 
@@ -76,7 +76,7 @@ def speak_like_prod(text: str) -> str:
 
 
 def problems(sc, r) -> list[str]:
-    from eve.response.orchestrator import _says_cannot
+    from .refusal_words import says_cannot as _says_cannot
 
     t = r["spoken"]
     raw = r["reply"]
@@ -100,7 +100,7 @@ def problems(sc, r) -> list[str]:
     if sc.get("kind", "user") != "user" and r["tools"]:
         p.append("報告・自律発話でツール")
     if "delegate_task" in r["tools"] and _says_cannot(t):
-        p.append("できないと言いつつ委譲（関門が捨てる）")
+        p.append("できないと言いつつ委譲の疑い（語で拾った候補・本番では止めない＝目で確かめる）")
     return p
 
 

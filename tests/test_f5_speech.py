@@ -1053,76 +1053,65 @@ async def t_input_source_stt_window_order() -> bool:
 
 
 async def t_input_source_routes_unintelligible() -> bool:
-    """日本語として受け取れない認識結果は**刺激にせず**聞き返しへ回す（ユーザ裁定 2026-08-15）。
+    """日本語として受け取れない認識結果は、生の文字を渡さず「聞き取れなかった」という事実だけを応答へ回す
+    （ユーザ裁定 2026-08-15・2026-10-09 から決まり文句ではなくイブ自身の言葉で返す）。
 
-    そのまま応答LLM に渡すと知ったかぶりの元になる（`style.py` の同趣旨の規則は
-    プロンプトなので守られないことがある＝コードで止める）。
+    生の文字を応答LLM に渡すと知ったかぶりの元になる。刺激にはする（put=True）＝応答が来るのでフィラーも止めない。
     """
     from eve.response.input_source import MicSttInputSource
+    from eve.stt.askback import UNINTELLIGIBLE_PLACEHOLDER
 
-    seen: list = []
-    understood: list = []
+    results: list = []
 
     class FakeStt:
         async def transcribe(self, pcm):
             return "오케이."  # 発音が崩れて韓国語として認識された形（実データにある）
 
-    async def on_unintelligible(text):
-        seen.append(text)
-
     q = StimulusQueue()
-    src = MicSttInputSource(q, FakeStt(),
-                            on_unintelligible=on_unintelligible,
-                            on_understood=lambda: understood.append(1))
-    src._ai = _FakeAIOnce()
-    task = asyncio.create_task(src._consume())
-    await asyncio.sleep(0.05)
-    task.cancel()
-    return seen == ["오케이."] and q.qsize() == 0 and understood == []
-
-
-async def t_input_source_normal_text_still_flows() -> bool:
-    """通常の日本語は従来どおり刺激になり、聞き取れた合図（連続カウント戻し）が出る。"""
-    from eve.response.input_source import MicSttInputSource
-
-    seen: list = []
-    understood: list = []
-
-    class FakeStt:
-        async def transcribe(self, pcm):
-            return "こんにちは"
-
-    async def on_unintelligible(text):
-        seen.append(text)
-
-    q = StimulusQueue()
-    src = MicSttInputSource(q, FakeStt(),
-                            on_unintelligible=on_unintelligible,
-                            on_understood=lambda: understood.append(1))
+    src = MicSttInputSource(q, FakeStt(), on_stt_result=results.append)
     src._ai = _FakeAIOnce()
     task = asyncio.create_task(src._consume())
     await asyncio.sleep(0.05)
     task.cancel()
     ok = q.qsize() == 1
     s = await q.get() if ok else None
-    return ok and s.payload == "こんにちは" and seen == [] and understood == [1]
+    return (ok and s.kind == StimulusKind.USER_UTTERANCE and s.payload == UNINTELLIGIBLE_PLACEHOLDER
+            and "오케이" not in s.payload and results == [True])
 
 
-async def t_input_source_unhooked_keeps_old_behavior() -> bool:
-    """フック未配線なら従来どおり（別言語でもそのまま刺激にする＝既存挙動を変えない）。"""
+async def t_input_source_normal_text_still_flows() -> bool:
+    """通常の日本語は従来どおりそのまま刺激になる。"""
     from eve.response.input_source import MicSttInputSource
+
+    results: list = []
 
     class FakeStt:
         async def transcribe(self, pcm):
-            return "오케이."
+            return "こんにちは"
 
     q = StimulusQueue()
-    src = MicSttInputSource(q, FakeStt())
+    src = MicSttInputSource(q, FakeStt(), on_stt_result=results.append)
     src._ai = _FakeAIOnce()
     task = asyncio.create_task(src._consume())
     await asyncio.sleep(0.05)
     task.cancel()
-    return q.qsize() == 1
+    ok = q.qsize() == 1
+    s = await q.get() if ok else None
+    return ok and s.payload == "こんにちは" and results == [True]
+
+
+def t_no_canned_askback_path() -> bool:
+    """決まり文句で聞き返す経路は持たない（2026-10-09 撤去・ユーザ「例文などで決まり文句や定型文は使わせたくない」
+    「（2回目のキーボードの案内は）普通に聞き取れない的なこと言えばよさそう」）。言い方は応答LLM（イブ）が決める。"""
+    import inspect
+
+    from eve.response.input_source import MicSttInputSource
+
+    params = inspect.signature(MicSttInputSource.__init__).parameters
+    from eve.voice_loop import VoiceLoop
+
+    return (not hasattr(VoiceLoop, "_ask_back") and not hasattr(VoiceLoop, "_speak_canned")
+            and "on_unintelligible" not in params and "on_understood" not in params)
 
 
 async def t_input_source_stt_window_closes_on_failure() -> bool:
@@ -1433,9 +1422,10 @@ async def main() -> None:
     check("J-2 ③-A: 窓内は monitor が発火しない", t_monitor_blocks_during_stt_pending())
     check("J-2 ③-A: 判定完了時に窓内なら破棄", await t_decider_discards_when_stt_pending_at_completion())
     check("J-2 ③-A: 窓は transcribe 前に開き put 後に閉じる", await t_input_source_stt_window_order())
-    check("聞き返し: 別言語の認識結果は刺激にせず聞き返しへ", await t_input_source_routes_unintelligible())
-    check("聞き返し: 通常の日本語は従来どおり刺激になる", await t_input_source_normal_text_still_flows())
-    check("聞き返し: フック未配線なら既存挙動のまま", await t_input_source_unhooked_keeps_old_behavior())
+    check("⭐聞き取れず: 別言語の認識結果は生の文字を渡さず「聞き取れなかった」事実だけを応答へ",
+          await t_input_source_routes_unintelligible())
+    check("聞き取れず: 通常の日本語は従来どおり刺激になる", await t_input_source_normal_text_still_flows())
+    check("⭐聞き取れず: 決まり文句で聞き返す経路を持たない（言い方はイブが決める）", t_no_canned_askback_path())
     check("J-2 ③-A: STT失敗でも窓は閉じる（固着防止）", await t_input_source_stt_window_closes_on_failure())
     # C4
     check("C4 Eve 発話で沈黙時計リセット + user_speaking トグル", t_eve_activity_resets_silence())
