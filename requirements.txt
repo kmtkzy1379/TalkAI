@@ -28,3 +28,6 @@ requests  # VOICEVOX HTTP・E2E ハーネス
 psutil  # pc_status 能力のメモリ情報（未導入でも動くが情報が減る）
 # S3 フィラー: fillers.yaml を読む（FILLER_ENABLED=1 の時だけ・遅延 import）
 PyYAML
+# Alchemy（ALCHEMY_ENABLED=1 の時だけ・遅延 import）: イブのゲーム画面をブラウザで開く。
+# ブラウザは PC の Chrome を使う（ALCHEMY_BROWSER_CHANNEL=chrome）ので `playwright install` は要らない
+playwright

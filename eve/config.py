@@ -406,6 +406,33 @@ class Config:
     # 1回だと誤クリックで居座るため（ユーザ指定 2026-08-15）。0 で保護を切る。
     TASKWIN_PROTECT_CLICKS = int(os.getenv("TASKWIN_PROTECT_CLICKS", "3"))
 
+    # Alchemy（ユーザ作のブラウザ対戦ゲーム・`eve/alchemy/`）。**機能フラグ**（既定 off）。
+    # ユーザ指定 2026-10-10「普段は入れずに、画面や会話からAlchemyをやりそうになりそうならプレイできるように準備」
+    # 「キーワード対戦でキーワード『AIバトル』として部屋作らせるor部屋に入らせる」「画面認識はAIが操作するはずの画面を
+    # 認識させる。ユーザーのPC画面は認識させない」。CALLFUNCTION_ENABLED 前提（部屋の出入りは応答AI の機能）
+    ALCHEMY_ENABLED = os.getenv("ALCHEMY_ENABLED", "0") == "1"
+    # ゲームの場所（ユーザがブラウザで開くのと同じ所。PC で動かすなら http://127.0.0.1:8000/）
+    ALCHEMY_URL = os.getenv("ALCHEMY_URL", "https://alchemy-game.fly.dev/")
+    ALCHEMY_KEYWORD = os.getenv("ALCHEMY_KEYWORD", "AIバトル")  # 合言葉の部屋
+    ALCHEMY_PLAYER_NAME = os.getenv("ALCHEMY_PLAYER_NAME", "イブ")
+    # 遊ばせ方（ユーザ案）: action＝1行動ごとに LLM が候補から選ぶ / strategy＝LLM は作戦（送りたい・減らしたい素材）
+    # だけ決め、手はコードがその作戦で打つ。どちらも LLM が締切に間に合わなければコードの手で打つ
+    ALCHEMY_PLAY_MODE = os.getenv("ALCHEMY_PLAY_MODE", "action")
+    # イブのゲーム画面を窓として出すか（既定 0＝画面なしのブラウザ。1 にするとイブの画面を横で見られる）
+    ALCHEMY_SHOW_WINDOW = os.getenv("ALCHEMY_SHOW_WINDOW", "0") == "1"
+    # イブの画面を動かすブラウザ（既定 chrome＝PC の Chrome。空なら Playwright 同梱の Chromium）
+    ALCHEMY_BROWSER_CHANNEL = os.getenv("ALCHEMY_BROWSER_CHANNEL", "chrome")
+    # 準備（ルールを会話に入れた状態）をこの秒数 Alchemy の話が無ければ解く（部屋にいる間は解かない）
+    ALCHEMY_PREPARE_TTL_SEC = float(os.getenv("ALCHEMY_PREPARE_TTL_SEC", "900"))
+    # 判断役（ModelRegistry の game 役・GAME_MODEL）の reasoning_effort（空＝渡さない）と、1回に待つ上限[秒]
+    ALCHEMY_REASONING_EFFORT = os.getenv("ALCHEMY_REASONING_EFFORT", "low")
+    ALCHEMY_MAX_THINK_SEC = float(os.getenv("ALCHEMY_MAX_THINK_SEC", "20"))
+    # 部屋でイブだけが待ってこの秒数たったら来るかを確かめ、その後この秒数返事が無ければ抜ける（ユーザ 2026-10-11）
+    ALCHEMY_NUDGE_SEC = float(os.getenv("ALCHEMY_NUDGE_SEC", "300"))
+    ALCHEMY_GIVEUP_SEC = float(os.getenv("ALCHEMY_GIVEUP_SEC", "30"))
+    # 確かめて返事はあったのに来ない（待ち直し）がこの回数たまったら、次は確かめずに抜ける
+    ALCHEMY_MAX_REWAITS = int(os.getenv("ALCHEMY_MAX_REWAITS", "2"))
+
     @classmethod
     def validate(cls) -> list[str]:
         """不足している必須設定を列挙。空リストなら起動可（Start ゲートで使う）。"""

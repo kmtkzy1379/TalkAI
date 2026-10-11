@@ -46,6 +46,8 @@ ROLE_ENV: dict[str, tuple[str, str]] = {
     # 「この発話を聞いたイブが次に返す声に乗る感情」（喜怒哀楽笑い）を JSON で聞く。実測（JVNV・2026-09-25）:
     # 話者の6感情 正解率 97%・1件 中央 1.28秒（8並列）・1件 約$0.00005。
     "emotion_judge": ("EMOTION_MODEL", "openai/gpt-6-luna"),
+    # Alchemy（ユーザ作のゲーム）の手を決める判断役（`eve/alchemy/brain.py`）。1ラウンドに1〜3回・締切つき
+    "game": ("GAME_MODEL", "openai/gpt-6-luna"),
 }
 
 CompletionFn = Callable[..., Awaitable[object]]

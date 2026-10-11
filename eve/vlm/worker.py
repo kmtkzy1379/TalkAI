@@ -43,8 +43,11 @@ class VlmWorker:
         dedup_ratio: float = 0.85,
         now_fn: Callable[[], float] = now_mono,
         sleep_fn: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        on_alchemy_seen: Optional[Callable[[], None]] = None,
     ) -> None:
         self._vs = vision_state
+        # 画面に Alchemy（ユーザ作のゲーム）が映っていたら呼ぶ（ルールを会話に入れる準備だけ・ゲームは始めない）
+        self._on_alchemy_seen = on_alchemy_seen
         self._pred = prediction_state
         self._narrate = narrate_fn
         self._speak_trigger = speak_trigger
@@ -186,6 +189,11 @@ class VlmWorker:
             return
         if not result.narration:
             return  # 空（パース失敗等）→ no-op（落とさない）
+        if result.alchemy and self._on_alchemy_seen is not None:
+            try:
+                self._on_alchemy_seen()  # 重複の実況でも数える（映り続けている間は準備を保つ）
+            except Exception:
+                logger.exception("Alchemy の準備の合図で例外（無視）")
         # 実況が取れた回は予想も更新する（重複の実況でも、今の画面から立てた予想が最新）
         self._last_prediction = result.prediction or ""
         if self._is_dup(result.narration):

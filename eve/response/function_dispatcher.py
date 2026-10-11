@@ -48,8 +48,19 @@ class FunctionDispatcher:
         self._task: Optional[asyncio.Task] = None
         self._stopping = False
 
-    def tool_schemas(self) -> list[dict]:
-        return self._registry.tool_schemas()
+    def tool_schemas(self, exclude=()) -> list[dict]:
+        return self._registry.tool_schemas(exclude=exclude) if exclude else self._registry.tool_schemas()
+
+    def reanswer_only(self, tool_calls) -> list:
+        """全部が「返事を言う前に実行して作り直す」能力なら [(name, args)]、1つでも違えば []。"""
+        calls = [parse_tool_call(tc)[:2] for tc in tool_calls or []]
+        if not calls or not all(self._registry.reanswer(n) for n, _a in calls):
+            return []
+        return calls
+
+    def execute_now(self, name: str, args: dict) -> str:
+        """その場で同期実行する（`reanswer` の能力だけ・結果は報告しない）。"""
+        return self._registry.execute(name, args)
 
     # --- ライフサイクル ---------------------------------------------------
 

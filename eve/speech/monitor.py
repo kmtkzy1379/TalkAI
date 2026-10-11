@@ -230,6 +230,7 @@ class SpeechDecider:
         dup_threshold: Optional[float] = None,  # J-2 ②-1: 同内容抑制の類似度閾値（テスト注入用）
         embedder=None,  # J-2 ②-2 任意: 二段目（意味の重複）判定用。None なら文字bigram のみ
         dup_emb_threshold: Optional[float] = None,
+        game_provider=None,  # 任意: Alchemy の部屋・対戦中の事実（`AlchemyManager.decider_block`・普段は None）
     ) -> None:
         self._state = state
         self._cache = cache
@@ -239,6 +240,7 @@ class SpeechDecider:
         self._decide_fn = decide_fn
         self._vision_state = vision_state
         self._tasks_provider = tasks_provider
+        self._game_provider = game_provider
         self._dup_threshold = dup_threshold if dup_threshold is not None else DUP_SIM_THRESHOLD
         self._embedder = embedder
         self._dup_emb_threshold = (
@@ -335,6 +337,12 @@ class SpeechDecider:
             except Exception:
                 logger.exception("実行中タスク一覧の取得に失敗（注入なしで継続）")
         prior = self._state.prior_items()  # J-2 ①: 既出の用件（実発話 + 止めた下書き）
+        game = None
+        if self._game_provider is not None:
+            try:
+                game = self._game_provider() or None
+            except Exception:
+                logger.exception("Alchemy の事実の取得に失敗（注入なしで継続）")
         seq0 = self._state.user_activity_seq  # 判定中にユーザが話したか検出する基準
         self._idle.clear()
         try:
@@ -342,7 +350,7 @@ class SpeechDecider:
                 surprise=surprise, silence_seconds=silence,
                 recent_turns=recent, topic_seeds=seeds, decide_fn=self._decide_fn,
                 last_feedback=last_feedback, vision=vision, active_tasks=active_tasks,
-                prior_items=prior,
+                prior_items=prior, game=game,
             )
         finally:
             self._idle.set()
@@ -366,6 +374,8 @@ class SpeechDecider:
                           for s in (seeds or [])]
             if vision:
                 materials.append(vision)
+            if game:
+                materials.append(game)  # ゲームの出来事に触れる話は材料に接地している
             if is_topic_outsourcing(decision.content, materials):
                 self._state.record_decision(
                     speak=False,

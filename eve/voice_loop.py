@@ -23,7 +23,7 @@ from .memory.embed import make_embedder
 from .model_registry import ModelRegistry
 from .pipeline.audio_play_queue import AudioPlayQueue
 from .pipeline.orchestrator import PipelineRunner
-from .pipeline.stimulus import Stimulus, StimulusKind
+from .pipeline.stimulus import CallFunctionResult, Stimulus, StimulusKind
 from .pipeline.stimulus_queue import StimulusQueue
 from .capability import CapabilityRegistry
 from .cleanup import sweep as cleanup_sweep
@@ -84,6 +84,10 @@ class VoiceLoop:
         # UI の機能 ON/OFF（`eve/control.py`）。**ヘッドレスでは None のまま**＝挙動は不変。
         # UI が起動時に差し込む。応答文脈の `features_off` はこれを遅延参照する。
         self.control = None
+        # Alchemy（ユーザ作のゲーム・既定 off）。実体は下の Call-Function の後で作る。発話判定・画面認識・応答は
+        # この参照を遅延 lambda で読む（作る前に呼ばれても None＝何も足さない）
+        self.alchemy = None
+        self._alchemy_react_task: Optional[asyncio.Task] = None
         # API 使用量メーター（既定 off）。ON の時だけ ModelRegistry/STT/埋め込みが記録する。
         self.usage = None
         if Config.USAGE_LOG_ENABLED:
@@ -155,6 +159,8 @@ class VoiceLoop:
                     self.task_store, undelivered=undelivered_reports(self.task_store, self.queue))
                 if self.task_store is not None else None
             ),
+            # Alchemy の部屋・対戦中だけ事実を渡す（普段は None＝発話判定の入力は変わらない）
+            game_provider=lambda: self.alchemy.decider_block() if self.alchemy is not None else None,
         )
 
         # F6 VLM サイドカー: 専用スレッドが capture→gate→on_frame、single-flight worker が
@@ -169,17 +175,23 @@ class VoiceLoop:
                                         if self.workspace is not None else ()),
                 # 前回の予想（画面認識の中だけで回す・ユーザ裁定 2026-09-30）。worker はこの直後に作るので遅延 lambda
                 prediction_fn=lambda: self.vlm_worker.last_prediction,
+                # Alchemy: イブ自身のゲーム画面を見ている間の断り書き / ユーザの画面に Alchemy が映っているかの1行
+                screen_note_fn=lambda: self.alchemy.screen_note() if self.alchemy is not None else None,
+                detect_alchemy=Config.ALCHEMY_ENABLED and Config.CALLFUNCTION_ENABLED,
             ),
             speak_trigger=lambda: self.speech_decider.trigger("vlm"),  # source は観測用（③分析の反省）
             speak_guard=self._vision_can_speak,  # A5/Q4: busy/ユーザ発話中/decider 処理中なら叩かない
             frames_per_call=Config.VLM_MAX_FRAMES_PER_CALL,
             min_interval_sec=Config.VLM_MIN_INTERVAL_SEC,
             dedup_ratio=Config.VLM_DEDUP_RATIO,
+            on_alchemy_seen=lambda: self.alchemy.note_seen_on_screen() if self.alchemy is not None else None,
         )
         self.vlm_capture = ScreenCapture(
             monitor=Config.VLM_MONITOR, downscale_max=Config.VLM_DOWNSCALE_MAX,
             jpeg_quality=Config.VLM_JPEG_QUALITY, blank_std_threshold=Config.VLM_BLANK_STD_THRESHOLD,
         )
+        # デスクトップの写し方を覚えておく（Alchemy の対戦中はイブのゲーム画面に差し替え、終わったら戻す）
+        self._desktop_capture = self.vlm_capture
         self.vlm_change_detector = ChangeDetector(
             phash_threshold=Config.VLM_PHASH_THRESHOLD, periodic_frames=Config.VLM_PERIODIC_FRAMES,
         )
@@ -314,6 +326,25 @@ class VoiceLoop:
         # 束の実体は「登録の前後で増えた名前」。手書きしないので構成差で腐らない。
         self._task_cap_names: "list[str]" = sorted(set(self.capabilities.names()) - _caps_before)
 
+        # Alchemy（ユーザ作のブラウザ対戦ゲーム・既定 off）。タスクの束とは別に登録する（UI のタスク ON/OFF で消えない）。
+        # 部屋の出入りは応答AI の機能なので CALLFUNCTION_ENABLED が前提
+        if Config.ALCHEMY_ENABLED:
+            if not Config.CALLFUNCTION_ENABLED:
+                logger.warning("ALCHEMY_ENABLED=1 だが CALLFUNCTION_ENABLED=0 のため Alchemy は無効"
+                               "（部屋に入る・やめるは応答AI の機能）")
+            else:
+                from .alchemy import AlchemyManager, register_alchemy_capabilities
+
+                self.alchemy = AlchemyManager(
+                    self.registry, react=self._alchemy_react, report=self._alchemy_report,
+                    screen_hook=self._alchemy_screen, say=self._alchemy_say,
+                    user_seq=lambda: self.speech_state.user_activity_seq,
+                    # 見切りの30秒を止めるのは、イブが実際に話している・ユーザが話している間だけ
+                    # （発話判定が考えている間まで数えると、判定のたびに時計が戻り79秒かかった・実測 2026-10-11）
+                    busy=lambda: (self.runner.is_busy() or self.speech_state.user_speaking
+                                  or not self.audio.is_quiet() or self.audio.is_playing()))
+                register_alchemy_capabilities(self.capabilities, self.alchemy)
+
         # 応答LLM の reasoning_effort（Config.RESPONSE_REASONING_EFFORT・gpt-6-luna は none 必須）。
         # litellm は gpt-6-luna がこの引数を受けることを知らないので allowed_openai_params で通す（emotion.py と同じ）
         effort = Config.RESPONSE_REASONING_EFFORT.strip()
@@ -372,6 +403,10 @@ class VoiceLoop:
             emotion_provider=self.emotion.describe if self.emotion is not None else None,
             tone_provider=self._voice_tone,  # S5: 声のトーン（未決の間は None＝付けない）
             style_examples=self.style_examples,  # 話し方の実例（ユーザ発話への応答だけ・毎ターン選び直す）
+            # Alchemy の準備・部屋・対戦中だけ `# Alchemy`（ルールと事実）を入れる（普段は None＝入れない）
+            game_provider=lambda: self.alchemy.voice_block() if self.alchemy is not None else None,
+            # 委譲の使い方は delegate_task が出ている時だけ（UI でタスクを切っても Alchemy の機能は残るため）
+            delegation_offered=lambda: self.capabilities.has("delegate_task"),
         )
         self.runner = PipelineRunner(self.queue, self.orchestrator, self.audio)
         # 沈黙監視は応答中(runner busy)/ユーザ発話中/フィラー中は発火しない。
@@ -598,7 +633,11 @@ class VoiceLoop:
         return self.filler is not None and self.filler.active
 
     def _busy_for_autospeech(self) -> bool:
-        """自発発話のガード: 応答中・フィラー中は発火しない（S3）。"""
+        """自発発話のガード: 応答中・フィラー中は発火しない（S3）。
+
+        Alchemy の部屋で待っている間も発話判定は止めない（ユーザ 2026-10-11「待機中も発話判定はON。1分半で催促してもいい。
+        問題は5分以上待たせても居座り続ける不自然さ」）。5分の最終確認と抜けるのは待ちの見張り（`AlchemyManager`）。
+        """
         return self.runner.is_busy() or self._filler_active()
 
     def _on_speech_end(self, speech_sec: float, seg: int = 0) -> None:
@@ -716,6 +755,15 @@ class VoiceLoop:
         stt_pending は J-2 ③-A: VLM 経由トリガは沈黙5秒閾値を迂回するため、発話終了〜STT完了の
         窓（1〜3秒）に自発発話が差し込まれ、直後に届くユーザ発話の処理を遅らせていた（E2E S8）。
         """
+        # Alchemy の対戦中（画面認識がイブのゲーム画面を見ている間）は、画面の変化では話しかけを起こさない。
+        # 演出で画面は絶えず変わるので、毎行動の実況になる（ユーザ指定「毎行動うるさく反応するのはうざい」）。
+        # ゲームの話しかけは、大きく動いた時の合図（`_alchemy_react`）だけが起こす
+        if self.alchemy is not None and self.alchemy.owns_screen():
+            return False
+        return self._quiet_for_speech()
+
+    def _quiet_for_speech(self) -> bool:
+        """自分から話しかけてよい間か（応答中・ユーザ発話中・STT待ち・判定処理中・フィラー中でない）。"""
         return (
             not self.runner.is_busy()
             and not self.speech_state.user_speaking
@@ -723,6 +771,80 @@ class VoiceLoop:
             and self.speech_decider.is_idle()
             and not self._filler_active()  # S3: フィラー中は実況を差し込まない
         )
+
+    # --- Alchemy（ユーザ作のゲーム）------------------------------------------
+
+    def _alchemy_report(self, name: str, content: str, ok: bool) -> None:
+        """部屋に入れた・入れなかった等を、機能の報告として応答AI へ（loop 上・同期）。"""
+        stim = Stimulus(
+            StimulusKind.CALLFUNCTION_RESULT,
+            payload=CallFunctionResult(function_name=name, content=content, ok=ok),
+            dedup_key=f"alchemy:{name}:{now_mono():.3f}",
+        )
+        task = asyncio.create_task(self.queue.put(stim))
+        self._ui_tasks.add(task)  # 参照を保持（stop() で片付く）
+        task.add_done_callback(self._ui_tasks.discard)
+
+    def _alchemy_react(self, text: str) -> None:
+        """ゲームが大きく動いた: 発話判定を起こす（話すかどうかは発話判定が決める）。
+
+        応答中・ユーザが話している間は起こさずに少し待つ（割り込まない）。待っても間が来なければ見送る
+        （出来事は `# Alchemy` の「最近の出来事」に残るので、次に話す時の材料にはなる）。
+        """
+        if self._alchemy_react_task is not None and not self._alchemy_react_task.done():
+            return  # 既に待っている（発話判定は最新の出来事を読む）
+        self._alchemy_react_task = asyncio.create_task(self._alchemy_react_when_quiet())
+        self._ui_tasks.add(self._alchemy_react_task)
+        self._alchemy_react_task.add_done_callback(self._ui_tasks.discard)
+
+    async def _alchemy_react_when_quiet(self, max_wait: float = 15.0) -> None:
+        t0 = now_mono()
+        while now_mono() - t0 < max_wait:
+            if self._quiet_for_speech():
+                self.speech_decider.trigger("game")
+                return
+            await asyncio.sleep(0.3)
+        logger.info("🎮 話せる間が来なかったので、出来事への反応は見送った")
+
+    def _alchemy_say(self, content: str, reason: str) -> None:
+        """Alchemy の部屋で待っている時の催促・見切り: 発話判定を通さずにイブが自分から話す（何を言うかは応答AI）。
+
+        「いつ」はユーザ指定（5分待って来なければ確かめる・30秒返事が無ければ抜ける）なので判定AI に委ねない。
+        既出の用件に載せる（発話判定が同じ催促を重ねない）。
+        """
+        from .speech.decider import AutonomousSpeech
+
+        async def _put() -> None:
+            t0 = now_mono()
+            while not self._quiet_for_speech() and now_mono() - t0 < 15.0:
+                await asyncio.sleep(0.3)
+            self.speech_state.record_prior_item(content, played=True)
+            await self.queue.put(Stimulus(StimulusKind.AUTONOMOUS_SPEECH, payload=AutonomousSpeech(content, reason)))
+
+        task = asyncio.create_task(_put())
+        self._ui_tasks.add(task)
+        task.add_done_callback(self._ui_tasks.discard)
+
+    async def _alchemy_screen(self, feed) -> None:
+        """画面認識の見る先を切り替える（feed＝イブのゲーム画面 / None＝デスクトップに戻す）。
+
+        ユーザ指定「画面認識はAIが操作するはずの画面を認識させる。ユーザーのPC画面は認識させない」。
+        動いていれば止めてから差し替えて動かし直す（`stop_vision` が画面の記憶も消す＝デスクトップの実況を
+        対戦中に持ち込まない・逆も同じ）。画面認識を UI で切っている間は差し替えだけ（点けた時にこの先を見る）。
+        """
+        running = self.capture_thread is not None
+        if running:
+            await self.stop_vision()
+        if feed is not None:
+            self.vlm_capture = ScreenCapture(
+                monitor=Config.VLM_MONITOR, downscale_max=Config.VLM_DOWNSCALE_MAX,
+                jpeg_quality=Config.VLM_JPEG_QUALITY, blank_std_threshold=Config.VLM_BLANK_STD_THRESHOLD,
+                grab_fn=feed.grab,
+            )
+        else:
+            self.vlm_capture = self._desktop_capture
+        if running:
+            self.start_vision()
 
     def _progress(self, key: str, text: str) -> None:
         """起動の進み具合を UI へ知らせる（既定 None＝ヘッドレスでは何もしない）。
@@ -983,6 +1105,9 @@ class VoiceLoop:
                     logger.info("プログラム実行 稼働（run_program・%s）", Config.WS_EXEC_ALLOW)
                 if Config.WS_VIEWER_ENABLED:
                     logger.info("画面表示 稼働（show_on_screen・別ウィンドウ）")
+        # Alchemy（既定 off）。ブラウザは遊ぶ時まで開かない（ここでは準備の期限の見張りだけ）
+        if self.alchemy is not None:
+            self.alchemy.start()
         # F6: 画面認識を起動（既定 off）。capture スレッドは loop 確定後に生成し on_frame を橋渡し。
         if Config.VLM_ENABLED:
             self.start_vision()
@@ -1025,6 +1150,12 @@ class VoiceLoop:
             await self.vlm_worker.stop()
         except Exception:
             pass
+        # Alchemy: 部屋から抜けてイブのゲーム画面（ブラウザ）を閉じる（画面認識は上で止めてある）
+        if self.alchemy is not None:
+            try:
+                await self.alchemy.stop()
+            except Exception:
+                pass
         # F5: 沈黙監視を止め（新規トリガを断つ）→ 発話判定 worker を drain/停止。
         try:
             await self.silence_monitor.stop()

@@ -71,6 +71,11 @@ class Capability:
     # 必須の引数（JSON schema の required）。2026-09-29 `delegate_task` の `reply`（ユーザへの一言）で使う:
     # 応答LLM（gpt-6-luna）は本文を書かずにツールだけ返すことが多く、必須にしないと書き落とす
     required: tuple = ()
+    # 返事を言う前にその場で実行し、同じ発話への返事を作り直す（会話に事実を足すだけの、すぐ終わる同期の機能）。
+    # Alchemy のルール準備で使う: 結果を後から報告すると「思い出しました」の決まった発言が増え（ユーザ 2026-10-11
+    # 「報告はいらない」）、報告しないと「ちょっと待ってね」と言ったきりルールを答えなかった（実測）。
+    # 応答LLM が本文を書かずにこの機能だけを呼んだ時だけ効く（本文を話し始めた後は作り直さない）。
+    reanswer: bool = False
 
     def __post_init__(self) -> None:
         # 契約の fail-fast: handler / async_handler はちょうど一方（両方/両方None は登録時プログラミングエラー。
@@ -138,6 +143,11 @@ class CapabilityRegistry:
         cap = self._caps.get(name)
         return cap.report_result if cap is not None else True
 
+    def reanswer(self, name: str) -> bool:
+        """返事を言う前に実行して返事を作り直す能力か（未知は False）。"""
+        cap = self._caps.get(name)
+        return cap is not None and cap.reanswer and cap.handler is not None
+
     def is_blocking(self, name: str) -> bool:
         """時間のかかる能力か（async_handler 持ち＝検索/将来の fetch・画面操作）。
 
@@ -160,9 +170,9 @@ class CapabilityRegistry:
             },
         }
 
-    def tool_schemas(self) -> list[dict]:
-        """**応答LLM** 向け（委譲/管理系＝offered=True）。実行系/内部は除外。"""
-        return [self._schema(c) for c in self._caps.values() if c.offered]
+    def tool_schemas(self, exclude=()) -> list[dict]:
+        """**応答LLM** 向け（委譲/管理系＝offered=True）。実行系/内部は除外。exclude の名前も除く。"""
+        return [self._schema(c) for c in self._caps.values() if c.offered and c.name not in exclude]
 
     def agent_tool_schemas(self) -> list[dict]:
         """**TaskAgent** 向け（実行系＝agent_tool=True）。委譲/管理系は含めない（自己再帰防止）。"""

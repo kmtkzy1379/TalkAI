@@ -25,6 +25,7 @@ _NOTABLE_ALIASES = ("notable", "notability", "注目", "重要", "言及")
 _VISIBLE_ALIASES = ("visible", "視認", "見える")
 _DIFF_ALIASES = ("surprise", "surprise_diff", "予測差", "驚き")
 _PRED_ALIASES = ("prediction", "予想", "次の予想")
+_ALCHEMY_ALIASES = ("alchemy",)
 
 
 def _extract_line(text: str, aliases: tuple[str, ...]) -> str:
@@ -68,9 +69,10 @@ def parse_vision(text: Optional[str]) -> VisionResult:
     notable = _truthy(_extract_line(text, _NOTABLE_ALIASES), default=False)
     diff = _extract_int(text, _DIFF_ALIASES)
     prediction = _extract_line(text, _PRED_ALIASES)
+    alchemy = _truthy(_extract_line(text, _ALCHEMY_ALIASES), default=False)
 
     if not visible:
         # 視認不可: 中身は採用せず surprise も上げない（捏造防止）。予想も持ち越さない（見えていない画面の予想）。
         return VisionResult(narration="", notable=False, surprise_diff=None, visible=False)
     return VisionResult(narration=narration, notable=notable, surprise_diff=diff, visible=True,
-                        prediction=prediction)
+                        prediction=prediction, alchemy=alchemy)

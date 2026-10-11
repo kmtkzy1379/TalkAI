@@ -28,6 +28,9 @@ class VisionResult:
     # 次の画面の予想（ユーザ裁定 2026-09-30）。**画面認識の中だけで使う**＝次の呼び出しに「前回の予想」として
     # 渡し、surprise を「予想と今の画面の食い違い」にする。応答・発話判定など他の AI には渡さない。
     prediction: str = ""
+    # ユーザの画面に Alchemy（ユーザ作のゲーム）が映っているか（ALCHEMY_ENABLED の時だけ聞く・`eve/alchemy/`）。
+    # 映っていたらルールを会話に入れる準備をする（ゲームは始めない）
+    alchemy: bool = False
 
     def is_empty(self) -> bool:
         return not (self.narration or self.notable or self.surprise_diff is not None)

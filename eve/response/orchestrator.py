@@ -153,6 +153,11 @@ class ResponseOrchestrator:
         # 任意: 話し方の実例（`eve/persona_examples.StyleExamples`）。ユーザ発話への応答でだけ、毎ターン選び直して
         # 性格の直後に入れる。今の話しかけと意味が近い実例は見せない（丸写しの元・2026-10-01 実測）
         style_examples=None,
+        # 任意: Alchemy（ユーザ作のゲーム）の準備・対戦中の事実（`AlchemyManager.voice_block`・それ以外は None）。全刺激種別で入れる
+        game_provider: Optional[Callable[[], Optional[str]]] = None,
+        # 任意: 委譲（delegate_task）が今出ているか。タスクを UI で切っても Alchemy の機能は残るので「tool がある」だけでは
+        # 委譲の使い方を出す理由にならない（出すと無い delegate_task を使うつもりで喋る）。None なら従来どおり tool の有無で決める
+        delegation_offered: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._audio = audio
         self._stream_fn = stream_fn
@@ -194,6 +199,8 @@ class ResponseOrchestrator:
         self._emotion_provider = emotion_provider
         self._tone_provider = tone_provider
         self._style_examples = style_examples
+        self._game_provider = game_provider
+        self._delegation_offered = delegation_offered
         self.last_response = ""  # 生成済み全文（自然さの目視・テスト用。記憶には使わない＝C5）
 
     def _tools_enabled_for(self, stimulus: Stimulus) -> bool:
@@ -215,6 +222,18 @@ class ResponseOrchestrator:
         except Exception:
             logger.exception("tool_schemas の取得に失敗（tool なしで応答）")
             return False
+
+    def _delegation_for(self, stimulus: Stimulus) -> bool:
+        """委譲（タスク）の使い方・実行できる手段のブロックを出すか（tool が渡り、かつ delegate_task が出ている）。"""
+        if not self._tools_enabled_for(stimulus):
+            return False
+        if self._delegation_offered is None:
+            return True
+        try:
+            return bool(self._delegation_offered())
+        except Exception:
+            logger.exception("委譲の有無の取得に失敗（出すとみなす）")
+            return True
 
     def _vision_for(self, stimulus: Stimulus) -> tuple[Optional[str], bool]:
         """この刺激の応答文脈に入れる画面情報（層分離の唯一の分岐点）。
@@ -322,7 +341,7 @@ class ResponseOrchestrator:
         # （5連続で誤拒否・直前に内部知識で答えた話題まで拒否）、そこへ「手段が無い」を
         # 足すのは逆効果。
         capabilities = None
-        if self._capabilities_provider is not None and self._tools_enabled_for(stimulus):
+        if self._capabilities_provider is not None and self._delegation_for(stimulus):
             try:
                 capabilities = self._capabilities_provider()
             except Exception:
@@ -356,6 +375,12 @@ class ResponseOrchestrator:
                 emotion = self._emotion_provider() or None
             except Exception:
                 logger.exception("今の感情の取得に失敗（無しで継続）")
+        game = None
+        if self._game_provider is not None:
+            try:
+                game = self._game_provider() or None
+            except Exception:
+                logger.exception("Alchemy の事実の取得に失敗（無しで継続）")
         # native ロール messages（system + user/assistant ターン列 + 最終 user発話/自発指示）。
         return self._ctx.assemble(
             user_text=user_text,
@@ -369,7 +394,7 @@ class ResponseOrchestrator:
             speech_decision_reason=speech_reason,
             stale_reference=stale_reference,
             callfunction_result=callfunction_result,
-            tools_active=self._tools_enabled_for(stimulus),
+            tools_active=self._delegation_for(stimulus),
             active_tasks=active_tasks,
             capabilities=capabilities,
             prev_session_gap_sec=prev_gap,
@@ -378,6 +403,7 @@ class ResponseOrchestrator:
             spoken_filler=spoken_filler,
             emotion=emotion,
             style_examples=style_examples if stimulus.kind == StimulusKind.USER_UTTERANCE else None,
+            game=game,
         )
 
     def _notify_complete(self) -> None:
@@ -611,26 +637,46 @@ class ResponseOrchestrator:
                 except Exception:
                     logger.exception("on_first_sentence フックで例外（無視して継続）")
 
-        try:
+        async def _run_stream(msgs, tls, sink) -> bool:
+            """1回分の生成を読み上げへ流す。最後まで生成し切ったら True（parts が全文である保証）。"""
             try:
                 # tools 有効時のみ tool 対応 stream（content は従来どおり TTS・tool_calls は sink へ）。
-                stream = (
-                    self._stream_fn(messages, tools=tools, tool_sink=tool_sink)
-                    if tools is not None else self._stream_fn(messages)
-                )
+                stream = self._stream_fn(msgs, tools=tls, tool_sink=sink) if tls is not None else self._stream_fn(msgs)
                 async for delta in stream:
                     if self._audio.current_generation() != gen:
-                        break  # barge-in(世代変化): 生成停止（残りの文は出さない）
+                        return False  # barge-in(世代変化): 生成停止（残りの文は出さない）
                     for sentence in splitter.feed(delta):
                         _emit(sentence)
-                else:
-                    # 正常終了時のみ末尾を flush（barge-in/エラー中断時は出さない）
-                    for sentence in splitter.flush():
-                        _emit(sentence)
-                    stream_complete = True  # parts が「報告の全文」であることの保証（途中 break では偽）
+                # 正常終了時のみ末尾を flush（barge-in/エラー中断時は出さない）
+                for sentence in splitter.flush():
+                    _emit(sentence)
+                return True
             except Exception:
                 # A3: LLM/stream の一時エラーは起こりうる → ログして途中までで打ち切り、継続。
                 logger.exception("応答生成中にエラー（途中までで打ち切り）")
+                return False
+
+        try:
+            stream_complete = await _run_stream(messages, tools, tool_sink)
+            redo = (self._dispatcher.reanswer_only(tool_sink)
+                    if stream_complete and tool_sink and not parts and hasattr(self._dispatcher, "reanswer_only")
+                    else [])
+            if redo:
+                # 会話に事実を足すだけの機能（Alchemy のルール準備）だけを呼んで本文ゼロ: 一言（reply）は言わずに
+                # その場で実行し、足された事実（ルール）を見て同じ発話への返事を作り直す（1回だけ）。
+                # 前置き「ちょっと待ってね」で止まらず、そのまま答える（ユーザ 2026-10-11）
+                first_reply = _reply_from_tools(tool_sink)
+                for name, args in redo:
+                    logger.info("⚙ 返事の前に実行: %s → %s", name, self._dispatcher.execute_now(name, args))
+                tool_sink = []
+                messages = self._build_messages(stimulus, recent, rag_chunks, style_examples=examples or None)
+                tools = (self._dispatcher.tool_schemas(exclude={n for n, _a in redo})
+                         if tools is not None else None) or None
+                stream_complete = await _run_stream(messages, tools, tool_sink)
+                if stream_complete and not parts and not tool_sink and first_reply:
+                    # 作り直しが何も言わなかった時だけ、最初の一言を言う（無言にしない）
+                    for sentence in splitter.feed(first_reply) + splitter.flush():
+                        _emit(sentence)
             if stream_complete and tool_sink and not parts:
                 # 機能を呼びつつ本文ゼロで終わったターン: 応答LLM が引数に書いた一言（reply）を言う
                 # （「、」「。」で区切るのは本文と同じ。barge-in等で stream_complete=False の時は言わない＝

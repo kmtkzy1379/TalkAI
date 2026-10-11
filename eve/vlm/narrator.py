@@ -53,7 +53,21 @@ VLM_SYSTEM = (
 )
 
 
-def build_messages(frames: list[Frame], own_windows: tuple = (), prediction: Optional[str] = None) -> list[dict]:
+# Alchemy（ユーザ作のブラウザ対戦ゲーム・`eve/alchemy/`）が**ユーザの画面に**映っているかを聞く1行（ALCHEMY_ENABLED の時だけ足す）。
+# ユーザ指定「画面や会話からAlchemyをやりそうになりそうならプレイできるように準備」の画面の側。語の一覧で実況文を
+# 判定せず、画像を見ている画面認識に yes/no で答えさせる（notable / visible と同じ形）。映っていてもゲームは始めない
+# （ルールを会話に入れるだけ）。見た目の手がかりはゲームの画面（FlaskRondo `client/`）から書いた
+ALCHEMY_TAG = (
+    "\nalchemy: <yes/no＝ブラウザゲーム『Alchemy』の画面が映っているか（錬金術がテーマの対戦カードゲーム。"
+    "タイトルや部屋の画面に Alchemy の文字や『○○の部屋』、対戦中はレシピのカード・素材箱・フラスコ・ROUND の表示）。"
+    "錬金術の本や、別のゲーム・動画なら no>"
+)
+# イブ自身のゲーム画面を見ている間は、実況の頭にこれを付けて会話へ渡す（ユーザの画面と取り違えない）
+GAME_SCREEN_PREFIX = "（イブ自身のゲーム画面）"
+
+
+def build_messages(frames: list[Frame], own_windows: tuple = (), prediction: Optional[str] = None,
+                   screen_note: Optional[str] = None, detect_alchemy: bool = False) -> list[dict]:
     """litellm multimodal messages（OpenAI 形式; gemini 経路で inline_data に変換される）。
 
     `own_windows` = イブ自身が `show_on_screen` で開いている窓のファイル名。
@@ -67,7 +81,10 @@ def build_messages(frames: list[Frame], own_windows: tuple = (), prediction: Opt
     """
     head = f"連続スクリーンショット {len(frames)} 枚（古い順・最後が今）。今の画面を実況して。"
     head += f"\n前回のあなたの予想: {(prediction or '').strip() or 'なし（初回）'}"
-    if own_windows:
+    if screen_note:
+        # イブ自身のゲーム画面（Alchemy の部屋・対戦中）。ユーザの画面ではないことを先に断る
+        head += "\n" + screen_note
+    elif own_windows:
         head += ("\nなお次のウィンドウは**あなた自身（イブ）が開いたもの**で、ユーザの作業ではない: "
                  + "・".join(own_windows)
                  + "。これらを『ユーザが開いた/新しく現れた』とは言わず、実況の主役にしない。")
@@ -77,8 +94,9 @@ def build_messages(frames: list[Frame], own_windows: tuple = (), prediction: Opt
             "type": "image_url",
             "image_url": {"url": f"data:image/jpeg;base64,{f.jpeg_b64}"},
         })
+    system = VLM_SYSTEM + (ALCHEMY_TAG if detect_alchemy and not screen_note else "")
     return [
-        {"role": "system", "content": VLM_SYSTEM},
+        {"role": "system", "content": system},
         {"role": "user", "content": content},
     ]
 
@@ -91,12 +109,16 @@ def _content_of(resp: object) -> str:
         return ""
 
 
-def make_narrate_fn(registry, own_windows_fn=None, prediction_fn=None) -> NarrateFn:
+def make_narrate_fn(registry, own_windows_fn=None, prediction_fn=None, screen_note_fn=None,
+                    detect_alchemy: bool = False) -> NarrateFn:
     """ModelRegistry の `vlm_leaf` を叩く本番 narrate_fn。
 
     `own_windows_fn` は呼び出しのたびに評価する（窓は開閉するのでスナップショットにしない）。
     未接続（作業フォルダ無効）なら従来どおり何も足さない。
     `prediction_fn` は前回の予想を返す（`VlmWorker.last_prediction`）。無ければ毎回「初回」扱い。
+    `screen_note_fn` はイブ自身のゲーム画面を見ている間だけ断り書きを返す（`AlchemyManager.screen_note`）。
+    その間の実況には `GAME_SCREEN_PREFIX` を付ける（会話でユーザの画面と取り違えない）。
+    `detect_alchemy` は「Alchemy が映っているか」の1行を足す（ALCHEMY_ENABLED の時だけ）。
     """
     async def narrate(frames: list[Frame]) -> VisionResult:
         own: tuple = ()
@@ -111,7 +133,17 @@ def make_narrate_fn(registry, own_windows_fn=None, prediction_fn=None) -> Narrat
                 pred = prediction_fn() or None
             except Exception:  # 予想が取れなくても実況は続ける（初回扱いになるだけ）
                 logger.debug("前回の予想の取得に失敗（初回扱いで継続）", exc_info=True)
-        resp = await registry.complete("vlm_leaf", build_messages(frames, own, pred))
-        return parse_vision(_content_of(resp))
+        note: Optional[str] = None
+        if screen_note_fn is not None:
+            try:
+                note = screen_note_fn() or None
+            except Exception:  # 断り書きが取れなくても実況は続ける
+                logger.debug("画面の断り書きの取得に失敗（無しで継続）", exc_info=True)
+        resp = await registry.complete(
+            "vlm_leaf", build_messages(frames, own, pred, screen_note=note, detect_alchemy=detect_alchemy))
+        result = parse_vision(_content_of(resp))
+        if note and result.narration:
+            result.narration = GAME_SCREEN_PREFIX + result.narration
+        return result
 
     return narrate

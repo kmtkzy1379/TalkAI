@@ -123,7 +123,7 @@ class ContextAssembler:
                       callfunction_result=None, tools_active=False, active_tasks=None,
                       last_feedback_iso=None, session_gap_sec=None, capabilities=None,
                       features_off=None, self_model=None, spoken_filler=None,
-                      user_reply=False, emotion=None, style_examples=None) -> str:
+                      user_reply=False, emotion=None, style_examples=None, game=None) -> str:
         parts: list[str] = []
         if self.system_prompt:
             parts.append(self.system_prompt)
@@ -208,6 +208,10 @@ class ContextAssembler:
                 "画面のことを聞かれたら、今は読み取れていないと伝える。"
                 "画面以外（会話の流れ・相手の様子）から言えることは、これまでどおり普通に話してよい。"
             )
+        if game:
+            # Alchemy（ユーザ作のゲーム・`eve/alchemy/manager.py` の voice_block）。準備・部屋・対戦中の間だけ入る
+            # （ユーザ指定「普段は入れずに、やりそうになりそうなら準備」＝それ以外の時はブロックごと出さない）
+            parts.append(game)
         if last_feedback:
             # D1 の主経路: 起動時 catch-up の内省が**前セッション末尾**を要約し、それが
             # 時刻ラベル無しで「# 直近フィードバック」として出ていた。実機(2026-07-29)では
@@ -405,6 +409,7 @@ class ContextAssembler:
         spoken_filler: str | None = None,  # S3: 直前にイブが口にしたつなぎ言葉（USER 発話のみ）
         emotion: str | None = None,  # S5: イブの今の気持ち（例「楽（穏やかで楽しい・リラックスしている）」）
         style_examples: str | None = None,  # 話し方の実例（`eve/persona_examples.py`・ユーザ発話への応答だけ）
+        game: str | None = None,  # Alchemy の準備・対戦中の事実（`eve/alchemy/`・それ以外は None＝出さない）
         now: Stamp | None = None,
     ) -> list[dict]:
         now = now or Stamp.now()
@@ -433,6 +438,7 @@ class ContextAssembler:
                     user_reply=user_text is not None and autonomous_content is None,
                     emotion=emotion,
                     style_examples=style_examples,
+                    game=game,
                 ),
             }
         ]
