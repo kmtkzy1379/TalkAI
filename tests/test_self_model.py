@@ -132,6 +132,9 @@ check("好きと苦手が別行で出る", "好きな食べ物" in block and "�
 check("2件並びの意味を説明する", "どちらも好きで迷う" in block)
 check("無い項目は決めつけさせない", "まだ決まっていない" in block)
 check("そのまま読み上げさせない", "そのまま読み上げない" in block)
+# 近い時だけ入れる形では、置いている訳（聞かれた時に答えがぶれないため）を書いても違いが無かった＝10-16 までの注記のまま
+check("聞かれたら同じように答える（10-16 までの注記）", "ここにある事は聞かれたら同じように答える" in block
+      and "ぶれない" not in block)
 # **RAG と同じ引力を持たせない**のが要点（02:41 の格上げ事故の再発防止）
 check("「今の会話に絡める」指示を持たない", "絡める" not in block)
 
@@ -312,6 +315,127 @@ try:
     check("保存しない時は None", SelfModelStore().path is None)
 finally:
     os.chdir(_cwd)
+
+# ==== 近い時だけ入れる（ユーザ 2026-10-17「好みの種類が近いときに読み込ませる・RAG に似た感じ・0件でもいい」）====
+import eve.memory.self_model as _sm  # noqa: E402
+from eve.memory.self_model import SelfRecall, comment_body  # noqa: E402
+from eve.stream.manager import format_comment  # noqa: E402
+from eve.stream.youtube import ChatMessage  # noqa: E402
+
+check("コメントの印と名前を外して測る", comment_body("（チャット）ぽてと: 好きな食べ物なに？") == "好きな食べ物なに？")
+check("スーパーチャットの印も外す", comment_body("（スーパーチャット ￥1,000・黄色）やまもと: いつも") == "いつも")
+check("持ち主の印つきの名前も外す（format_comment と同じ形）",
+      comment_body(format_comment(ChatMessage(id="1", kind="text", author="山田", text="プリン好き？", owner=True)))
+      == "プリン好き？")
+check("印の無い話しかけはそのまま", comment_body("好きな食べ物は？") == "好きな食べ物は？")
+check("本文の無い知らせはそのまま（近い項目が無いだけ）", comment_body("（メンバー加入・メンバー）しろくま") == "（メンバー加入・メンバー）しろくま")
+
+r8 = SelfModelStore()
+r8.set("好き", "食べ物", "プリン")
+r8.set("好き", "SNS", "X")
+check("近さを測る1行", [line for _k, line in r8.entries()] == ["好きなSNS: X", "好きな食べ物: プリン"], f"{r8.entries()}")
+only = r8.render(only={("好き", "食べ物")})
+check("選んだ項目だけ出す（見出しと注記は同じ）", "好きな食べ物: プリン" in only and "SNS" not in only
+      and only.startswith("# イブ自身のこと") and "まだ決まっていない" in only)
+_sm.PURPOSE_NOTE = True
+try:
+    with_note = r8.render()
+    check("訳を書く版（測る口）", "聞かれた時に答えがぶれないように控えている" in with_note
+          and "ここにある事は聞かれたら同じように答える" not in with_note, with_note)
+finally:
+    _sm.PURPOSE_NOTE = False
+
+
+class _FakeEmb:
+    """文 → 決めたベクトル（表に無い文は どの項目とも遠い）。呼ばれた回数を数える。"""
+
+    def __init__(self, table, fail=False):
+        self.table, self.fail, self.calls = table, fail, []
+
+    async def embed_query(self, text):
+        if self.fail:
+            raise RuntimeError("x")
+        self.calls.append(text)
+        return self.table.get(text, [0.0, 0.0, 1.0])
+
+
+_table = {"好きな食べ物: プリン": [1.0, 0.5, 0.0], "好きなSNS: X": [0.5, 1.0, 0.0],
+          "好きな食べ物なに？": [1.0, 0.0, 0.0], "何が好き？": [1.0, 1.0, 0.0], "甘いもの好き？": [1.0, 0.7, 0.0]}
+
+
+async def _recall_cases():
+    emb = _FakeEmb(_table)
+    rc = SelfRecall(r8, emb)
+    food = await rc.block_for("（チャット）ぽてと: 好きな食べ物なに？")
+    check("**好きな食べ物を聞かれたら、好きな食べ物だけ入れる**", "プリン" in food and "SNS" not in food, food)
+    check("**関係ない話しかけには入れない（0件）**", await rc.block_for("（チャット）Maple: Hello from Canada!") == "")
+    both = await rc.block_for("何が好き？")
+    check("どちらも同じくらい近ければ両方", "プリン" in both and "SNS: X" in both, both)
+    near = await rc.block_for("甘いもの好き？")
+    check("いちばん近い項目から離れた項目は入れない（差の上限）", "プリン" in near and "SNS" not in near, near)
+    n = sum(1 for t in emb.calls if t in ("好きな食べ物: プリン", "好きなSNS: X"))
+    check("項目の埋め込みは1回だけ作る（毎回作り直さない）", n == 2, f"{emb.calls}")
+    check("空の話しかけには入れない", await rc.block_for("") == "")
+    check("台帳が空なら何も入れない", await SelfRecall(SelfModelStore(), emb).block_for("好きな食べ物なに？") == "")
+    check("埋め込みが無い構成は全部入れる（聞かれた時の答えがぶれない方へ）",
+          await SelfRecall(r8, None).block_for("やあ") == r8.render())
+    check("埋め込みに失敗したら全部入れる", await SelfRecall(r8, _FakeEmb(_table, fail=True)).block_for("やあ") == r8.render())
+    _sm.RECALL = False
+    try:
+        check("RECALL=False なら従来どおり毎回全部（測る口）", await rc.block_for("やあ") == r8.render())
+    finally:
+        _sm.RECALL = True
+
+
+asyncio.run(_recall_cases())
+
+# 応答の組み立て: 選んだ控えを使う（"" は「入れない」・選ぶ口が無い時だけ従来どおり全部）
+from eve.pipeline.audio_play_queue import AudioPlayQueue  # noqa: E402
+from eve.pipeline.stimulus import CallFunctionResult, Stimulus, StimulusKind  # noqa: E402
+from eve.response.orchestrator import ResponseOrchestrator, _recall_query  # noqa: E402
+from eve.speech.decider import AutonomousSpeech  # noqa: E402
+
+
+async def _orch_cases():
+    seen: list[str] = []
+    asked: list[str] = []
+
+    async def play_fn(a):
+        pass
+
+    async def stream_fn(messages):
+        seen.append(messages[0]["content"])
+        yield "はい。"
+
+    async def tts_fn(s):
+        return b"x"
+
+    async def pick(text):
+        asked.append(text)
+        return r8.render(only={("好き", "食べ物")}) if "食べ物" in text else ""
+
+    audio = AudioPlayQueue(play_fn=play_fn)
+    worker = asyncio.create_task(audio.play_worker())
+    orch = ResponseOrchestrator(audio, stream_fn, tts_fn, self_model_fn=r8.render, self_model_pick=pick)
+    await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "（チャット）ぽてと: 好きな食べ物なに？"))
+    await orch.handle(Stimulus(StimulusKind.USER_UTTERANCE, "（チャット）Maple: Hello"))
+    worker.cancel()
+    check("**応答は話しかけに近い項目だけを入れる**", "好きな食べ物: プリン" in seen[0] and "SNS" not in seen[0], seen[0][-300:])
+    check("**近い項目が無ければ入れない（全部に戻さない）**", "イブ自身のこと" not in seen[1], seen[1][-300:])
+    check("選ぶ口には話しかけそのものを渡す", asked == ["（チャット）ぽてと: 好きな食べ物なに？", "（チャット）Maple: Hello"], f"{asked}")
+    o2 = ResponseOrchestrator(AudioPlayQueue(play_fn=play_fn), stream_fn, tts_fn, self_model_fn=r8.render)
+    msgs = o2._build_messages(Stimulus(StimulusKind.USER_UTTERANCE, "やあ"))
+    check("選ぶ口が無い時は従来どおり全部", "好きなSNS: X" in msgs[0]["content"] and "好きな食べ物: プリン" in msgs[0]["content"])
+    check("選んだ結果が「入れない」なら入れない", "イブ自身のこと" not in o2._build_messages(
+        Stimulus(StimulusKind.USER_UTTERANCE, "やあ"), self_model="")[0]["content"])
+
+
+asyncio.run(_orch_cases())
+check("測る文: ユーザ発話はその文", _recall_query(Stimulus(StimulusKind.USER_UTTERANCE, "好きな食べ物は？")) == "好きな食べ物は？")
+check("測る文: 自発発話は判定のメモ",
+      _recall_query(Stimulus(StimulusKind.AUTONOMOUS_SPEECH, AutonomousSpeech("好きなおやつの話", "理由"))) == "好きなおやつの話")
+check("測る文: 機能の報告は結果",
+      _recall_query(Stimulus(StimulusKind.CALLFUNCTION_RESULT, CallFunctionResult(content="天気は晴れ", function_name="search"))) == "天気は晴れ")
 
 print(f"\n合計: PASS {_passed} / FAIL {_failed}")
 sys.exit(1 if _failed else 0)

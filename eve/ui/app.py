@@ -24,10 +24,10 @@ import threading
 import time
 from typing import Optional
 
-from PySide6.QtCore import QObject, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, QPoint, QSize, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QHBoxLayout, QLabel, QLineEdit, QProgressBar,
-    QPushButton, QScrollArea, QSlider, QStackedWidget, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QDialog, QDialogButtonBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+    QProgressBar, QPushButton, QScrollArea, QSlider, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 from .. import capture_guard
@@ -55,6 +55,62 @@ class LoopBridge(QObject):
     close_item = Signal(str)                # タスクウィンドウから閉じる (window_id)
     loop_stopped = Signal(str)              # 異常終了時の理由（正常終了は空文字）
     control_state = Signal(str, str, bool)  # 機能 ON/OFF の**確定**通知 (key, state, on)
+    stream_event = Signal(str, dict)        # 配信からの知らせ（キャプチャ除外の外す/戻す）
+
+
+def _window_class(hwnd: int) -> str:
+    """Windows の窓のクラス名（OBS で窓を指定する時に使う）。取れなければ ""。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        fn = ctypes.windll.user32.GetClassNameW
+        fn.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]  # 64bit の HWND を切り捨てない
+        buf = ctypes.create_unicode_buffer(256)
+        return buf.value if fn(hwnd, buf, 256) else ""
+    except Exception:
+        return ""
+
+
+def _process_exe() -> str:
+    """このプロセスの実行ファイル名（venv の python.exe は実体を子で起動するので、実体の名前を取る）。"""
+    try:
+        import psutil
+
+        return psutil.Process().name()
+    except Exception:
+        import sys
+
+        return os.path.basename(sys.executable)
+
+
+class StreamDialog(QDialog):
+    """［配信］を押した時の確認（誤って押して配信が始まらないように）。"""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("YouTube で配信する")
+        lay = QVBoxLayout(self)
+        msg = QLabel(
+            "OBS で YouTube への配信を始めます。\n"
+            "配信中は、画面認識とマイクを切り、自律発話とタスクを入れて、視聴者のチャットに返事をします。\n"
+            "PC の音（BGM・ゲームの音）は OBS の設定のまま配信に乗ります。マイクのボタンを入れると、"
+            "イブがあなたの声を聞き、配信にも声が乗ります。\n"
+            "（終わったら元に戻します。イブのウィンドウは最小化しないでください＝OBS に映らなくなります）")
+        msg.setWordWrap(True)
+        lay.addWidget(msg)
+        self.url = QLineEdit()
+        self.url.setPlaceholderText("配信の URL（限定公開の時だけ。空欄なら公開中の配信を自動で探します）")
+        lay.addWidget(self.url)
+        self.chat_only = QCheckBox("OBS は操作しない（チャットだけ読む・試す時用）")
+        lay.addWidget(self.chat_only)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.button(QDialogButtonBox.Ok).setText("配信を始める")
+        buttons.button(QDialogButtonBox.Cancel).setText("やめる")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        lay.addWidget(buttons)
+        self.resize(560, 220)
 
 
 class _ItemHandle:
@@ -104,6 +160,12 @@ class VoiceLoopThread(threading.Thread):
     def _on_start(self, text: str, meta) -> None:
         self._bridge.sentence_started.emit(text, meta)
 
+    def _stream_ui(self, event: str, data: dict) -> None:
+        try:
+            self._bridge.stream_event.emit(event, data)
+        except RuntimeError:
+            pass  # UI が先に閉じた（終了処理の途中で配信を片付けた時）
+
     def _on_end(self, text: str) -> None:
         self._bridge.sentence_ended.emit(text)
 
@@ -141,6 +203,12 @@ class VoiceLoopThread(threading.Thread):
                 task = rows[0] if rows else ""
             except Exception:
                 task = ""
+        stream = None
+        if getattr(vl, "stream", None) is not None:
+            try:
+                stream = vl.stream.snapshot()
+            except Exception:
+                stream = None
         return {
             "mic_on": bool(ai is not None and ai.running),
             "mic_level": float(getattr(ai, "speech_prob", 0.0) or 0.0) if ai else 0.0,
@@ -149,6 +217,7 @@ class VoiceLoopThread(threading.Thread):
             "busy": bool(vl.runner.is_busy()),
             "queued": int(vl.queue.qsize()),
             "task": str(task)[:80],
+            "stream": stream,
         }
 
     # --- タスクウィンドウ（イブの表示物の集約）---
@@ -226,6 +295,31 @@ class VoiceLoopThread(threading.Thread):
         except RuntimeError:
             pass  # 既に閉じている
 
+    def configure_stream(self, **kw) -> None:
+        """UI スレッドから: 配信の確認で選んだ値と、OBS に映す窓の情報を loop へ渡す（値のコピーだけ）。
+
+        `request_control("stream", True)` より**先に**呼ぶ（call_soon_threadsafe は順番どおりに届く）。
+        """
+        loop, vl = self._loop, self._vl
+        if loop is None or vl is None or getattr(vl, "stream", None) is None:
+            return
+        import functools
+
+        try:
+            loop.call_soon_threadsafe(functools.partial(vl.stream.configure, **kw))
+        except RuntimeError:
+            pass
+
+    def push_stream_geometry(self, geom: dict) -> None:
+        """UI スレッドから: イブのウィンドウと Live2D の位置（配信中に大きさが変わった時）。"""
+        loop, vl = self._loop, self._vl
+        if loop is None or vl is None or getattr(vl, "stream", None) is None:
+            return
+        try:
+            loop.call_soon_threadsafe(vl.stream.set_geometry, dict(geom))
+        except RuntimeError:
+            pass
+
     def request_control(self, key: str, on: bool) -> None:
         """UI スレッドから機能 ON/OFF を要求（§9.3 手段1: call_soon_threadsafe のみ）。
 
@@ -252,6 +346,9 @@ class VoiceLoopThread(threading.Thread):
         # 経過（何を待っているか）は `logger` 経由で会話ログへ出る（LogBridge の eve.control 経路）
         # ＝ここで別の通り道を作らない。
         vl.control = self._control
+        if getattr(vl, "stream", None) is not None:
+            # 配信からの知らせ（キャプチャ除外の外す/戻す）。loop 上から呼ばれる＝emit だけして戻る
+            vl.stream.ui = self._stream_ui
         self._control.start()
         # 構成で使えない機能（`.env` で無効なもの）を最初に灰色にする。
         for key, (state, on) in self._control.snapshot().items():
@@ -337,6 +434,14 @@ class MainWindow(QWidget):
         self.mic.setFixedHeight(10)
         self.task_line = QLabel("")
         self.task_line.setStyleSheet("color:#666;")
+        # 配信中だけ出す（チャットの状態・コメント数・視聴者数）
+        self.stream_line = QLabel("")
+        self.stream_line.setStyleSheet("color:#c93a3f; font-weight:bold;")
+        self._streaming = False
+        self._capture_before: Optional[tuple[bool, bool]] = None  # 配信前のキャプチャ除外（戻す用）
+        self._geom_timer = QTimer(self)
+        self._geom_timer.setSingleShot(True)
+        self._geom_timer.timeout.connect(self._push_geometry)
 
         # キーボード入力: マイクを使わずに話しかける。実起動での確認が
         # 「喋って待つ」から「打って Enter」になるので検証がずっと軽くなる。
@@ -362,6 +467,7 @@ class MainWindow(QWidget):
         self.bridge.progress.connect(self._on_progress)
         self.bridge.loop_stopped.connect(self._on_loop_stopped)
         self.bridge.control_state.connect(self._on_control_state)
+        self.bridge.stream_event.connect(self._on_stream_event)
         self.view.ready.connect(lambda ok, msg: self.status.setText(("✅ " if ok else "❌ ") + msg))
 
         self.thread_ = VoiceLoopThread(self.bridge)
@@ -420,6 +526,7 @@ class MainWindow(QWidget):
         top.addWidget(self.pill)
         top.addWidget(self.mic, 1)
         top.addWidget(self.task_line, 2)
+        top.addWidget(self.stream_line, 2)
 
         entry_row = QHBoxLayout()
         entry_row.addWidget(self.mic_btn)   # 左端（ユーザ指定 2026-08-15）
@@ -550,6 +657,77 @@ class MainWindow(QWidget):
         # （実起動で発生: メニューボタンが覆いの下に隠れた）。
         if getattr(self, "loading", None) is not None:
             self.loading.setGeometry(self.rect())
+        if getattr(self, "_streaming", False):
+            self._geom_timer.start(300)  # 配信中: OBS の Live2D の切り出しを合わせ直す（大きさが落ち着いてから）
+
+    def changeEvent(self, ev) -> None:
+        super().changeEvent(ev)
+        from PySide6.QtCore import QEvent
+
+        if (ev.type() == QEvent.Type.WindowStateChange and getattr(self, "_streaming", False)
+                and self.isMinimized()):
+            self.logs.add("chat", "system", "⚠ 配信中にイブのウィンドウを最小化すると OBS に映りません（元に戻してください）")
+
+    # --- 配信（YouTube）---
+    def _live2d_geometry(self) -> dict:
+        """イブのウィンドウの中での Live2D の位置（論理座標）。OBS がウィンドウから Live2D を切り出すのに使う。"""
+        p = self.view.mapTo(self, QPoint(0, 0))
+        return {"win": (self.width(), self.height()),
+                "view": (p.x(), p.y(), self.view.width(), self.view.height())}
+
+    def _push_geometry(self) -> None:
+        self.thread_.push_stream_geometry(self._live2d_geometry())
+
+    def _stream_requested(self, want_on: bool) -> None:
+        """［配信］: 確認してから loop に要求を出す（表示は loop の確定を待つ＝他のボタンと同じ）。"""
+        if want_on:
+            dlg = StreamDialog(self)
+            if dlg.exec() != QDialog.Accepted:
+                return
+            from ..stream.scene import WindowInfo
+
+            self._show_main()  # 配信中は Live2D の画面にしておく（設定ページを映さない）
+            exe = _process_exe()
+            main = WindowInfo(self.windowTitle(), _window_class(int(self.winId())), exe)
+            task = WindowInfo(self.taskwin.windowTitle(), _window_class(int(self.taskwin.winId())), exe)
+            self.thread_.configure_stream(target=dlg.url.text().strip(), use_obs=not dlg.chat_only.isChecked(),
+                                          main_window=main, task_window=task, geometry=self._live2d_geometry())
+            self.logs.add("chat", "system", "配信を ON に切り替えます…")
+            self.thread_.request_control("stream", True)
+            return
+        ans = QMessageBox.question(self, "配信を終える", "配信を終了しますか？（OBS の配信も止めます）")
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self.logs.add("chat", "system", "配信を OFF に切り替えます…")
+        self.thread_.request_control("stream", False)
+
+    def _on_stream_state(self, state: str, on: bool) -> None:
+        """配信の確定状態: 配信中（と切り替え中）は設定を触らせない（Live2D 以外が映らないように）。"""
+        self._streaming = bool(on) and state == "on"
+        busy = self._streaming or state == "pending"
+        self.menu.settings.setEnabled(not busy)
+        if busy:
+            self._show_main()
+        if not self._streaming:
+            self.stream_line.setText("")
+
+    def _on_stream_event(self, event: str, data: dict) -> None:
+        if event != "capture":
+            return
+        if data.get("hide") is False:
+            # OBS に映るよう、イブの窓のキャプチャ除外を外す（配信中は画面認識を切っているので自分を見ない）
+            if self._capture_before is None:
+                self._capture_before = (self.hide_cb.isChecked(), self.hide_task_cb.isChecked())
+            self.hide_cb.setChecked(False)
+            self.hide_task_cb.setChecked(False)
+            self._apply_hide_to_task_window()
+            self.logs.add("chat", "system", "OBS に映るよう、イブのウィンドウのキャプチャ除外を外しました（配信が終わったら戻します）")
+        elif data.get("restore") and self._capture_before is not None:
+            ui_hide, task_hide = self._capture_before
+            self._capture_before = None
+            self.hide_cb.setChecked(ui_hide)
+            self.hide_task_cb.setChecked(task_hide)
+            self._apply_hide_to_task_window()
 
     def showEvent(self, ev) -> None:
         super().showEvent(ev)
@@ -652,6 +830,9 @@ class MainWindow(QWidget):
         押した瞬間に見た目を変えると、実体が切り替わる前に ON/OFF を表示することになり、
         「OFF にしたのに普通に稼働している」という嘘になる（1-A で実際に起きた）。
         """
+        if key == "stream":
+            self._stream_requested(want_on)  # 確認を挟む（誤って配信が始まる/終わるのを防ぐ）
+            return
         name = self._MENU_JA.get(key, key)
         verb = "ON" if want_on else "OFF"
         if key == "mute":  # ミュートだけは ON=黙る なので語を反転させないと読み違える
@@ -664,6 +845,8 @@ class MainWindow(QWidget):
         if key == "mic":
             self._set_mic_button(state, on)
             return
+        if key == "stream":
+            self._on_stream_state(state, on)
         self.menu.set_state(key, state, on=on)
 
     def _set_mic_button(self, state: str, on: bool) -> None:
@@ -763,6 +946,20 @@ class MainWindow(QWidget):
         q = s.get("queued", 0)
         self.task_line.setText((f"🔍 {task}" if task else "")
                                + (f"　待ち {q}" if q else ""))
+        st = s.get("stream") or {}
+        if st.get("active"):
+            from ..stream.manager import duration_text
+
+            chat = {"waiting": "配信を探しています", "live": "チャット接続中", "ended": "チャット終了",
+                    "error": "チャットを読めない", "quota": "API の上限"}.get(st.get("chat"), "")
+            parts = [f"● 配信中 {duration_text(st.get('elapsed') or 0)}", chat,
+                     f"コメント {st.get('comments', 0)}"]
+            if st.get("viewers") is not None:
+                parts.append(f"視聴 {st['viewers']}")
+            if st.get("mic"):
+                parts.append("マイクが配信に乗っている")  # 持ち主の声が視聴者に聞こえている（気づけるように）
+            self.stream_line.setText("・".join(p for p in parts if p))
+            self.stream_line.setToolTip(st.get("note") or st.get("title") or "")
 
     def _send_text(self) -> None:
         text = self.entry.text().strip()

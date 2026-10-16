@@ -94,6 +94,7 @@ async def should_speak(
     active_tasks: Optional[list] = None,  # J-2 P2-3 実行中タスク一覧（あれば材料に・None なら無し）
     prior_items: Optional[list] = None,  # J-2 ① 既出の用件（あれば材料に・None なら無し）
     game: Optional[str] = None,  # Alchemy の部屋・対戦中の事実（`AlchemyManager.decider_block`・None なら無し）
+    stream: Optional[str] = None,  # YouTube 配信中の事実（`StreamManager.decider_block`・None なら無し）
     pending_obligation: bool = False,
 ) -> SpeechDecision:
     if pending_obligation:
@@ -117,6 +118,8 @@ async def should_speak(
         kwargs["prior_items"] = prior_items
     if game:
         kwargs["game"] = game
+    if stream:
+        kwargs["stream"] = stream
     d = await decide_fn(**kwargs)
     if d.speak and not (d.content or "").strip():
         # 話す判断だが content が空 → 全 speak 経路で最小ヒントを保証（応答LLMが膨らませる）。
@@ -307,9 +310,12 @@ _PRIOR_RULES = (
     "何をきっかけにするかはイブが決める）。\n"
     "ただし、直前に自分から話したばかりなら、別の話題であっても間を空ける（立て続けに話しかけない）。"
 )
+# 配信中もこの3行目（直前に話したばかりなら別の話題でも間を空ける）を入れるか。一人を相手にした会話の決まりで、
+# 配信では「2分前に話したばかり」を理由に黙っていた（`tools/prompt_eval/stream_ab.py` で測る口・2026-10-15）
+STREAM_PRIOR_GAP_RULE = True
 
 
-def _render_prior(prior_items: Optional[list]) -> str:
+def _render_prior(prior_items: Optional[list], *, stream: bool = False) -> str:
     """既出の用件ブロック（J-2 ①）。None/空ならブロック自体を出さない（active_tasks と同じ規約）。
 
     判定LLMは自分の**実発話**なら「# 直近の会話」で既に見えているが、(a)コードゲートで止めた
@@ -324,7 +330,10 @@ def _render_prior(prior_items: Optional[list]) -> str:
     if not prior_items:
         return ""
     body = "\n".join(f"- {t}" for t in prior_items)
-    return f"\n\n{PRIOR_HEAD}\n{body}\n{_PRIOR_RULES}"
+    rules = _PRIOR_RULES
+    if stream and not STREAM_PRIOR_GAP_RULE:
+        rules = rules.rsplit("\n", 1)[0]
+    return f"\n\n{PRIOR_HEAD}\n{body}\n{rules}"
 
 
 def _render_active_tasks(active_tasks: Optional[list]) -> str:
@@ -343,7 +352,7 @@ def build_decide_messages(
     *, surprise: int, silence_seconds: float, recent_turns, topic_seeds,
     last_feedback: Optional[str] = None, vision: Optional[str] = None,
     active_tasks: Optional[list] = None, now: Optional[str] = None,
-    prior_items: Optional[list] = None, game: Optional[str] = None,
+    prior_items: Optional[list] = None, game: Optional[str] = None, stream: Optional[str] = None,
 ) -> list[dict]:
     fb = (last_feedback or "").strip() or "（なし）"
     screen = (vision or "").strip()
@@ -351,14 +360,16 @@ def build_decide_messages(
     tasks_block = _render_active_tasks(active_tasks)
     # Alchemy の部屋・対戦中だけ（見出しと扱いの注記は `AlchemyManager.decider_block` が持つ＝普段は何も足さない）
     game_block = f"\n\n{game.strip()}" if game and game.strip() else ""
+    # YouTube 配信中だけ（見出しと扱いの注記は `StreamManager.decider_block` が持つ＝普段は何も足さない）
+    stream_block = f"\n\n{stream.strip()}" if stream and stream.strip() else ""
     user = (
         # 2026-10-05: 先頭の「…」（沈黙を表す内部の記号）を外した。判定がそれを相手の発言と読み
         # 「三点リーダーだけで今日を語る気か」と、ユーザに意味の分からないツッコミを下書きにした
         f"# 直近の会話（[話者/いつの発話か]）\n{_render_turns(recent_turns, now)}"
-        f"{_render_prior(prior_items)}\n\n"
+        f"{_render_prior(prior_items, stream=bool(stream_block))}\n\n"
         f"# 過去の記憶・話題の種（今の流れに合えば、ここから自分から話を振ってよい）\n{_render_seeds(topic_seeds, now)}\n\n"
         f"# イブの今の状態（直近フィードバック: 感情/要約）\n{fb}"
-        f"{screen_block}{game_block}{tasks_block}\n\n"
+        f"{screen_block}{game_block}{stream_block}{tasks_block}\n\n"
         # 2026-10-05: 沈黙の秒数はイブが話しても戻るので、相手がどれだけ黙っているかは別に事実で渡す
         f"# 状況\n最後に誰かが話してから{silence_seconds:.0f}秒。{silence_facts(recent_turns, now)}\n"
         f"予測差(surprise)={surprise}（指標。高=思考/感情が高ぶる・低=安定。これだけで決めない）"
@@ -383,11 +394,12 @@ def make_decide_fn(registry, *, persona: str = "") -> DecideFn:
     extra = persona_for(persona, PERSONA_HOW)
 
     async def decide_fn(*, surprise, silence_seconds, recent_turns, topic_seeds, last_feedback=None,
-                        vision=None, active_tasks=None, prior_items=None, game=None) -> SpeechDecision:
+                        vision=None, active_tasks=None, prior_items=None, game=None,
+                        stream=None) -> SpeechDecision:
         messages = build_decide_messages(
             surprise=surprise, silence_seconds=silence_seconds,
             recent_turns=recent_turns, topic_seeds=topic_seeds, last_feedback=last_feedback,
-            vision=vision, active_tasks=active_tasks, prior_items=prior_items, game=game,
+            vision=vision, active_tasks=active_tasks, prior_items=prior_items, game=game, stream=stream,
         )
         if extra:
             messages[0]["content"] += extra

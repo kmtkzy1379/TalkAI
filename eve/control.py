@@ -36,7 +36,17 @@ logger = logging.getLogger(__name__)
 
 # `mic` はメニューではなく**入力欄の左のボタン**が持つ（キーボードで打つ時に押す物なので、
 # 手がある場所に置く）。切り替えの経路は他と同じ＝直列化も latest-wins も同じように効く。
-KEYS = ("pause", "mute", "mic", "autospeech", "vision", "task")
+# `stream` は YouTube 配信（`eve/stream/`）。ON にすると下の機能をまとめて切り替え、OFF で元に戻す。
+KEYS = ("pause", "mute", "mic", "autospeech", "vision", "task", "stream")
+
+# 配信を始める時に切り替える機能（ユーザ指定 2026-10-15「画面認識はOFF・自律的発話はON・タスク実行はON」）。
+# マイクも切って始める（入力は視聴者のチャット。ユーザ 2026-10-15「マイクだけデフォルトOFFで切り替えられるように」）。
+# 配信中にマイクを入れると OBS のマイクも入る（`_apply_mic`）。配信を終えたら配信前の状態に戻す。
+# 画面認識は配信中は入れられない（ロック）＝自分の配信画面を見てしまう・キャプチャ除外を外しているので自分の窓が映る。
+STREAM_SWITCHES = (("vision", False), ("mic", False), ("autospeech", True), ("task", True))
+# 配信が始まってから入れる機能。自律発話を先に入れると、OBS の用意の数秒の間に「配信の事実なし・配信前の会話の
+# 文脈」で最初の話題を決めてしまう（実測 2026-10-15: 配信前の持ち主との会話の話が配信の最初の一言になった）
+AFTER_LIVE = ("autospeech",)
 
 # 応答LLM に見せる「今はオフ」の説明。**機能の不在ではなく一時的な停止**として書く
 # （「画面を見る機能がない」はハルシネーションに見える＝ユーザ裁定 2026-08-14）。
@@ -47,6 +57,11 @@ FEATURE_OFF_TEXT = {
     "task": "調べ物や作業を引き受ける機能（今はユーザがオフにしている。オンにすれば頼まれごとができる）",
     "autospeech": "自分から話しかける機能（今はユーザがオフにしている。聞かれたら答えるのは普通にできる）",
     "mute": "声を出す機能（今はミュート。話した内容は画面のログには出ている）",
+}
+# 配信中の言い方（配信ボタンが切った物。視聴者に「点けてくれたら」と言っても視聴者には点けられない）
+STREAM_OFF_TEXT = {
+    "mic": "声を聞く機能（今は配信中なのでマイクをオフにしている。視聴者とはチャットで話す）",
+    "vision": "画面を見る機能（今は配信中なのでオフにしている。配信が終われば戻る）",
 }
 
 # 待ちの上限[秒]。超えても**強制終了はしない**（正常終了させる方針）。
@@ -66,6 +81,7 @@ class ControlPlane:
         self._quiesce = float(quiesce_sec if quiesce_sec is not None else DEFAULT_QUIESCE_SEC)
         self._on: dict[str, bool] = {k: True for k in KEYS}
         self._on["mute"] = False  # ミュートだけは「オンにする＝黙らせる」なので初期は解除
+        self._on["stream"] = False  # 配信は押した時だけ
         # 起動時の初期値は `.env`（設定タブの「起動時の初期値」）に従う。ここを見ないと
         # 「設定で切ったのにメニューは ON と表示される」という嘘になる。
         self._on["autospeech"] = bool(Config.AUTOSPEECH_ENABLED)
@@ -84,10 +100,14 @@ class ControlPlane:
             "autospeech": True,
             "vision": bool(Config.VLM_ENABLED),
             "task": bool(Config.TASK_ENABLED and vl.task_store is not None),
+            "stream": bool(getattr(vl, "stream", None) is not None and vl.stream.available()[0]),
         }
         for k in KEYS:
             if not self._available[k]:
                 self._on[k] = False
+        # 配信中だけ押させない機能（画面認識）と、配信前の状態（終わったら戻す）
+        self._locked: set[str] = set()
+        self._stream_prev: dict[str, bool] = {}
 
     # --- 状態の公開 -------------------------------------------------------
 
@@ -97,17 +117,22 @@ class ControlPlane:
     def features_off(self) -> list[str]:
         """応答LLM の system に入れる「今オフの機能」。ミュートは pause と重複しないよう単独で見る。"""
         off = []
+        streaming = self._on["stream"]
         for key in ("mic", "vision", "task", "autospeech"):
             if self._available[key] and not self._on[key]:
-                off.append(FEATURE_OFF_TEXT[key])
+                off.append(STREAM_OFF_TEXT[key] if streaming and key in STREAM_OFF_TEXT else FEATURE_OFF_TEXT[key])
         if self._on["mute"]:
             off.append(FEATURE_OFF_TEXT["mute"])
         return off
 
+    def _state_of(self, key: str) -> str:
+        if not self._available[key] or key in self._locked:
+            return "disabled"
+        return "on" if self._on[key] else "off"
+
     def snapshot(self) -> dict[str, tuple[str, bool]]:
         """UI の初期表示用（key -> (state, on)）。"""
-        return {k: ("disabled" if not self._available[k] else ("on" if self._on[k] else "off"),
-                    self._on[k]) for k in KEYS}
+        return {k: (self._state_of(k), self._on[k]) for k in KEYS}
 
     # --- 入口 -------------------------------------------------------------
 
@@ -128,7 +153,7 @@ class ControlPlane:
         """UI から「これを ON/OFF にしたい」。**loop 上で呼ぶこと**（O(1)・待たない）。"""
         if key not in KEYS:
             return
-        if not self._available[key]:
+        if not self._available[key] or key in self._locked:
             self._emit(key, "disabled")
             return
         self._want[key] = bool(on)
@@ -161,18 +186,33 @@ class ControlPlane:
         while self._want:
             key = next(iter(self._want))
             want = self._want.pop(key)
+            if key in self._locked:
+                # 押された後でロックされた（例: 配信の開始が先に処理された）→ 切り替えない
+                self._emit(key, "disabled")
+                continue
             if want == self._on[key]:
-                self._emit(key, "on" if self._on[key] else "off")
+                self._emit(key, self._state_of(key))
                 continue
             try:
                 await self._apply(key, want)
                 self._on[key] = want
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                logger.exception("機能の切り替えに失敗: %s -> %s", key, want)
-                self._note(f"{key} の切り替えに失敗しました（元の状態のまま）")
-            self._emit(key, "on" if self._on[key] else "off")
+            except Exception as e:
+                if key == "stream" and want:
+                    from .stream import StreamError
+
+                    if isinstance(e, StreamError):
+                        why = str(e)  # 想定内（OBS の設定が足りない等）＝トレースバックは出さない
+                        logger.warning("配信を始められなかった: %s", why)
+                    else:
+                        why = f"{type(e).__name__}: {e}"
+                        logger.exception("配信を始められなかった")
+                    self._note(f"配信を始められませんでした: {why}")
+                else:
+                    logger.exception("機能の切り替えに失敗: %s -> %s", key, want)
+                    self._note(f"{key} の切り替えに失敗しました（元の状態のまま）")
+            self._emit(key, self._state_of(key))
 
     async def _apply(self, key: str, on: bool) -> None:
         handler = {
@@ -182,8 +222,75 @@ class ControlPlane:
             "autospeech": self._apply_autospeech,
             "vision": self._apply_vision,
             "task": self._apply_task,
+            "stream": self._apply_stream,
         }[key]
         await handler(on)
+
+    async def _switch(self, key: str, on: bool) -> None:
+        """配信の開始・終了の中で、ほかの機能を**同じ直列の中で**切り替える（確定も通知する）。"""
+        if not self._available[key] or self._on[key] == on:
+            return
+        try:
+            await self._apply(key, on)
+            self._on[key] = on
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("配信に合わせた切り替えに失敗: %s -> %s（続行）", key, on)
+        self._emit(key, self._state_of(key))
+
+    async def _apply_stream(self, on: bool) -> None:
+        """YouTube 配信の開始/終了（ユーザ指定 2026-10-15）。
+
+        開始: 画面認識 OFF（配信中はロック）・マイク OFF・自律発話 ON・タスク ON → `stream.start()`
+        （会話の区切り → OBS の準備と配信開始）。失敗したら切り替えた機能を配信前の状態に戻してから失敗を返す。
+        終了: `stream.stop()`（OBS の配信を止める・OBS の音を戻す・UI のキャプチャ除外を戻す）→ 機能を配信前に戻す。
+        画面認識を戻すのは最後（UI がイブの窓をキャプチャから隠し直してから＝自分の窓を見ない）。
+        """
+        st = self._vl.stream
+        if on:
+            self._stream_prev = {k: self._on[k] for k, _v in STREAM_SWITCHES}
+            was_running = self._on["pause"]
+            self._note("配信の準備をしています（画面認識とマイクを切り、自律発話とタスクを入れます）…")
+            for key, value in STREAM_SWITCHES:
+                if key in AFTER_LIVE:
+                    continue
+                await self._switch(key, value)
+                if key == "mic":
+                    # 停止中なら再開する（配信するのに黙っていない）。終わっても停止には戻さない
+                    await self._switch("pause", True)
+            self._locked.add("vision")
+            self._emit("vision", "disabled")
+            try:
+                await st.start()
+            except asyncio.CancelledError:
+                self._locked.discard("vision")  # 終了処理の途中（機能を戻しても直後に止まる）
+                raise
+            except Exception:
+                await self._restore_after_stream()
+                await self._switch("pause", was_running)  # 始められなかったなら停止中も元に戻す
+                raise
+            for key, value in STREAM_SWITCHES:
+                if key in AFTER_LIVE:
+                    await self._switch(key, value)
+            self._note("配信を始めました" + ("（YouTube の配信を探しています。見つかったらチャットを読みます）"
+                                         if st.chat_state != "live" else ""))
+            return
+        try:
+            await st.stop()
+        finally:
+            await self._restore_after_stream()
+        self._note("配信を終えました")
+
+    async def _restore_after_stream(self) -> None:
+        """配信前の状態に戻す。**画面認識は最後**（UI がイブの窓をキャプチャから隠し直してから）。"""
+        self._locked.discard("vision")
+        prev, self._stream_prev = self._stream_prev, {}
+        await asyncio.sleep(0.5)  # UI がイブの窓をキャプチャから隠し直す間（画面認識を戻す前に）
+        for key, _value in reversed(STREAM_SWITCHES):
+            if key in prev:
+                await self._switch(key, prev[key])
+        self._emit("vision", self._state_of("vision"))
 
     # --- 各機能 -----------------------------------------------------------
 
@@ -207,15 +314,24 @@ class ControlPlane:
         押した瞬間に効くのが正しい。聞き取りの途中だった1発話は捨てられる（言い終える前に
         切ったのだから、そのまま届く方が驚く）。停止/再開やタスクのように「正常終了を待つ」
         対象ではない。
+
+        配信中は OBS のマイクも合わせる（ボタン1つで「イブが聞く」と「配信に乗る」がそろう・ユーザ 2026-10-15
+        「マイクだけデフォルトOFFで切り替えられるように」）。配信の外では OBS に触らない。
         """
         vl = self._vl
+        st = getattr(vl, "stream", None)
+        live = st is not None and st.active and st.obs is not None
         if on:
             await vl.input.start()
             # 止めていた間の沈黙で、再開直後に独り言を始めないようにする。
             vl.speech_state.mark_eve_activity()
-            self._note("マイクを ON にしました")
+            if live:
+                await st.set_mic(True)
+            self._note("マイクを ON にしました" + ("（配信にも声が乗ります）" if live and st.mic_live else ""))
             return
         vl.input.stop()
+        if live:
+            await st.set_mic(False)
         self._note("マイクを OFF にしました（キーボードでは話しかけられます）")
 
     async def _apply_pause(self, on: bool) -> None:

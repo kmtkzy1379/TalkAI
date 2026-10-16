@@ -28,6 +28,23 @@ SPEAKER_EVE = "eve"
 # `# 前回の会話` ブロックの発火に使う。実測で 300〜3600秒の広い平坦域にあり値に敏感でない。
 SESSION_GAP_SEC = 900.0
 
+# 配信中の自発発話でも「一言だけ」と言わせるか（ユーザ 2026-10-15「もう少し1話題を広げて長く話させたい」で外した。
+# `tools/prompt_eval/stream_ab.py` が元に戻して比べるための口）
+STREAM_AUTONOMOUS_ONE_LINE = False
+
+# 配信中は「# 参照」の記憶から、内省の内部の行（予測差・理由）を外して見せる（ユーザ 2026-10-17「異様にプリンに触れてる
+# けどなんで？」→「要約と感情、次の行動指標まで渡してほしい」＝要約・感情・次の予測は残す）。配信中に書かれた記憶は、要約に
+# 無い話題（「プリン城ネタ」等）まで予測・理由の行で繰り返していて、リハーサルでコメントへの返事に見せた記憶は33件中19件に
+# プリンが入っていた。行の名前は `feedback/feedback_llm.render_chunk_text` が付ける物。普段の会話は従来どおり全文
+# （測ったのは配信だけ・`tools/prompt_eval/stream_variety.py`）
+STREAM_MEMORY_SLIM = True
+MEMORY_INTERNAL_LINES = ("予測差:", "理由:")
+
+
+def memory_for_stream(text: str) -> str:
+    """記憶の本文から内省の内部の行（予測差・理由）を外す（要約・感情・次の予測は残す）。純関数。"""
+    return "\n".join(ln for ln in (text or "").splitlines() if not ln.startswith(MEMORY_INTERNAL_LINES))
+
 # system に置く役割アンカー（assistant=イブ自身を明示し、自分の発話への自答を防ぐ）。
 ROLE_ANCHOR = (
     "あなたはAI VTuber「イブ」です。この会話では、assistant のメッセージは“あなた自身(イブ)の発話”、"
@@ -112,8 +129,12 @@ def silence_facts(recent_turns, now: str | None = None, *, me: str = "イブ") -
 
 
 class ContextAssembler:
-    def __init__(self, system_prompt: str = "", reply_opener: str = "") -> None:
+    def __init__(self, system_prompt: str = "", reply_opener: str = "",
+                 stream_system_prompt: str | None = None) -> None:
         self.system_prompt = system_prompt
+        # 配信中だけ使う版（スタイル指示の「短く」を外した物・`response/style.py` の SPEECH_STYLE_STREAM）。
+        # None なら配信中も同じ
+        self.stream_system_prompt = stream_system_prompt
         # S4: 応答の書き出しに置く応答依存フィラーの表（`eve/filler/prompt.py`）。
         # **ユーザ発話への応答のときだけ**入れる（自発発話・機能報告の書き出しに「へー」は付かない）。
         self.reply_opener = reply_opener
@@ -123,15 +144,23 @@ class ContextAssembler:
                       callfunction_result=None, tools_active=False, active_tasks=None,
                       last_feedback_iso=None, session_gap_sec=None, capabilities=None,
                       features_off=None, self_model=None, spoken_filler=None,
-                      user_reply=False, emotion=None, style_examples=None, game=None) -> str:
+                      user_reply=False, emotion=None, style_examples=None, game=None, stream=None,
+                      carry_over=None) -> str:
         parts: list[str] = []
-        if self.system_prompt:
-            parts.append(self.system_prompt)
+        base = self.stream_system_prompt if (stream and self.stream_system_prompt) else self.system_prompt
+        if base:
+            parts.append(base)
         if style_examples:
             # 話し方の実例（`eve/persona_examples.py`）。性格（system_prompt の最後）の直後に置く＝測った置き方
             # （`tools/prompt_eval/` の N5＋実例）。毎ターン入れ替わる。
             parts.append(style_examples)
         parts.append(ROLE_ANCHOR)
+        if stream:
+            # YouTube 配信中（`eve/stream/manager.py` の voice_block）。誰が話しているか（user＝視聴者のコメント）
+            # の前提なので、役割の説明の直後に置く。配信していない時は None＝出さない
+            parts.append(stream)
+        if carry_over:
+            parts.append(carry_over)
         if user_reply and self.reply_opener:
             parts.append(self.reply_opener)
         if spoken_filler:
@@ -161,9 +190,10 @@ class ContextAssembler:
             # （`memory/self_model.py` の閉じたスロット × 最大2件）。
             parts.append(self_model)
         if rag_chunks:
+            slim = bool(stream) and STREAM_MEMORY_SLIM
             lines = [
                 f"[{'話題の種' if c.as_topic_seed else '過去の記憶'}/"
-                f"{humanize(elapsed_wall(c.iso, now.iso))}] {c.text}"
+                f"{humanize(elapsed_wall(c.iso, now.iso))}] {memory_for_stream(c.text) if slim else c.text}"
                 for c in rag_chunks
             ]
             parts.append("# 参照（今の会話に絡める。思い出話に逸れない）\n" + "\n".join(lines))
@@ -410,6 +440,10 @@ class ContextAssembler:
         emotion: str | None = None,  # S5: イブの今の気持ち（例「楽（穏やかで楽しい・リラックスしている）」）
         style_examples: str | None = None,  # 話し方の実例（`eve/persona_examples.py`・ユーザ発話への応答だけ）
         game: str | None = None,  # Alchemy の準備・対戦中の事実（`eve/alchemy/`・それ以外は None＝出さない）
+        stream: str | None = None,  # YouTube 配信中の事実（`eve/stream/`・配信していない時は None＝出さない）
+        # 配信の始め・終わりの区切りの手前で話していたことの要約（見出し込み・`eve/stream/` が作る）。区切りで直近の会話を
+        # 入れなくなる代わりに、何を話していたかだけを渡す（切り替えた途端に直前のことを忘れない・ユーザ 2026-10-16）
+        carry_over: str | None = None,
         now: Stamp | None = None,
     ) -> list[dict]:
         now = now or Stamp.now()
@@ -439,6 +473,8 @@ class ContextAssembler:
                     emotion=emotion,
                     style_examples=style_examples,
                     game=game,
+                    stream=stream,
+                    carry_over=carry_over,
                 ),
             }
         ]
@@ -453,14 +489,18 @@ class ContextAssembler:
                     # 相手がどれだけ黙っているか分からない。どう反応するかは書かない（イブが決める）
                     f"（指示）今は沈黙が続いています（{silence_facts(recent_turns, now.iso, me='あなた')}）"
                     "直前の会話を踏まえ、ユーザ発話への返事ではなく、"
-                    "あなた（イブ）から自分の言葉で一言だけ話しかけてください（相手は今こちらに注意を向けていない）。"
+                    "あなた（イブ）から自分の言葉で"
+                    # 配信中は「一言だけ」を外す（話の長さはイブが決める・ユーザ 2026-10-15）
+                    + ("一言だけ" if (not stream or STREAM_AUTONOMOUS_ONE_LINE) else "") + "話しかけてください"
+                    # 配信中は聞き手が配信を見ている人みんな（相手が画面から離れている前提の注記は事実と違う）
+                    + ("（配信を見ている人みんなに向けて）。" if stream else "（相手は今こちらに注意を向けていない）。")
                     # 2026-10-04: 応答を Gemini にしたら、自発発話でだけ問いかけを「。」で終えた（5/5・ユーザ発話への返事では
                     # 「？」を付ける）。読み上げは「？」で語尾が上がるので、問いかけが平らに読まれる
-                    "問いかける時は文末に「？」を付ける。\n"
+                    + "問いかける時は文末に「？」を付ける。\n"
                     # 2026-10-05: 発話判定は「話すか・何について」までを決め、言い回しはイブ（応答モデル）が決める。
                     # 判定の書いた文をそのまま言わせると、判定モデルの言い回し（「そういえば〜？」ばかり）と
                     # 口調（タメ口）がそのまま出ていた
-                    f"話しかける中身（発話判定のメモ。言い回しや切り出し方はあなたが決める）: {autonomous_content}"
+                    + f"話しかける中身（発話判定のメモ。言い回しや切り出し方はあなたが決める）: {autonomous_content}"
                     + (
                         # ②-6: コード側のゲートが立った時だけ出す（常時出すと新しい会話でも
                         # 不要に「前に」と言い出す）。メモは判定LLMが「10日前」と正しく

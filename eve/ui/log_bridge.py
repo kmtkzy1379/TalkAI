@@ -32,6 +32,9 @@ _ROUTES: tuple[tuple[str, str, str], ...] = (
     ("eve.feedback.worker", "mind", "system"),
     ("eve.speech.monitor", "mind", "system"),           # 🔔 発話判定・🔇 抑制
     ("eve.control", "chat", "system"),                  # 🎛 機能 ON/OFF の確定と待ち（会話タブに出す）
+    ("eve.stream.chat", "chat", "viewer"),              # 💬 配信のコメント（イブに渡した1件）
+    ("eve.stream.manager", "chat", "system"),           # 🔴 配信の開始・終了・チャットの状態
+    ("eve.stream.scene", "chat", "system"),             # 🎬 OBS のシーンの用意
 )
 
 

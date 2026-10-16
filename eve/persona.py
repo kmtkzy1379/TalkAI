@@ -114,6 +114,17 @@ def persona_for(persona: str, how: str) -> str:
     return f"\n\n# イブの性格（{how}）\n{body}"
 
 
+# 配信中は性格の文の「短く」を外す（ユーザ 2026-10-16「配信中は短くはずしていいかも」）。性格の中身はユーザの物なので、
+# 外すのはこの語と直後の読点・句点だけ。実測: 配信のスタイルの「短く」を外すだけでは返事の中央 80→97字、
+# 性格の「短く」も外すと 137字（`tools/prompt_eval/stream_ab.py`・2026-10-15）
+_SHORT = re.compile(r"短く[、。]?")
+
+
+def persona_for_stream(persona: str) -> str:
+    """配信中に使う性格の文（「短く」の指示だけを外す）。無ければそのまま。"""
+    return _SHORT.sub("", persona or "")
+
+
 def persona_path() -> str:
     """実際に読む場所（起動ログ用）。"""
     return str(os.getenv("PERSONA_FILE") or _default_path())

@@ -59,6 +59,24 @@ def _g(o: object, k: str):
     return o.get(k) if isinstance(o, dict) else getattr(o, k, None)
 
 
+def _finish_reason(chunk) -> Optional[str]:
+    try:
+        r = chunk.choices[0].finish_reason
+    except (AttributeError, IndexError, KeyError, TypeError):
+        return None
+    return str(r) if r else None
+
+
+def _warn_cut(role: str, model: str, finish: Optional[str], out: list) -> None:
+    """モデルが返事を途中で止めた（安全のフィルター・長さの上限）ことをログに残す（黙って途切れると原因が追えない）。
+
+    実測 2026-10-15 の配信リハーサル: 応答が文の途中（「〜みたいなこと言」）で終わり、ログに何も残らなかった。
+    """
+    if finish in ("content_filter", "length", "safety", "SAFETY", "recitation", "RECITATION"):
+        logger.warning("✂ %s（%s）の返事が途中で止められた（%s・ここまで %d 字: %.40s）", role, model, finish,
+                       len("".join(out)), "".join(out)[-40:])
+
+
 def merge_tool_call_deltas(fragments) -> list[dict]:
     """streaming の tool_calls 断片（index 毎に id/name/arguments が分割）を1件ずつに結合する。
 
@@ -164,7 +182,9 @@ class ModelRegistry:
             from litellm import acompletion  # 遅延 import（テストは不要）
 
             resp = await acompletion(model=model, messages=messages, stream=True, **kwargs)
+            finish = None
             async for chunk in resp:
+                finish = _finish_reason(chunk) or finish
                 try:
                     delta = chunk.choices[0].delta.content
                 except (AttributeError, IndexError, KeyError, TypeError):
@@ -172,6 +192,7 @@ class ModelRegistry:
                 if delta:
                     out.append(delta)
                     yield delta
+            _warn_cut(role, model, finish, out)
         finally:
             _meter_record(lambda m: m.record_stream(
                 role=role, model=model, messages=messages, output="".join(out)))
@@ -199,7 +220,9 @@ class ModelRegistry:
 
             resp = await acompletion(model=model, messages=messages, stream=True, tools=tools, **kwargs)
             frags: list = []
+            finish = None
             async for chunk in resp:
+                finish = _finish_reason(chunk) or finish
                 try:
                     delta = chunk.choices[0].delta
                 except (AttributeError, IndexError, KeyError, TypeError):
@@ -212,6 +235,7 @@ class ModelRegistry:
                 if tcs:
                     frags.extend(tcs)
             tool_sink.extend(merge_tool_call_deltas(frags))
+            _warn_cut(role, model, finish, out)
         finally:
             # tools のスキーマも入力トークンに乗るので一緒に数える（無視すると過小評価になる）。
             _meter_record(lambda m: m.record_stream(

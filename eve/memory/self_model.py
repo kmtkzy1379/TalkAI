@@ -66,6 +66,36 @@ MAX_PER_SLOT = 2      # 1項目の値の上限（ユーザ指示「各項目1〜
 MAX_TOPIC_CHARS = 12  # 対象名の長さ上限
 MAX_VALUE_CHARS = 24  # 値の長さ上限（読み上げに載る長さ）
 
+# 返事に入れるのは、今の話しかけに近い項目だけ（ユーザ 2026-10-17「好みの種類が近いときに読み込ませる。好きな食べ物は？で
+# 好きな食べ物はプリンを入れる。好きな映画とかは同時に読み込ませない。RAG に似た感じ。0件でもいい」）。毎ターン全部入れて
+# いた時は、項目が少ないうちはその1つ（好きな食べ物: プリン）を聞かれていない所でも持ち出していた。
+# 近さは記憶の検索と同じ埋め込み（Ruri）で「好きな食べ物: プリン」と話しかけを両方クエリとして測る（実測 2026-10-17・
+# 仮の項目を足した12項目×46の話しかけ: 入れるべき項目は全部いちばん近く 0.859〜0.943、要らない話しかけの最大は 0.823）。
+# 配信のコメントは印（（チャット）名前: ）を外して測る（付けたままだと 0.02〜0.03 下がり「好きな映画ある？」を落とした）
+RECALL = True          # False なら従来どおり毎ターン全部入れる（測る口）
+RECALL_MIN = 0.85      # これ以上近い項目だけ入れる
+RECALL_MARGIN = 0.02   # いちばん近い項目からこれ以上離れた項目は入れない（食べ物を聞かれて飲み物・苦手な虫まで入れない）
+RECALL_TOP = 3
+# 置いている訳（聞かれた時に答えがぶれないため）を書くか（測る口）。毎回全部入れていた時に足した物で、近い時だけ入れる形では
+# 違いが出なかった（好きな食べ物・SNS・おやつを聞かれて答えがそろうのは訳の有無によらず 5/5・甘いものを聞かれて
+# プリンの話 5/5・聞かれていない所のプリン 4/25 と 3/25＝`tools/prompt_eval/stream_variety.py` の gate / gate+note）ので、
+# 10-16 までの注記に戻した（ユーザ 2026-10-17「プロフィール注釈必要かは検証が必要そう」）
+PURPOSE_NOTE = False
+# 配信のコメントの印（`stream.manager.format_comment` の「（チャット）名前: 」「（スーパーチャット ￥500・緑）名前: 」）
+_COMMENT_HEAD = re.compile(r"^（[^）\n]{1,40}）[^\n]{0,80}?: ")
+
+
+def comment_body(text: str) -> str:
+    """配信のコメントなら印と名前を外した本文（それ以外はそのまま）。近さを測る時だけに使う。純関数。"""
+    return _COMMENT_HEAD.sub("", text or "", count=1)
+
+
+def _cos(a, b) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    return dot / (na * nb) if na and nb else 0.0
+
 # 対象名の正規化で剥がす接頭辞。「好きな食べ物」と言われても対象は「食べ物」。
 # 完全な言い換え吸収は狙わない（できないと実測済み）。**表記ゆれだけ**を潰す。
 _PREFIX = re.compile(r"^(?:大?好きな?|嫌いな?|苦手な?|得意な?)")
@@ -141,8 +171,13 @@ class SelfModelStore:
         """表示順は「最近言及した順」ではなく安定順（極性→対象）＝毎ターン揺れないため。"""
         return sorted(self._slots.values(), key=lambda s: (POLARITIES.index(s.polarity), s.topic))
 
-    def render(self) -> str:
-        """system に入れる1ブロック。**何も無ければ空文字**（空の見出しを出さない）。
+    def entries(self) -> list[tuple[tuple[str, str], str]]:
+        """（キー, 1行）の一覧。1行は「好きな食べ物: プリン」の形（話しかけとの近さを測る文・`SelfRecall`）。"""
+        return [((s.polarity, s.topic), f"{s.label}: {' / '.join(f.value for f in s.facts)}")
+                for s in self._ordered() if s.facts]
+
+    def render(self, only=None) -> str:
+        """system に入れる1ブロック。**何も無ければ空文字**（空の見出しを出さない）。only はキーの集まり（その項目だけ）。
 
         文言の制約（実測に基づく・緩めると壊れる）:
         - 「今の会話に絡める」とは**書かない**。`# 参照`(RAG) にはその指示があり、それが
@@ -150,18 +185,22 @@ class SelfModelStore:
           （実機事故 2026-08-15 02:41）。ここは**聞かれた時に答えるための台帳**に徹する。
         - 「ここに無いことは決まっていない」を明示する。書いていない項目まで自信満々に
           即興されると、この層を作った意味が無くなる。
+        - 毎ターン全部入れていた時は、項目が少ないうちはその1つを聞かれていない所でも持ち出していた（2026-10-16 の
+          配信リハーサルで「好きな食べ物: プリン」がスパチャの使い道・貢ぎ物の話に毎回出た・21回中9回）。今は話しかけに
+          近い項目だけを入れる（`SelfRecall`）。置いている訳を書く案（`PURPOSE_NOTE`）は、近い時だけ入れる形では違いが無かった
         """
-        slots = [s for s in self._ordered() if s.facts]
+        slots = [s for s in self._ordered() if s.facts and (only is None or (s.polarity, s.topic) in only)]
         if not slots:
             return ""
         lines = [f"- {s.label}: {' / '.join(f.value for f in s.facts)}" for s in slots]
+        purpose = "聞かれた時に答えがぶれないように控えている。" if PURPOSE_NOTE else ""
+        asked = "" if PURPOSE_NOTE else "ここにある事は聞かれたら同じように答える。"
         return (
             "# イブ自身のこと（自分で言ったこと。理由なく変えない）\n"
             + "\n".join(lines)
-            + "\n（2つ並んでいるのは「どちらも好きで迷う」という意味。"
+            + f"\n（{purpose}2つ並んでいるのは「どちらも好きで迷う」という意味。"
               "ここに無いことはまだ決まっていない＝聞かれたら決めつけず、"
-              "その場で思ったことを言ってよい。ここにある事は聞かれたら同じように答える。"
-              "そのまま読み上げない。）"
+              f"その場で思ったことを言ってよい。{asked}そのまま読み上げない。）"
         )
 
     # --- 書き込み ---------------------------------------------------------
@@ -304,3 +343,39 @@ class SelfModelStore:
         slot.facts = [f for f in slot.facts if f.value != rec.get("value")]
         if not slot.facts:
             self._slots.pop((pol, top), None)
+
+
+class SelfRecall:
+    """控えのうち、今の話しかけに近い項目だけを返す（記憶の検索と同じ埋め込み・0件もある）。
+
+    応答の system に入れる `# イブ自身のこと` を作る（`ResponseOrchestrator` が刺激ごとに呼ぶ）。タスク担当には従来どおり
+    全部を渡す（goal の「イブの好きな〜」を解決するため・`task/agent.py`）。埋め込みが使えない時は全部を返す
+    （聞かれた時の答えがぶれない方に倒す）。
+    """
+
+    def __init__(self, store: SelfModelStore, embedder) -> None:
+        self.store = store
+        self._embedder = embedder
+        self._vecs: dict[str, list[float]] = {}  # 項目の1行 → 埋め込み（値が変わった項目だけ作り直す）
+
+    async def block_for(self, text: str) -> str:
+        if not RECALL or self._embedder is None:
+            return self.store.render()
+        entries = self.store.entries()
+        query = comment_body(text).strip()
+        if not entries or not query:
+            return ""
+        try:
+            q = await self._embedder.embed_query(query)
+            for _key, line in entries:
+                if line not in self._vecs:
+                    self._vecs[line] = await self._embedder.embed_query(line)
+        except Exception:
+            logger.exception("自分のことの控えの近さを測れなかった（全部入れる）")
+            return self.store.render()
+        scored = sorted(((_cos(q, self._vecs[line]), key) for key, line in entries), key=lambda x: -x[0])
+        best = scored[0][0]
+        keep = {key for s, key in scored[:RECALL_TOP] if s >= RECALL_MIN and s >= best - RECALL_MARGIN}
+        if keep:
+            logger.info("🙋 自分のことの控えから入れた: %s（%.3f）", "・".join(ln for k, ln in entries if k in keep), best)
+        return self.store.render(only=keep) if keep else ""

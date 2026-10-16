@@ -1,0 +1,65 @@
+/* イブの配信: YouTube のポップアウトチャット（OBS のブラウザソース「イブ チャット」に入れる CSS）。
+   YouTube の画面の作りが変わると一部が効かなくなることがある（その時もチャット自体は普通に表示される）。
+   OBS でこのソースの CSS を書き換えた場合、次の配信からも書き換えた方が使われる（上書きしない）。 */
+html, body {
+  background: rgba(255, 255, 255, 0.86) !important;
+  margin: 0 !important;
+  overflow: hidden !important;
+  font-family: "BIZ UDPGothic", "BIZ UDGothic", "Yu Gothic UI", "Meiryo", sans-serif !important;
+}
+yt-live-chat-app, yt-live-chat-renderer, #chat, #contents, #chat-messages,
+yt-live-chat-item-list-renderer, #item-scroller, #item-offset, #items {
+  background: transparent !important;
+}
+/* 見出し・入力欄・固定表示・案内など、配信の画面には要らない物 */
+yt-live-chat-header-renderer, #panel-pages, yt-live-chat-message-input-renderer, #input-panel,
+#ticker, yt-live-chat-ticker-renderer, yt-live-chat-banner-manager, #show-more,
+yt-live-chat-viewer-engagement-message-renderer, #separator,
+yt-reaction-control-panel-overlay-view-model, #reaction-control-panel-overlay,
+#action-panel, yt-live-chat-action-panel-renderer, yt-live-chat-poll-renderer {
+  display: none !important;
+}
+#item-scroller { overflow: hidden !important; }
+#timestamp { display: none !important; }
+
+/* 普通のコメント */
+yt-live-chat-text-message-renderer {
+  padding: 8px 18px !important;
+  border-bottom: 1px solid rgba(140, 107, 177, 0.12) !important;
+}
+yt-live-chat-text-message-renderer #author-photo {
+  width: 34px !important; height: 34px !important; margin-right: 12px !important;
+}
+yt-live-chat-text-message-renderer #author-photo img {
+  width: 34px !important; height: 34px !important; border-radius: 50% !important;
+}
+yt-live-chat-author-chip #author-name, #author-name {
+  font-size: 19px !important; font-weight: 800 !important; color: #8c6bb1 !important;
+}
+#author-name.owner { background: #f0b545 !important; color: #3b2a00 !important; border-radius: 6px !important; padding: 0 6px !important; }
+#author-name.moderator { color: #2f6fd6 !important; }
+#author-name.member { color: #2f9e5b !important; }
+yt-live-chat-text-message-renderer #message {
+  font-size: 23px !important; font-weight: 700 !important; line-height: 1.42 !important; color: #2a2433 !important;
+}
+yt-live-chat-text-message-renderer #message img.emoji, #message img {
+  width: 28px !important; height: 28px !important;
+}
+
+/* スーパーチャット・メンバー（YouTube の色はそのまま・字だけ大きく） */
+yt-live-chat-paid-message-renderer, yt-live-chat-membership-item-renderer,
+yt-live-chat-paid-sticker-renderer {
+  margin: 6px 12px !important;
+}
+yt-live-chat-paid-message-renderer #message, yt-live-chat-membership-item-renderer #message {
+  font-size: 22px !important; font-weight: 700 !important; line-height: 1.4 !important;
+}
+yt-live-chat-paid-message-renderer #author-name, yt-live-chat-paid-message-renderer #purchase-amount,
+yt-live-chat-membership-item-renderer #author-name, yt-live-chat-membership-item-renderer #header-subtext {
+  font-size: 19px !important; font-weight: 800 !important;
+}
+/* 色付きの帯の上の名前は YouTube の文字色のまま（上の紫だと緑・水色の帯で読めない＝リハーサルで確認 2026-10-15） */
+yt-live-chat-paid-message-renderer #author-name, yt-live-chat-membership-item-renderer #author-name,
+yt-live-chat-paid-sticker-renderer #author-name {
+  color: inherit !important; opacity: 0.85;
+}

@@ -59,6 +59,10 @@ class ConversationCache:
         self._restored_last_iso: Optional[str] = None
         self._restored_count = 0
         self._live_count = 0
+        # 起動中に入れる区切り（YouTube 配信の始まりと終わり・`mark_boundary`）。これより前の会話は注入しない
+        # （配信前の私的な会話を配信に持ち込まない・配信のコメントを配信後の会話に持ち込まない）。
+        self._boundary_iso: Optional[str] = None
+        self._since_boundary = 0
         self._write_queue: "asyncio.Queue[Optional[dict]]" = asyncio.Queue()
         self._write_task: Optional[asyncio.Task] = None
 
@@ -113,17 +117,30 @@ class ConversationCache:
         """前セッション最終発話の iso（無ければ None）。system の境界表示に使う。"""
         return self._restored_last_iso
 
+    def mark_boundary(self) -> None:
+        """ここで会話を区切る（これより前の会話は応答・発話判定に注入しない）。記録と RAG はそのまま残る。"""
+        self._boundary_iso = now_iso()
+        self._since_boundary = 0
+
+    def before_boundary(self, iso: Optional[str]) -> bool:
+        """起動中の区切りより前の時点か（区切りが無ければ False）。内省（直近フィードバック）の扱いに使う。"""
+        if self._boundary_iso is None:
+            return False
+        return not iso or iso <= self._boundary_iso
+
     def _live_turns(self) -> list[Turn]:
-        """**当セッションで記録された**ターンだけ（復元分を除く）。
+        """**当セッションで記録された**ターンだけ（復元分を除く・起動中の区切りがあればそれより後だけ）。
 
         判定は iso 比較（`add_turn` は `Stamp.now()` を打つので live は境界より必ず新しい）。
         システム時計が巻き戻ると live が境界以下になり得るので、その時は**無フィルタに倒し
         （＝従来挙動）ログを残す**（無言で会話ゼロにして沈黙化させない）。
         """
-        if self._restored_last_iso is None:
+        cut = max((c for c in (self._restored_last_iso, self._boundary_iso) if c), default=None)
+        if cut is None:
             return list(self._turns)
-        live = [t for t in self._turns if t.stamp.iso > self._restored_last_iso]
-        if self._live_count > 0 and not live:
+        live = [t for t in self._turns if t.stamp.iso > cut]
+        recorded = self._since_boundary if self._boundary_iso is not None else self._live_count
+        if recorded > 0 and not live:
             logger.warning("⏳ セッション境界の判定に失敗（時計の巻き戻り?）→ 復元分も注入する")
             return list(self._turns)
         return live
@@ -151,6 +168,7 @@ class ConversationCache:
         stamp = Stamp.now()
         self._turns.append(Turn(speaker, text, stamp))
         self._live_count += 1
+        self._since_boundary += 1
         try:
             self._write_queue.put_nowait(
                 {"ts": stamp.iso, "speaker": speaker, "text": text}
@@ -177,6 +195,10 @@ class ConversationCache:
         if not iso:
             return turns
         return [t for t in turns if t.stamp.iso > iso]
+
+    def since_boundary(self) -> list[Turn]:
+        """この起動の、区切り（配信の始まり・終わり）より後のターン（配信中にイブが何を話したかを数えるのに使う）。"""
+        return self._live_turns()
 
     def recent_for_injection(self, window: Optional[int] = None) -> list[Turn]:
         """応答LLM へ注入する直近会話を選ぶ（自律発話で文脈が逸れないように）。

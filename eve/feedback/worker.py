@@ -95,6 +95,10 @@ class FeedbackWorker:
         """未処理ありを通知（非ブロッキング）。応答クリティカルパスを汚さない。"""
         self._event.set()
 
+    def is_idle(self) -> bool:
+        """処理中でなく、保留中のトリガも無い（配信の開始前に内省を済ませる待ちで使う）。"""
+        return self._idle.is_set() and not self._event.is_set()
+
     # --- worker 本体 ------------------------------------------------------
 
     async def _run_forever(self) -> None:

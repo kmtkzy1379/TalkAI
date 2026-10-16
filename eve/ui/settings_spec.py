@@ -14,9 +14,10 @@ Phase 3 で項目が 45 件を超える。1件ずつメソッドを書くと、�
   `RAG_DUP_HARDCUT` / `RAG_REL_BASELINE` / `RAG_RELEVANCE_FLOOR` /
   `SPEECH_DUP_EMB_THRESHOLD` / `VLM_DEDUP_RATIO` / `VLM_BLANK_STD_THRESHOLD` /
   `SILENCE_TICK_SEC` ほか。ユーザ側に動かす判断材料が無く、ずらすと静かに劣化するだけ。
-- **消費者ゼロの設定**: `VLM_MERGE_MODEL` / `YOUTUBE_MODEL` / `YOUTUBE_API_KEY` /
-  `TARGET_CHANNEL_ID` / `VTS_PATH`。使うコードが1行も無いので、出すと
+- **消費者ゼロの設定**: `VLM_MERGE_MODEL` / `YOUTUBE_MODEL` / `VTS_PATH`。使うコードが1行も無いので、出すと
   「設定したのに効かない」という嘘になる。
+- **YouTube 配信の設定**（`YOUTUBE_API_KEY` / `TARGET_CHANNEL_ID` / `STREAM_*` / `OBS_*`・2026-10-15 から配信モードが使う）:
+  まだこのタブには出していない（`.env` で設定する）。
 - **記憶ファイル名**: `HISTORY_FILE` / `RAG_FILE` / `TASK_FILE`。変えると記憶が
   消えたように見える。
 """

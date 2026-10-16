@@ -161,6 +161,18 @@ class RagStore:
                 best = ts
         return best
 
+    def summaries_between(self, since_iso: str, until_iso: str, k: int = 6) -> list[str]:
+        """会話の時刻（チャンクの timestamp＝内省したスパンの末尾）が [since, until] の要約を古い順に、新しい方から k 件。
+
+        配信の始め・終わりの区切りで「直前に何を話していたか」を渡すのに使う（`VoiceLoop._carry_text`）。
+        内省は会話より後で書かれるが、timestamp は会話の時刻なので、区切りの後に書かれた分もここで拾える。
+        """
+        rows = [r for r in self._chunks
+                if isinstance(r.get("timestamp"), str) and since_iso <= r["timestamp"] <= until_iso
+                and (r.get("summary") or "").strip()]
+        rows.sort(key=lambda r: r["timestamp"])
+        return [str(r["summary"]).strip() for r in rows[-max(0, int(k)):]] if k > 0 else []
+
     # --- 書き込み ---------------------------------------------------------
 
     async def add_chunk(

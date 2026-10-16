@@ -21,8 +21,10 @@ SPEAKER_COLORS = {
     "eve": "#2b2b33",        # イブ（応答）
     "auto": "#8250df",       # 自発発話（イブが自分から話した）
     "system": "#6b6b76",     # 起動・状態など
+    "viewer": "#c2410c",     # 配信の視聴者のコメント
 }
-SPEAKER_LABELS = {"user": "あなた", "eve": "イブ", "auto": "イブ（自分から）", "system": "システム"}
+SPEAKER_LABELS = {"user": "あなた", "eve": "イブ", "auto": "イブ（自分から）", "system": "システム",
+                  "viewer": "リスナー"}
 
 
 def menu_button_qss(state: str) -> str:
@@ -35,6 +37,9 @@ def menu_button_qss(state: str) -> str:
     """
     base = ("QPushButton{border-radius:9px; padding:7px 14px; font-weight:bold;"
             "border:1px solid %s;}" % LINE)
+    if state == "live":  # 配信中（赤・目立たせる）
+        return base + ("QPushButton{background:#e5484d; color:#fff; border-color:#c93a3f;}"
+                       "QPushButton:hover{background:#d93d42;}")
     if state == "on":
         return base + ("QPushButton{background:#eaf3ff; color:#1f6feb; border-color:#a9ccf5;}"
                        "QPushButton:hover{background:#dceaff;}")

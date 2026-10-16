@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from typing import Callable, Optional
 
-from .clock import now_mono
+from .clock import now_iso, now_mono
 from .config import Config
 from .context_assembler import ContextAssembler
 from .feedback import FeedbackLLM, FeedbackWorker, PredictionState
@@ -37,12 +37,12 @@ from .task import (
 from .response.input_source import MicSttInputSource
 from .response.orchestrator import REDELIVER_MAX_ATTEMPTS, ResponseOrchestrator
 from .response.player import RealAudioPlayer
-from .response.style import SPEECH_STYLE
+from .response.style import SPEECH_STYLE, SPEECH_STYLE_STREAM
 from .response.tts import VoicevoxTTS
 from .emotion import EmotionState
 from .speech import SilenceMonitor, SpeechDecider, SpeechState, make_decide_fn
-from .memory.self_model import SelfModelStore
-from .persona import load_persona, persona_path
+from .memory.self_model import SelfModelStore, SelfRecall
+from .persona import load_persona, persona_for_stream, persona_path
 from .persona_examples import StyleExamples, examples_path, load_examples
 from .self_model.worker import SelfModelWorker
 from .stt import make_stt
@@ -51,6 +51,21 @@ from .vlm.capture import ScreenCapture
 from .vlm.capture_thread import CaptureThread
 
 logger = logging.getLogger(__name__)
+
+# 配信の始め・終わりの区切りで持ち越す要約（`VoiceLoop._carry_text`）: 配信の前は手前30分・配信の後は30分間・最大6件
+CARRY_PRE_SEC = 1800.0
+CARRY_POST_SEC = 1800.0
+CARRY_MAX = 6
+
+
+def _iso_shift(iso: str, sec: float) -> str:
+    from datetime import datetime, timedelta
+
+    return (datetime.fromisoformat(iso) + timedelta(seconds=sec)).isoformat()
+
+
+def _minutes(sec: float) -> int:
+    return max(1, int(round(sec / 60.0)))
 
 
 def _make_tts():
@@ -88,6 +103,10 @@ class VoiceLoop:
         # この参照を遅延 lambda で読む（作る前に呼ばれても None＝何も足さない）
         self.alchemy = None
         self._alchemy_react_task: Optional[asyncio.Task] = None
+        # YouTube 配信モード（既定 off）。実体は下で作る。応答・発話判定はこの参照を遅延 lambda で読む（配信していない時は None）
+        self.stream = None
+        # 配信の始め・終わりの区切りで持ち越す「直前に話していたこと」（`_carry_text`・無ければ None）
+        self._carry: Optional[dict] = None
         # API 使用量メーター（既定 off）。ON の時だけ ModelRegistry/STT/埋め込みが記録する。
         self.usage = None
         if Config.USAGE_LOG_ENABLED:
@@ -129,11 +148,14 @@ class VoiceLoop:
         # 既定 off。ON なら応答文脈と TaskAgent の両方に `# イブ自身のこと` が渡る。
         self.self_model = None
         self.self_model_worker = None
+        self.self_recall = None
         if Config.SELF_MODEL_ENABLED:
             self.self_model = SelfModelStore(Config.SELF_MODEL_FILE)
             self.self_model_worker = SelfModelWorker(
                 model_registry=self.registry, store=self.self_model, cache=self.cache,
             )
+            # 応答には今の話しかけに近い項目だけを入れる（記憶の検索と同じ埋め込み・ユーザ 2026-10-17）
+            self.self_recall = SelfRecall(self.self_model, self.embedder)
 
         # F4 内分泌系: 各応答後に非同期で内省 → RAG 書込 + surprise + 直近フィードバック注入。
         self.prediction = PredictionState()  # loop 所有・単一書込（feedback/VLM が書く）
@@ -161,6 +183,8 @@ class VoiceLoop:
             ),
             # Alchemy の部屋・対戦中だけ事実を渡す（普段は None＝発話判定の入力は変わらない）
             game_provider=lambda: self.alchemy.decider_block() if self.alchemy is not None else None,
+            # YouTube 配信中だけ事実を渡す（配信していない時は None）
+            stream_provider=lambda: self.stream.decider_block() if self.stream is not None else None,
         )
 
         # F6 VLM サイドカー: 専用スレッドが capture→gate→on_frame、single-flight worker が
@@ -345,6 +369,21 @@ class VoiceLoop:
                                   or not self.audio.is_quiet() or self.audio.is_playing()))
                 register_alchemy_capabilities(self.capabilities, self.alchemy)
 
+        # YouTube 配信モード（ユーザ指定 2026-10-15・既定 off）。UI の［配信］ボタンから ControlPlane が start/stop する。
+        # コメントは「イブの手が空いた時」に1件ずつユーザ発話として入る（割り込まない）
+        if Config.STREAM_ENABLED:
+            from .stream import StreamManager, StreamSettings
+
+            self.stream = StreamManager(
+                StreamSettings.from_config(), is_free=self._free_for_comment, submit=self.submit_stream_comment,
+                before_stream=self._stream_session_start, on_live=self._stream_live,
+                after_stream=self._stream_session_end)
+            self.stream.on_end = self._stream_ended
+            # 配信中にイブが画面に出した窓（作業の結果）を数えて閉じるため（タスクが無い構成では空）
+            self.stream.viewers_fn = lambda: self.workspace.live_viewers() if self.workspace is not None else []
+            # この配信の会話（区切りより後）。イブの発言に何度も出ている言葉を数える（`StreamManager._repeat_fact`）
+            self.stream.turns_fn = self.cache.since_boundary
+
         # 応答LLM の reasoning_effort（Config.RESPONSE_REASONING_EFFORT・gpt-6-luna は none 必須）。
         # litellm は gpt-6-luna がこの引数を受けることを知らないので allowed_openai_params で通す（emotion.py と同じ）
         effort = Config.RESPONSE_REASONING_EFFORT.strip()
@@ -377,6 +416,8 @@ class VoiceLoop:
             # を繰り返す（CLAUDE.md の v1 問題5）。無ければ従来どおりペルソナ無しで動く。
             ContextAssembler(system_prompt="\n\n".join(
                 p for p in (SPEECH_STYLE, self.persona) if p),
+                stream_system_prompt="\n\n".join(
+                    p for p in (SPEECH_STYLE_STREAM, persona_for_stream(self.persona)) if p),
                 reply_opener=self._reply_opener()),  # S4: 応答依存フィラー（ユーザ発話への応答だけ）
             # 文ごとの合成を同時にいくつ投げるか（Irodori はサーバが1本ずつ処理するので 2・S1）
             tts_concurrency=getattr(self.tts, "concurrency", 3),
@@ -385,6 +426,7 @@ class VoiceLoop:
             on_response_complete=self._on_response_complete,  # 正常完了で feedback + 沈黙時計リセット
             # 空の台帳で起動しても配線する（`is not None`・上の TaskAgent と同じ理由）
             self_model_fn=(lambda: self.self_model.render()) if self.self_model is not None else None,
+            self_model_pick=self.self_recall.block_for if self.self_recall is not None else None,
             vision_state=self.vision_state,  # F6: 応答文脈に直近画面を注入
             dispatcher=self.dispatcher,  # J: tool_calls を応答完了後に submit（gate は CALLFUNCTION_ENABLED）
             tasks_provider=tasks_provider,  # J-1/Fix#2: 予約タスク状態の毎ターン注入（TASK_ENABLED 時のみ）
@@ -407,6 +449,8 @@ class VoiceLoop:
             game_provider=lambda: self.alchemy.voice_block() if self.alchemy is not None else None,
             # 委譲の使い方は delegate_task が出ている時だけ（UI でタスクを切っても Alchemy の機能は残るため）
             delegation_offered=lambda: self.capabilities.has("delegate_task"),
+            # YouTube 配信中だけ `# 配信`（誰が見ているか・コメントの形）を入れる（配信していない時は None）
+            stream_provider=lambda: self.stream.voice_block() if self.stream is not None else None,
         )
         self.runner = PipelineRunner(self.queue, self.orchestrator, self.audio)
         # 沈黙監視は応答中(runner busy)/ユーザ発話中/フィラー中は発火しない。
@@ -427,6 +471,12 @@ class VoiceLoop:
         )
         # イブの音が鳴り始める時、ユーザがまだ話していたら最初の節で譲る（割り込みのかけ直し）
         self.audio.add_start_listener(self._yield_if_user_speaking)
+        if self.stream is not None:
+            self.audio.add_text_listener(self.stream.on_sentence)  # 配信の字幕（配信していない時は何もしない）
+            self.orchestrator.carry_provider = self._carry_text  # 配信の始め・終わりで直前の会話の要約を持ち越す
+            # 配信中は自分から話すかを考え直す間隔を短く保つ（話すかどうかはイブが決める）
+            self.silence_monitor.max_interval_fn = (
+                lambda: Config.STREAM_SPEECH_MAX_INTERVAL_SEC if self.stream.active else None)
         self._tasks: list[asyncio.Task] = []
         # 再配達（barge-in で潰れた機能報告）の待機タスク。done で自己除去・stop() で cancel。
         self._redeliver_waiters: "set[asyncio.Task]" = set()
@@ -710,6 +760,113 @@ class VoiceLoop:
         task = asyncio.create_task(self.queue.put(
             Stimulus(StimulusKind.USER_UTTERANCE, payload=text)))
         # 参照を保持する（create_task の戻り値を捨てると GC で消えうる）
+        self._ui_tasks.add(task)
+        task.add_done_callback(self._ui_tasks.discard)
+
+    # --- YouTube 配信モード（`eve/stream/`）-----------------------------------
+
+    def _free_for_comment(self) -> bool:
+        """配信のコメントを渡してよい間か（イブが話していない・考えていない・ユーザ（持ち主）が話していない）。
+
+        コメントは割り込まない（話している途中のイブを止めない・ユーザ指定は「音声合成完了後に最新コメントを取得」）。
+        待っている自発発話の下書きはコメントに譲る（渡す時に捨てる＝`submit_stream_comment`）ので、それだけは数えない。
+        """
+        if self.runner.is_paused() or self.runner.is_busy():
+            return False
+        if not self.audio.is_quiet() or self.audio.is_playing():
+            return False
+        if self.speech_state.user_speaking or self.speech_state.stt_pending or self._filler_active():
+            return False
+        return all(s.kind == StimulusKind.AUTONOMOUS_SPEECH for s in self.queue.snapshot())
+
+    def submit_stream_comment(self, text: str, dedup_key: str) -> None:
+        """配信のコメントをユーザ発話として入れる（**loop 上・手が空いた時だけ呼ばれる＝割り込みはしない**）。
+
+        `submit_user_text` と違って `_barge_in` を呼ばない。沈黙時計を戻し（＝判定中の自発発話は seq の変化で捨てられる）、
+        判定済みでまだ話していない自発発話の下書きはコメントに譲って捨てる。会話の記録は orchestrator が行う。
+        """
+        self.speech_state.mark_user_utterance()
+        self.queue.discard_kind(StimulusKind.AUTONOMOUS_SPEECH)
+        task = asyncio.create_task(self.queue.put(
+            Stimulus(StimulusKind.USER_UTTERANCE, payload=text, dedup_key=dedup_key)))
+        self._ui_tasks.add(task)
+        task.add_done_callback(self._ui_tasks.discard)
+
+    async def _stream_session_start(self, wait_sec: float = 20.0) -> None:
+        """配信の前: 直前の会話の内省を済ませてから会話に区切りを入れる（配信前の私的な会話を配信の文脈に入れない）。
+
+        内省（直近フィードバック）は区切りより前の分を応答・発話判定に入れない（orchestrator / decider）。先に済ませて
+        おかないと、配信の最初の内省が配信前の会話までまとめて要約し、それが配信の文脈に入ってしまう。
+        """
+        self.feedback_worker.trigger()
+        t0 = now_mono()
+        while now_mono() - t0 < wait_sec:
+            await asyncio.sleep(0.3)
+            if not self.cache.turns_since(self.prediction.watermark) and self.feedback_worker.is_idle():
+                break
+        else:
+            logger.warning("配信前の会話の内省が %.0f 秒で終わらなかった（区切りは入れて配信を始める）", wait_sec)
+        now = now_iso()
+        # 区切りの手前30分に話していたことの要約を、配信中の返事に渡す（会話そのものは入れない＝前の短い返事に長さが
+        # 引っ張られない・私的なことを言いにくい。入れないと「さっきの話」を忘れる。実測 2026-10-16
+        # `tools/prompt_eval/stream_switch.py`: 覚えていた 区切る 0/4・混ぜる 4/4・要約 4/4／最初のコメントへの返事
+        # 74・52・90字／私的な語 0/4・2/4・0/4）
+        self._carry = {"kind": "pre", "since": _iso_shift(now, -CARRY_PRE_SEC), "until": now}
+        self.cache.mark_boundary()
+
+    def _stream_live(self) -> None:
+        """配信が始まった（ここから先の判定には配信の事実が入る）: それまでに決めた自発発話は捨てる。
+
+        実測 2026-10-15: 配信の準備中（OBS の用意の数秒）に決めた最初の話題が、配信の事実なしに配信前の持ち主との会話から
+        選ばれ、配信の最初の一言になった。判定中の分は seq で、決まって待っている分はキューから捨てる。
+        """
+        self.speech_state.mark_session_start()
+        self.queue.discard_kind(StimulusKind.AUTONOMOUS_SPEECH)
+
+    def _stream_session_end(self) -> None:
+        """配信の後: 会話に区切りを入れる（配信のコメントを、配信後の持ち主との会話の文脈に入れない）。
+
+        配信中に決めた（視聴者に向けた）自発発話も、配信が終わった後には話さない。
+        配信の様子は要約だけを、配信の後しばらく（CARRY_POST_SEC）返事に渡す（「配信どうだった？」に答えられるように）。
+        """
+        st = self.stream
+        if st is not None and st.started_iso:
+            note = (f"配信は約{_minutes(st.elapsed_sec())}分・コメント {st.total}件（{len(st.people)}人）。"
+                    if st.started_mono else "")
+            self._carry = {"kind": "post", "since": st.started_iso, "until": now_iso(), "note": note,
+                           "expires": now_mono() + CARRY_POST_SEC}
+        self.cache.mark_boundary()
+        self.speech_state.mark_session_start()
+        self.queue.discard_kind(StimulusKind.AUTONOMOUS_SPEECH)
+
+    def _carry_text(self) -> Optional[str]:
+        """区切りの手前で話していたことの要約（見出し込み）。配信中は配信の前の会話、配信の後しばらくは配信のこと。"""
+        c = self._carry
+        if c is None:
+            return None
+        streaming = self.stream is not None and self.stream.active
+        if c["kind"] == "pre" and not streaming:
+            return None
+        if c["kind"] == "post":
+            if streaming:
+                return None
+            if now_mono() > c["expires"]:
+                self._carry = None
+                return None
+        lines = self.rag.summaries_between(c["since"], c["until"], k=CARRY_MAX)
+        if not lines and not c.get("note"):
+            return None
+        head = ("# 配信の直前に開発者と話していたこと（要約・視聴者はこの会話を知らない）" if c["kind"] == "pre"
+                else "# さっきまでの配信（要約）")
+        body = "\n".join(f"- {s}" for s in lines)
+        return "\n".join(x for x in (head, body, c.get("note") or "") if x)
+
+    def _stream_ended(self, reason: str) -> None:
+        """OBS で止めた・YouTube で終えた等、外で配信が終わった（loop 上）。機能の戻しは ControlPlane に任せる。"""
+        if self.control is not None:
+            self.control.request("stream", False)
+            return
+        task = asyncio.create_task(self.stream.stop())  # UI が無い（ControlPlane が無い）時はここで止める
         self._ui_tasks.add(task)
         task.add_done_callback(self._ui_tasks.discard)
 
@@ -1119,6 +1276,12 @@ class VoiceLoop:
 
     async def stop(self) -> None:
         self.input.stop()
+        if self.stream is not None:
+            # 配信中なら OBS の配信を止める（イブが居なくなった画面を流し続けない）・OBS の音を戻す
+            try:
+                await self.stream.shutdown()
+            except Exception:
+                logger.exception("配信の後片付けで例外（続行）")
         if self.laugh is not None:
             try:
                 await self.laugh.stop()  # 判定中の問い合わせを止める

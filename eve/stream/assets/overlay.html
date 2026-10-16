@@ -1,0 +1,180 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>イブ 字幕</title>
+<!--
+  OBS のブラウザソース（キャンバス全体・透明）。配置の数字は Python（eve/stream/scene.py）が下の LAYOUT に埋める。
+  中身は obs-websocket の CallVendorRequest（obs-browser の emit_event）で "eve" という名前のイベントとして届く:
+    {type: "say", text}          イブが今から話す1節（字幕に足す）
+    {type: "comment", kind, name, text, amount, badge}   イブが今から返事をするコメント
+    {type: "comment_done"}       そのコメントへの返事が終わった
+    {type: "state", chat, note}  チャットの状態（waiting / live / ended / error / quota）
+  コメントの文字は視聴者が書いたもの → **必ず textContent で入れる**（HTML として解釈させない）。
+-->
+<style>
+  html, body { margin: 0; padding: 0; background: transparent; overflow: hidden; }
+  body { font-family: "BIZ UDPGothic", "BIZ UDGothic", "Yu Gothic UI", "Meiryo", sans-serif; color: #2a2433; }
+  #stage { position: absolute; left: 0; top: 0; width: 1920px; height: 1080px; transform-origin: 0 0; }
+  .abs { position: absolute; box-sizing: border-box; }
+
+  /* Live2D の枠: 枠の外側（角）を背景の色で塗って角を丸く見せる */
+  .clip { overflow: hidden; }
+  .round { position: absolute; inset: 0; box-shadow: 0 0 0 40px var(--bg); }
+  #l2d-round { border-radius: 28px; }
+  #chat-round { border-radius: 22px; }
+  #l2d-line { border-radius: 28px; border: 5px solid rgba(255,255,255,0.95);
+              box-shadow: 0 6px 22px rgba(90,70,120,0.18), inset 0 0 0 1px rgba(140,107,177,0.25); }
+
+  /* チャット: 見出しの帯（中身は YouTube のチャット＝別のソース） */
+  #chat-head { border-radius: 22px 22px 0 0; background: linear-gradient(90deg, #a98cc9, #8c6bb1);
+               color: #fff; font-weight: 800; font-size: 26px; letter-spacing: 0.04em;
+               display: flex; align-items: center; gap: 12px; padding: 0 20px; }
+  #chat-head .dot { width: 14px; height: 14px; border-radius: 50%; background: #ff5a5a;
+                    box-shadow: 0 0 0 4px rgba(255,90,90,0.25); }
+  #chat-line { border-radius: 22px; border: 5px solid rgba(255,255,255,0.95);
+               box-shadow: 0 6px 22px rgba(90,70,120,0.18); pointer-events: none; }
+  #chat-wait { display: flex; align-items: center; justify-content: center; text-align: center;
+               font-size: 26px; font-weight: 700; color: #8b8296; line-height: 1.6; padding: 24px;
+               background: rgba(255,255,255,0.82); border-radius: 0 0 22px 22px; }
+
+  /* イブの発話（字幕） */
+  #sub { border-radius: 28px; background: rgba(255,255,255,0.93); border: 5px solid rgba(255,255,255,0.98);
+         box-shadow: 0 8px 26px rgba(90,70,120,0.20), inset 0 0 0 1px rgba(140,107,177,0.22); }
+  #sub-head { position: absolute; left: 26px; top: 12px; display: flex; align-items: center; gap: 10px; }
+  .heart { width: 30px; height: 26px; }
+  #sub-name { margin-left: 10px; font-size: 30px; font-weight: 800; color: #8c6bb1; letter-spacing: 0.06em; }
+  #sub-body { position: absolute; left: 34px; right: 34px; top: 60px; bottom: 16px; overflow: hidden;
+              display: flex; flex-direction: column; justify-content: flex-end; }
+  #sub-text { font-size: 46px; font-weight: 800; line-height: 1.32; color: #2a2433; letter-spacing: 0.02em;
+              word-break: break-all; transition: opacity 0.6s; }
+  #sub-text.fade { opacity: 0; }
+
+  /* 今返事をしているコメント */
+  #card { max-width: 820px; padding: 16px 24px 18px; border-radius: 22px; background: rgba(255,255,255,0.95);
+          border: 4px solid rgba(255,255,255,1); box-shadow: 0 8px 24px rgba(60,40,90,0.25);
+          opacity: 0; transform: translateY(14px); transition: opacity 0.35s, transform 0.35s; }
+  #card.show { opacity: 1; transform: translateY(0); }
+  #card-top { display: flex; align-items: center; gap: 12px; margin-bottom: 6px; }
+  #card-badge { display: none; font-size: 22px; font-weight: 800; color: #fff; padding: 4px 14px;
+                border-radius: 999px; background: #8c6bb1; }
+  #card-badge.money { background: linear-gradient(90deg, #f0a43a, #e5732d); }
+  #card-badge.member { background: linear-gradient(90deg, #5fbf7a, #2f9e5b); }
+  #card-name { font-size: 26px; font-weight: 800; color: #8c6bb1; }
+  #card-text { font-size: 32px; font-weight: 800; line-height: 1.35; color: #2a2433; word-break: break-all; }
+</style>
+</head>
+<body>
+<div id="stage">
+  <div id="l2d-clip" class="abs clip"><div id="l2d-round" class="round"></div></div>
+  <div id="chat-clip" class="abs clip"><div id="chat-round" class="round"></div></div>
+  <div id="l2d-line" class="abs"></div>
+
+  <div id="chat-head" class="abs"><span class="dot"></span><span>チャット</span></div>
+  <div id="chat-wait" class="abs">チャットを準備しています…</div>
+  <div id="chat-line" class="abs"></div>
+
+  <div id="card" class="abs">
+    <div id="card-top"><span id="card-badge"></span><span id="card-name"></span></div>
+    <div id="card-text"></div>
+  </div>
+
+  <div id="sub" class="abs">
+    <div id="sub-head">
+      <svg class="heart" viewBox="0 0 30 26"><path fill="#d9acd6" d="M15 25C6 18 1 13 1 7.5 1 3.6 4.1 1 7.6 1c3 0 5.4 1.7 7.4 4.3C17 2.7 19.4 1 22.4 1 25.9 1 29 3.6 29 7.5 29 13 24 18 15 25z"/></svg>
+      <svg class="heart" viewBox="0 0 30 26"><path fill="#e6ca6f" d="M15 25C6 18 1 13 1 7.5 1 3.6 4.1 1 7.6 1c3 0 5.4 1.7 7.4 4.3C17 2.7 19.4 1 22.4 1 25.9 1 29 3.6 29 7.5 29 13 24 18 15 25z"/></svg>
+      <svg class="heart" viewBox="0 0 30 26"><path fill="#a3d585" d="M15 25C6 18 1 13 1 7.5 1 3.6 4.1 1 7.6 1c3 0 5.4 1.7 7.4 4.3C17 2.7 19.4 1 22.4 1 25.9 1 29 3.6 29 7.5 29 13 24 18 15 25z"/></svg>
+      <span id="sub-name">イブ</span>
+    </div>
+    <div id="sub-body"><div id="sub-text"></div></div>
+  </div>
+</div>
+<script>
+(function () {
+  const L = /*LAYOUT*/null || {W: 1920, H: 1080, live2d: [28, 28, 1308, 782], chat: [1364, 28, 528, 782],
+                                 subtitle: [28, 838, 1864, 214], bg: "#EAE5EF", canvas: [1920, 1080]};
+  const $ = (id) => document.getElementById(id);
+  const stage = $("stage");
+  document.documentElement.style.setProperty("--bg", L.bg);
+  function place(el, r, dy, dh) {
+    el.style.left = r[0] + "px"; el.style.top = (r[1] + (dy || 0)) + "px";
+    el.style.width = r[2] + "px"; el.style.height = (r[3] + (dh || 0)) + "px";
+  }
+  function fit() {
+    const s = Math.min(window.innerWidth / L.W, window.innerHeight / L.H) || 1;
+    stage.style.transform = "scale(" + s + ")";
+  }
+  const HEAD = L.head || 52;  // チャットの見出しの帯の高さ（チャット本体はこの下・scene.py の CHAT_HEAD）
+  place($("l2d-clip"), L.live2d); place($("l2d-line"), L.live2d);
+  place($("chat-clip"), L.chat);
+  place($("chat-head"), [L.chat[0], L.chat[1], L.chat[2], HEAD]);
+  place($("chat-wait"), L.chat, HEAD, -HEAD);
+  place($("chat-line"), L.chat);
+  place($("sub"), L.subtitle);
+  const card = $("card");
+  card.style.left = (L.live2d[0] + 26) + "px";
+  card.style.bottom = (L.H - (L.live2d[1] + L.live2d[3]) + 26) + "px";
+  fit();
+  window.addEventListener("resize", fit);
+
+  // --- 字幕: 間が空いたら新しい発話として書き直す。黙ってしばらくしたら消す
+  const subText = $("sub-text");
+  let cur = "", lastSay = 0, clearTimer = null;
+  function say(text) {
+    const now = Date.now();
+    if (now - lastSay > 3500) cur = "";
+    cur = (cur + (text || "")).slice(-240);
+    lastSay = now;
+    subText.classList.remove("fade");
+    subText.textContent = cur;
+    if (clearTimer) clearTimeout(clearTimer);
+    clearTimer = setTimeout(() => { subText.classList.add("fade"); }, 9000);
+  }
+
+  // --- 今返事をしているコメント
+  // 返事が終わってから少し残して消す。その間に次のコメントが来たら、消す予約は取り消す
+  // （取り消さないと、続けて読んだ2件目のカードが出た直後に消えた＝リハーサルで確認 2026-10-15）
+  let cardTimer = null, doneTimer = null;
+  function showComment(d) {
+    if (doneTimer) { clearTimeout(doneTimer); doneTimer = null; }
+    const badge = $("card-badge");
+    badge.className = ""; badge.style.display = "none"; badge.textContent = "";
+    if (d.badge) {
+      badge.textContent = d.badge;
+      badge.style.display = "inline-block";
+      if (d.kind === "superchat" || d.kind === "supersticker" || d.kind === "gift") badge.className = "money";
+      else if (d.kind === "member" || d.kind === "milestone" || d.kind === "gift_members") badge.className = "member";
+    }
+    $("card-name").textContent = d.name || "";
+    $("card-text").textContent = d.text || "";
+    $("card-text").style.display = d.text ? "block" : "none";
+    card.classList.add("show");
+    if (cardTimer) clearTimeout(cardTimer);
+    cardTimer = setTimeout(hideComment, 40000);  // 終わりの知らせが来なくても残り続けない
+  }
+  function hideComment() { card.classList.remove("show"); }
+
+  // --- チャットの状態（読めるまでの間は案内を出す）
+  function chatState(d) {
+    const w = $("chat-wait");
+    if (d.chat === "live") { w.style.display = "none"; return; }
+    w.style.display = "flex";
+    w.textContent = d.note || "チャットを準備しています…";
+  }
+
+  window.addEventListener("eve", (e) => {
+    const d = (e && e.detail) || {};
+    try {
+      if (d.type === "say") say(d.text);
+      else if (d.type === "comment") showComment(d);
+      else if (d.type === "comment_done") {
+        if (doneTimer) clearTimeout(doneTimer);
+        doneTimer = setTimeout(() => { doneTimer = null; hideComment(); }, 2500);
+      }
+      else if (d.type === "state") chatState(d);
+    } catch (err) { /* 表示のための処理で止まらない */ }
+  });
+})();
+</script>
+</body>
+</html>

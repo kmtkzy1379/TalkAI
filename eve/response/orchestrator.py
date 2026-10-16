@@ -117,6 +117,14 @@ def _render_recent(turns: Optional[list]) -> str:
     return "\n".join(lines)
 
 
+def _recall_query(stimulus: Stimulus) -> str:
+    """自分のことの控えの近さを測る文: ユーザ発話はその文・自発発話は判定のメモ・機能の報告は結果。"""
+    payload = stimulus.payload
+    if isinstance(payload, (AutonomousSpeech, CallFunctionResult)):
+        return payload.content or ""
+    return str(payload)
+
+
 class ResponseOrchestrator:
     def __init__(
         self,
@@ -138,6 +146,9 @@ class ResponseOrchestrator:
         is_suppressed: Optional[Callable[[Optional[str]], bool]] = None,  # D2 任意: 取消済み報告の判定（同期）
         features_off_provider: Optional[Callable[[], list[str]]] = None,  # UI 任意: 今オフの機能
         self_model_fn: Optional[Callable[[], str]] = None,  # 任意: イブ自身の好み（`# イブ自身のこと`）
+        # 任意: 今の話しかけ（自発発話はそのメモ・機能の報告は結果）に近い好みだけの `# イブ自身のこと`（0件なら ""）。
+        # あれば self_model_fn より優先する（`memory/self_model.SelfRecall`・ユーザ 2026-10-17「好みの種類が近いときに読み込ませる」）
+        self_model_pick: Optional[Callable[[str], Awaitable[str]]] = None,
         # S3 任意: 「応答が近い」合図（そのターンで最初の文の合成を始めた瞬間＝音声まで約0.2〜0.35秒）。
         # フィラーはこれで新しい語を始めない（同期・非ブロッキング・例外は握る）。
         on_first_sentence: Optional[Callable[[], None]] = None,
@@ -158,6 +169,8 @@ class ResponseOrchestrator:
         # 任意: 委譲（delegate_task）が今出ているか。タスクを UI で切っても Alchemy の機能は残るので「tool がある」だけでは
         # 委譲の使い方を出す理由にならない（出すと無い delegate_task を使うつもりで喋る）。None なら従来どおり tool の有無で決める
         delegation_offered: Optional[Callable[[], bool]] = None,
+        # 任意: YouTube 配信中の事実（`StreamManager.voice_block`・配信していない時は None）。全刺激種別で入れる
+        stream_provider: Optional[Callable[[], Optional[str]]] = None,
     ) -> None:
         self._audio = audio
         self._stream_fn = stream_fn
@@ -194,6 +207,7 @@ class ResponseOrchestrator:
         # 任意注入(UI): 今オフにしている機能の名前。ヘッドレスでは None＝ブロック自体が出ない。
         self._features_off_provider = features_off_provider
         self._self_model_fn = self_model_fn
+        self._self_model_pick = self_model_pick
         self._on_first_sentence = on_first_sentence
         self._filler_provider = filler_provider
         self._emotion_provider = emotion_provider
@@ -201,6 +215,9 @@ class ResponseOrchestrator:
         self._style_examples = style_examples
         self._game_provider = game_provider
         self._delegation_offered = delegation_offered
+        self._stream_provider = stream_provider
+        # 配信の始め・終わりの区切りの手前で話していたことの要約（`eve/stream/` が作る・無ければ None）
+        self.carry_provider: Optional[Callable[[], Optional[str]]] = None
         self.last_response = ""  # 生成済み全文（自然さの目視・テスト用。記憶には使わない＝C5）
 
     def _tools_enabled_for(self, stimulus: Stimulus) -> bool:
@@ -269,12 +286,18 @@ class ResponseOrchestrator:
         recent_turns: Optional[list[Turn]] = None,
         rag_chunks: Optional[list[RagChunk]] = None,
         style_examples: Optional[str] = None,
+        self_model: Optional[str] = None,
     ) -> list[dict]:
         last_feedback = self._state.last_feedback if self._state is not None else None
         # D1: 内省が**いつの会話**を対象にしたか（watermark = そのスパン末尾の iso）。
         # 起動時 catch-up では前セッション末尾を要約するので、これが無いと
         # 「# 直近フィードバック」が5時間前の依頼を現在の依頼として提示する。
         last_feedback_iso = self._state.watermark if self._state is not None else None
+        if last_feedback and self._cache is not None and getattr(self._cache, "before_boundary", None) is not None:
+            # 起動中の区切り（YouTube 配信の始まり・終わり）より前の会話の内省は入れない
+            # （配信前の私的な会話の要約を配信の文脈に持ち込まない）
+            if self._cache.before_boundary(last_feedback_iso):
+                last_feedback = None
         # D1（案2）: 前セッション最終発話からの経過。会話は注入しないので、境界の事実だけ渡す。
         prev_gap = None
         if self._cache is not None:
@@ -348,14 +371,14 @@ class ResponseOrchestrator:
                 logger.exception("能力一覧の取得に失敗（注入なしで継続）")
         # UI で今オフにしている機能。**全刺激種別で出す**（自発発話でも「見えないから」と
         # 言い出す場面があり、そこで「機能が無い」と言われるのが最も紛らわしいため）。
-        # イブ自身の好み。**毎ターン注入する**（聞かれた時に同じ答えを返すのが目的なので、
-        # 関連しそうな時だけ入れるとブレる）。長さはストア側の上限で有界。
-        self_model = None
-        if self._self_model_fn is not None:
+        # イブ自身の好み。今の話しかけに近い項目だけ（`handle` が `self_model_pick` で選んで渡す・0件は ""）。
+        # 渡されなかった時（選ぶ口が無い構成・テスト・評価の道具）は従来どおり全部入れる。長さはストア側の上限で有界。
+        if self_model is None and self._self_model_fn is not None:
             try:
                 self_model = self._self_model_fn() or None
             except Exception:
                 logger.exception("自己モデルの取得に失敗（無しで継続）")
+        self_model = self_model or None
         features_off = None
         if self._features_off_provider is not None:
             try:
@@ -381,6 +404,18 @@ class ResponseOrchestrator:
                 game = self._game_provider() or None
             except Exception:
                 logger.exception("Alchemy の事実の取得に失敗（無しで継続）")
+        stream = None
+        if self._stream_provider is not None:
+            try:
+                stream = self._stream_provider() or None
+            except Exception:
+                logger.exception("配信の事実の取得に失敗（無しで継続）")
+        carry = None
+        if self.carry_provider is not None:
+            try:
+                carry = self.carry_provider() or None
+            except Exception:
+                logger.exception("区切りの手前の会話の要約の取得に失敗（無しで継続）")
         # native ロール messages（system + user/assistant ターン列 + 最終 user発話/自発指示）。
         return self._ctx.assemble(
             user_text=user_text,
@@ -404,6 +439,8 @@ class ResponseOrchestrator:
             emotion=emotion,
             style_examples=style_examples if stimulus.kind == StimulusKind.USER_UTTERANCE else None,
             game=game,
+            stream=stream,
+            carry_over=carry,
         )
 
     def _notify_complete(self) -> None:
@@ -540,7 +577,18 @@ class ResponseOrchestrator:
             except Exception:
                 logger.exception("話し方の実例の選択に失敗（実例なしで継続）")
                 examples, shown = None, []
-        messages = self._build_messages(stimulus, recent, rag_chunks, style_examples=examples or None)
+        # 自分のことの控え: 今の話しかけに近い項目だけ（実例の後＝話しかけの埋め込みは記憶の検索の物を使い回す）
+        self_model = None
+        if self._self_model_pick is not None:
+            try:
+                self_model = await self._self_model_pick(_recall_query(stimulus))
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("自分のことの控えの選択に失敗（全部入れる）")
+                self_model = None
+        messages = self._build_messages(stimulus, recent, rag_chunks, style_examples=examples or None,
+                                        self_model=self_model)
         # S5 声のトーン: 応答を組み立てた時点の今の感情で**このターンは1つに決める**（ユーザ 2026-09-26
         # 「ユーザー話し終わる前までの現感情→応答生成→発話」）。応答の途中で感情の判定が届いても声だけ
         # 変わらない＝応答の文字（上の「# イブの今の気持ち」）と声の感情がそろう。
@@ -669,7 +717,8 @@ class ResponseOrchestrator:
                 for name, args in redo:
                     logger.info("⚙ 返事の前に実行: %s → %s", name, self._dispatcher.execute_now(name, args))
                 tool_sink = []
-                messages = self._build_messages(stimulus, recent, rag_chunks, style_examples=examples or None)
+                messages = self._build_messages(stimulus, recent, rag_chunks, style_examples=examples or None,
+                                                self_model=self_model)
                 tools = (self._dispatcher.tool_schemas(exclude={n for n, _a in redo})
                          if tools is not None else None) or None
                 stream_complete = await _run_stream(messages, tools, tool_sink)

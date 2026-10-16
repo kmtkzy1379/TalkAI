@@ -79,6 +79,8 @@ class AudioPlayQueue:
         self.on_head_waiting: Optional[Callable[[], None]] = None
         # 音が鳴り始めた時の通知（UI の on_sentence_start とは別枠＝UI の差し込みを壊さない）。
         self._start_listeners: list[Callable[[], None]] = []
+        # 鳴り始めた/終わった節の文（`fn(text, started)`）。配信の字幕用（UI の on_sentence_* とは別枠）。
+        self._text_listeners: list[Callable[[str, bool], None]] = []
         # --- 区切りの間（S7・2026-09-26）。**既定 0＝待たない（既存の挙動は不変）** ---
         # 再生器の出力を開きっぱなしにすると、項目ごとの開き直しで空いていた約0.29秒の間が消える。
         # 試聴で良しとされた「、」「。」ごとの音はこの間込みなので、直前の音（応答・フィラー・笑い）が
@@ -224,6 +226,17 @@ class AudioPlayQueue:
     def add_start_listener(self, fn: Callable[[], None]) -> None:
         self._start_listeners.append(fn)
 
+    def add_text_listener(self, fn: Callable[[str, bool], None]) -> None:
+        """節の文を受け取る（鳴り始めに `fn(text, True)`・終わりに `fn(text, False)`・loop 上で同期に呼ぶ）。"""
+        self._text_listeners.append(fn)
+
+    def _notify_text(self, text: str, started: bool) -> None:
+        for fn in self._text_listeners:
+            try:
+                fn(text, started)
+            except Exception:
+                logger.exception("節の文の通知でエラー（再生は継続）")
+
     async def _wait_floor(self) -> None:
         if self.on_head_waiting is not None:
             try:
@@ -287,6 +300,7 @@ class AudioPlayQueue:
                             fn()
                         except Exception:
                             logger.exception("再生開始の通知でエラー（再生は継続）")
+                    self._notify_text(it.text, True)
                 await self._play(it.audio)
             finally:
                 self._playing = None
@@ -295,6 +309,8 @@ class AudioPlayQueue:
                     self.on_sentence_end(it.text)
                 except Exception:
                     logger.exception("on_sentence_end コールバックでエラー（再生は継続）")
+            if it.audio is not None:
+                self._notify_text(it.text, False)
             # C5: 実際に再生した項目だけ「喋った」と報告（割り込まれても鳴っている項目は言い切る）。
             # 番兵(audio=None)は再生していないので報告しない。
             # `reported` は barge-in 時に `_flush_playing` が既に報告した印＝二重に積まない。

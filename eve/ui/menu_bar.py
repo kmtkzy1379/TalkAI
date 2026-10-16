@@ -24,6 +24,8 @@ ITEMS = (
     ("autospeech", "自律発話", "自律発話 ON", "自律発話 OFF", True),
     ("vision", "画面認識", "画面認識 ON", "画面認識 OFF", True),
     ("task", "タスク", "タスク ON", "タスク OFF", True),
+    # YouTube 配信（押すと確認してから OBS で配信を始める・配信中は赤）
+    ("stream", "配信", "● 配信中", "配信する", False),
 )
 
 
@@ -70,7 +72,8 @@ class MenuBar(QWidget):
         if on is not None:
             self._on[key] = on
         self._state[key] = state
-        b.setStyleSheet(menu_button_qss(state))
+        # 配信中だけは赤（青い「ON」と見分けがつかないと、配信しているのに気づかない）
+        b.setStyleSheet(menu_button_qss("live" if key == "stream" and state == "on" else state))
         on_text, off_text = dict((k, (o, f)) for k, _l, o, f, _i in ITEMS)[key]
         b.setText("切替中…" if state == "pending" else (on_text if self._on[key] else off_text))
         b.setEnabled(state != "disabled")

@@ -433,6 +433,38 @@ class Config:
     # 確かめて返事はあったのに来ない（待ち直し）がこの回数たまったら、次は確かめずに抜ける
     ALCHEMY_MAX_REWAITS = int(os.getenv("ALCHEMY_MAX_REWAITS", "2"))
 
+    # YouTube 配信モード（`eve/stream/`・ユーザ指定 2026-10-15）。**機能フラグ**（既定 off）。UI の［配信］ボタンで
+    # OBS の配信を始め、視聴者のチャットを入力にして話す。配信中は画面認識とマイクを切り、自律発話とタスクを入れる。
+    # YOUTUBE_API_KEY が要る（チャットを読む）。TARGET_CHANNEL_ID があれば配信中の動画を自動で探す（無ければ URL を指定）
+    STREAM_ENABLED = os.getenv("STREAM_ENABLED", "0") == "1"
+    # チャットを読む最短の間隔[秒]。1回 5単位（1日の割り当ては既定 10,000）。YouTube が返す間隔（実測 約4.8秒）より
+    # 短くはしない。イブが話している・考えている間は読まない（読むのは話し終えた時）＝実際の回数はこれより少ない
+    STREAM_CHAT_POLL_SEC = float(os.getenv("STREAM_CHAT_POLL_SEC", "6"))
+    # イブが話し終えてから次のコメントを読むまでの間[秒]（話し終わりに被せない）
+    STREAM_COMMENT_GAP_SEC = float(os.getenv("STREAM_COMMENT_GAP_SEC", "1.0"))
+    # OBS（WebSocket サーバー・OBS 28 以降に内蔵）。ポートとパスワードは空なら OBS 自身の設定ファイルから読む
+    # （%APPDATA%\obs-studio\plugin_config\obs-websocket\config.json）
+    OBS_WS_PORT = int(os.getenv("OBS_WS_PORT", "0") or "0")
+    OBS_WS_PASSWORD = os.getenv("OBS_WS_PASSWORD", "")
+    # OBS 本体（obs64.exe）。空なら探す（インストール情報・Steam 版の場所）。起動していなければ配信ボタンで起動する
+    OBS_PATH = os.getenv("OBS_PATH", "")
+    # 配信に使う OBS のシーン名（無ければ作る。既にあれば配置は触らない＝OBS で動かした配置を壊さない）
+    STREAM_SCENE = os.getenv("STREAM_SCENE", "イブ配信")
+    # 配信の音（ユーザ 2026-10-15「PC音声はデフォルトON・マイクだけデフォルトOFFで切り替えられるように」）:
+    # pc＝PC の音（OBS のデスクトップ音声＝BGM・ゲームの音・イブの声）を OBS の設定のまま流す /
+    # eve＝イブの声だけ（配信中は OBS のデスクトップ音声をミュートし、イブのアプリの音だけを取り込む）。
+    # どちらでも OBS のマイクは配信の始めにミュートし、イブのマイクのボタンに合わせる（終わったら配信前に戻す）
+    STREAM_AUDIO = os.getenv("STREAM_AUDIO", "pc")
+    # 配信中、自分から話すかを考え直す間隔の上限[秒]。普段は 5秒から倍々に広がって最大 SILENCE_MAX_INTERVAL_SEC（5分）
+    # だが、配信では4分のあいだに8回しか考えなかった（リハーサル 2026-10-16）。話すかどうかは毎回イブが決める
+    # （何分に一回話す、という決まりではない・ユーザ「あくまで自主性」）
+    STREAM_SPEECH_MAX_INTERVAL_SEC = float(os.getenv("STREAM_SPEECH_MAX_INTERVAL_SEC", "30"))
+    # 配信中にイブが画面に出した物（作業の結果の窓）を自動で閉じるまでの秒（ユーザ 2026-10-15「作業画面は30秒で
+    # 強制的に消す」）。閉じたら OBS の作業画面も隠す。0 なら閉じない（その前にイブが閉じるのは自由）
+    STREAM_TASKWIN_SEC = float(os.getenv("STREAM_TASKWIN_SEC", "30"))
+    # 視聴者の覚え書き（名前・何回目の配信に来たか。手元だけ・.gitignore 済み）
+    STREAM_VIEWERS_FILE = os.getenv("STREAM_VIEWERS_FILE", "stream_viewers.json")
+
     @classmethod
     def validate(cls) -> list[str]:
         """不足している必須設定を列挙。空リストなら起動可（Start ゲートで使う）。"""

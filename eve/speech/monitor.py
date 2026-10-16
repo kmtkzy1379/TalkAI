@@ -136,6 +136,15 @@ class SpeechState:
         self.last_activity_mono = self._now()
         self.evals_since_activity = 0
 
+    def mark_session_start(self) -> None:
+        """話す場が変わった（配信の始まり・終わり）→ 判定中の自発発話を捨てさせ（seq）、沈黙時計を戻す。
+
+        前の場の文脈で決めた話題を、新しい場で話さないため（例: 配信の事実なしに決めた話題を配信で話す）。
+        """
+        self.user_activity_seq += 1
+        self.last_activity_mono = self._now()
+        self.evals_since_activity = 0
+
     # --- 計測 ---
     def silence_seconds(self) -> float:
         return max(0.0, self._now() - self.last_activity_mono)
@@ -231,6 +240,7 @@ class SpeechDecider:
         embedder=None,  # J-2 ②-2 任意: 二段目（意味の重複）判定用。None なら文字bigram のみ
         dup_emb_threshold: Optional[float] = None,
         game_provider=None,  # 任意: Alchemy の部屋・対戦中の事実（`AlchemyManager.decider_block`・普段は None）
+        stream_provider=None,  # 任意: YouTube 配信中の事実（`StreamManager.decider_block`・配信していない時は None）
     ) -> None:
         self._state = state
         self._cache = cache
@@ -241,6 +251,7 @@ class SpeechDecider:
         self._vision_state = vision_state
         self._tasks_provider = tasks_provider
         self._game_provider = game_provider
+        self._stream_provider = stream_provider
         self._dup_threshold = dup_threshold if dup_threshold is not None else DUP_SIM_THRESHOLD
         self._embedder = embedder
         self._dup_emb_threshold = (
@@ -314,6 +325,9 @@ class SpeechDecider:
         recent = [Turn(t.speaker, t.text, t.stamp) for t in recent]
         surprise = int(self._pred.surprise)  # 必須・int（指標として渡す）
         last_feedback = getattr(self._pred, "last_feedback", None)  # イブの今の感情/要約
+        before = getattr(self._cache, "before_boundary", None) if self._cache is not None else None
+        if last_feedback and before is not None and before(getattr(self._pred, "watermark", None)):
+            last_feedback = None  # 起動中の区切り（配信の始まり・終わり）より前の会話の内省は使わない
         vision = self._vision_state.fresh_vision(Config.VLM_VISION_TTL_SEC) if self._vision_state else None
         # 自律発話の材料: 今の画面/直近に**関連する記憶** ＋ **新しい切り口**（user 会話の search とは別系統）。
         # 「甘いもの検索→前のチーズケーキの話」のように画面↔記憶を結べるよう、画面+直近をクエリに引く。
@@ -343,6 +357,12 @@ class SpeechDecider:
                 game = self._game_provider() or None
             except Exception:
                 logger.exception("Alchemy の事実の取得に失敗（注入なしで継続）")
+        stream = None
+        if self._stream_provider is not None:
+            try:
+                stream = self._stream_provider() or None
+            except Exception:
+                logger.exception("配信の事実の取得に失敗（注入なしで継続）")
         seq0 = self._state.user_activity_seq  # 判定中にユーザが話したか検出する基準
         self._idle.clear()
         try:
@@ -350,7 +370,7 @@ class SpeechDecider:
                 surprise=surprise, silence_seconds=silence,
                 recent_turns=recent, topic_seeds=seeds, decide_fn=self._decide_fn,
                 last_feedback=last_feedback, vision=vision, active_tasks=active_tasks,
-                prior_items=prior, game=game,
+                prior_items=prior, game=game, stream=stream,
             )
         finally:
             self._idle.set()
@@ -376,6 +396,8 @@ class SpeechDecider:
                 materials.append(vision)
             if game:
                 materials.append(game)  # ゲームの出来事に触れる話は材料に接地している
+            if stream:
+                materials.append(stream)  # 配信・チャットに触れる話は材料に接地している
             if is_topic_outsourcing(decision.content, materials):
                 self._state.record_decision(
                     speak=False,
@@ -406,6 +428,9 @@ class SpeechDecider:
                 return
         # True/False とも発話判定ログに記録（観測専用・処理非関与）+ 再評価カデンス更新
         self._state.record_decision(speak=decision.speak, reason=decision.reason, content=decision.content)
+        # 内省タブに理由を残す（話さなかった理由が見えないと、頻度を測っても直せない＝配信のリハーサル 2026-10-16）
+        logger.info("🧠 発話判定: %s — %s%s", "話す" if decision.speak else "話さない", (decision.reason or "")[:80],
+                    f"（{decision.content[:60]}）" if decision.speak and decision.content else "")
         if decision.speak:
             self._state.record_autonomous_speech(decision.content, emb)  # 次回以降の比較元
             self._state.record_prior_item(decision.content, played=True)
@@ -463,6 +488,8 @@ class SilenceMonitor:
         self._state = state
         self._decider = decider
         self._is_busy = is_busy_fn
+        # 判定の間隔の上限を差し替える口（配信中だけ短くする・`VoiceLoop` が差す。None なら Config の上限）
+        self.max_interval_fn: Optional[Callable[[], Optional[float]]] = None
         self._tick = tick_sec if tick_sec is not None else Config.SILENCE_TICK_SEC
         self._threshold = threshold_sec if threshold_sec is not None else Config.SILENCE_THRESHOLD_SEC
         self._task: Optional[asyncio.Task] = None
@@ -499,8 +526,14 @@ class SilenceMonitor:
             return False  # ユーザ発話中は発火しない
         if self._state.stt_pending:
             return False  # J-2 ③-A: STT待ち窓（ユーザ発話テキストが到着直前）は発火しない
-        if not self._state.eval_due(self._threshold):
-            return False  # 前回の判定/活動から間隔（5秒から倍々・上限5分）が未満
+        cap = None
+        if self.max_interval_fn is not None:
+            try:
+                cap = self.max_interval_fn()
+            except Exception:
+                logger.exception("判定の間隔の上限の取得で例外（既定の上限で続行）")
+        if not self._state.eval_due(self._threshold, cap):
+            return False  # 前回の判定/活動から間隔（5秒から倍々・上限5分・配信中は短い上限）が未満
         if not self._decider.is_idle():
             return False  # single-flight（処理中/保留トリガあり）
         self._decider.trigger("silence")

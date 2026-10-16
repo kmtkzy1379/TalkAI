@@ -68,6 +68,10 @@ emotion_state.json
 emotion_state.json.tmp
 docs/FILLER_IMPL_PLAN.md
 docs/FILLER_DESIGN.md
+# YouTube 配信（2026-10-15）: 視聴者の覚え書き（名前・来た回数）と、OBS に読ませる字幕の HTML（実行時に作る）
+stream_viewers.json
+stream_viewers.json.tmp
+.stream/
 # エディタ / OS メタファイル
 .idea/
 .vscode/

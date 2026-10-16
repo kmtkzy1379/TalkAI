@@ -226,8 +226,32 @@ try:
                     or getattr(getattr(_vl3.task_executor, "_agent", None), "_self_model_fn", True) is not None)
         check("自己モデル: 空の台帳で起動しても応答に配線（起動中に書かれた好みが次の応答から届く）",
               _empty and _later and _task_ok)
+        check("自己モデル: 応答には話しかけに近い項目だけを選んで入れる口を配線（タスク担当は全部のまま）",
+              _vl3.orchestrator._self_model_pick == _vl3.self_recall.block_for
+              and _vl3.self_recall.store is _vl3.self_model)
     finally:
         _C2.SELF_MODEL_ENABLED, _C2.SELF_MODEL_FILE = _sm_saved
+
+    # YouTube 配信モード: 配信の部品と、配信の始め・終わりの要約の持ち越し・字幕・窓の数え方を配線する（2026-10-16:
+    # 持ち越しを配信の部品を作る所で配線したら、応答の部品がまだ無くて起動で落ちた）
+    _st_saved = _C2.STREAM_ENABLED
+    try:
+        _C2.STREAM_ENABLED = True
+        _vl4 = VoiceLoop()
+        check("配信: 配信の部品・要約の持ち越し・字幕・窓の数え方・配信用の「短く」なしの system を配線",
+              _vl4.stream is not None and _vl4.orchestrator.carry_provider == _vl4._carry_text
+              and _vl4.stream.on_sentence in _vl4.audio._text_listeners and _vl4.stream.viewers_fn is not None
+              and bool(_vl4.orchestrator._ctx.stream_system_prompt)
+              and "短く" not in _vl4.orchestrator._ctx.stream_system_prompt)
+        _vl4.stream.active = True
+        _cap_on = _vl4.silence_monitor.max_interval_fn()
+        _vl4.stream.active = False
+        check("配信: 配信中だけ、自分から話すかを考え直す間隔の上限を短くする",
+              _cap_on == _C2.STREAM_SPEECH_MAX_INTERVAL_SEC and _vl4.silence_monitor.max_interval_fn() is None)
+        check("配信: 何度も出ている言葉を数えるのは、会話の記録の区切りより後（この配信の会話）",
+              _vl4.stream.turns_fn == _vl4.cache.since_boundary)
+    finally:
+        _C2.STREAM_ENABLED = _st_saved
 except Exception as e:  # 構築自体が落ちたら配線ドリフト＝即失敗
     check(f"VoiceLoop 構築で例外: {e!r}", False)
 
