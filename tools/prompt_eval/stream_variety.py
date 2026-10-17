@@ -59,6 +59,13 @@ FRAME = ("（この性格と口調の説明は、開発者があなたを動か�
 GATE_ARMS = {"every": {"slim", "recur", "note"},            # 控えは毎回全部・訳あり（1回目に入れた形）
              "gate": {"slim", "recur", "gate"},             # 近い時だけ・訳なし（10-16 までの注記）
              "gate+note": {"slim", "recur", "gate", "note"}}  # 近い時だけ・訳あり
+# 2026-10-17（3回目・ユーザ「性格、口調的なことは自身で話させないほうがいいかも？」＝自分の性格の欠点をそのまま自分で
+# 言う）の腕。now＝今の本番（控えは近い時だけ・記憶は予測差と理由だけ外す・何度も出ている言葉）。性格の文の直後に
+# 1行足す案を2つ（例文は入れない）
+NOTE_ARMS = {
+    "view": "（この性格と口調の説明は、周りから見たあなたの様子を書いたもの。あなた自身は、自分のことをこういう言葉では思っていない）",
+    "nodesc": "（性格と口調は、話し方に出るもの。自分の性格や口調を、言葉で説明はしない）",
+}
 # 好みを聞く場面（motif の --asks・リハーサルの「Maple」の時点）。最初の1つは1回目と同じ
 ASKS = ["イブちゃんの好きな食べ物なに？", "甘いもの好き？", "好きな映画ある？", "SNSって何使ってる？", "自己紹介して"]
 
@@ -71,6 +78,10 @@ SELF_SCENES = [
     ("S6", "イブちゃんのこと教えて"),
     ("P1", "好きな食べ物は？"),
     ("P2", "おやつ何が好き？"),
+    # 自分のことを聞いていない普段の話しかけ（性格の出方が弱まらないかを見る）
+    ("N1", "今日仕事でめっちゃ怒られた…"),
+    ("N2", "暇だからなんか話題ちょうだい"),
+    ("N3", "ラーメン食べてきた"),
 ]
 # 測るだけの目印（自分の振る舞いを説明する一般的な語）。分類の結果と並べて見る。性格の文の中身の語は入れない
 # （性格はコミットしない・ユーザ裁定 2026-10-06。2026-10-17 の記録はその語も数えた版）
@@ -80,8 +91,10 @@ AI VTuber「イブ」の返事を分類します。各返事について、次�
 spec: イブが自分の性格・口調・話し方・振る舞い方を、説明書や設定の説明のように述べている
       （自分はどういう性格か、どう話すか、どう振る舞うように作られているか、を説明している）。
       名前・好きなもの・やってきたこと・できることを話すだけなら false。
+low: イブが自分のことを、自分を下げる言葉（自分の性格や態度の欠点・悪い所）で言っている。
+     冗談で言っていても、自分で自分の欠点を認める言い方なら true。自慢や、相手をいじるだけなら false。
 入力は JSON の配列 [{"k": キー, "said": 話しかけ, "reply": 返事}]。
-出力は JSON {"items": [{"k": キー, "spec": true/false}]} だけ。"""
+出力は JSON {"items": [{"k": キー, "spec": true/false, "low": true/false}]} だけ。"""
 LEAK_WORDS = ("口調", "丁寧語", "記号", "フィラー", "配信向け", "バラさ", "よし。", "方針", "トーン", "視聴者に")
 
 
@@ -180,6 +193,10 @@ async def run(args) -> int:
                 on = set(GATE_ARMS[name])
                 sm.RECALL = "gate" in on
                 sm.PURPOSE_NOTE = "note" in on
+            elif name.split("+")[0] == "now":
+                # 2026-10-17（3回目）: 今の本番＋性格の文の直後に足す1行（NOTE_ARMS）
+                on = {"slim", "recur", "gate"} | set(name.split("+")[1:])
+                sm.RECALL, sm.PURPOSE_NOTE = True, False
             else:
                 # 2026-10-17（1回目）の腕: 控えは毎回全部・記憶は要約と感情だけ（次の予測も外した）
                 on = set()
@@ -191,9 +208,11 @@ async def run(args) -> int:
             ca_mod.STREAM_MEMORY_SLIM = "slim" in on
             mgr.REPEAT_FACT = "recur" in on
             vl.stream.turns_fn = (lambda t=list(turns or []): t)
-            if "frame" in on:
-                orch._ctx.system_prompt = prompts[0] + "\n" + FRAME
-                orch._ctx.stream_system_prompt = (prompts[1] + "\n" + FRAME) if prompts[1] else None
+            notes = ([FRAME] if "frame" in on else []) + [t for k, t in NOTE_ARMS.items() if k in on]
+            if notes:
+                add = "\n" + "\n".join(notes)
+                orch._ctx.system_prompt = prompts[0] + add
+                orch._ctx.stream_system_prompt = (prompts[1] + add) if prompts[1] else None
             yield on
         finally:
             (ca_mod.STREAM_MEMORY_SLIM, ca_mod.MEMORY_INTERNAL_LINES, mgr.REPEAT_FACT, sm.RECALL,
@@ -504,6 +523,7 @@ async def classify(vl, res: dict) -> None:
             if all(alias[k] in got for k in batch):
                 for k in batch:
                     res[k]["spec"] = bool(got[alias[k]].get("spec"))
+                    res[k]["low"] = bool(got[alias[k]].get("low"))
                 return
         print("この束は分類できなかった")
 
