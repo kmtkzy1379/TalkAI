@@ -30,12 +30,16 @@ import numpy as np
 
 from ..clock import now_iso
 from ..config import Config
-from ..context_assembler import RagChunk
+from ..context_assembler import ORIGIN_X, RagChunk
 from .embed import Embedder, make_embedder
 
 logger = logging.getLogger(__name__)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+
+# 記憶の種類（レコードの "type"）。会話の内省（FeedbackLLM）と、X で見たこと（`eve/xfeed/`）。
+KIND_FEEDBACK = "feedback_response"
+KIND_X = "x_seen"
 
 
 # 話題の種として使えない「中身の無い要約」（会話の区切り/相談なし/反応なし 等）。
@@ -94,6 +98,29 @@ class RagStore:
         self._write_task: Optional[asyncio.Task] = None
         # J-2 ②-5: 自律発話の関連枠に使った直前クエリ（同じなら関連枠を使わない＝同じ記憶の固着防止）
         self._last_auto_query: Optional[str] = None
+        # 別ファイルの記憶（X で見たこと・`attach_side`）。思い出す時（検索・話題の種）だけ合わせる
+        self._side: Optional["RagStore"] = None
+
+    def attach_side(self, other: Optional["RagStore"]) -> None:
+        """別ファイルの記憶を、思い出す時（`search`・`autonomous_memories`・`random`・`topic_candidates`）だけ合わせる。
+
+        X で見たこと（`eve/xfeed/`）を会話の記憶と同じファイルに入れない理由（2026-10-17・コードで確認）:
+        - 起動時に内省の位置を `latest_timestamp` から戻している（`voice_loop.py` の watermark）。X の記憶が新しい時刻で
+          入ると位置が進み、まだ内省していない会話が飛ばされる（＝記憶喪失）
+        - 配信の区切りの「直前に話していたこと」（`summaries_between`）に X で見たことが混ざる
+        - 上限（`RAG_MAX_CHUNKS`）は古い順に押し出すので、X の記憶が会話の記憶を押し出す
+        よって件数・最新時刻・時刻での要約・書き込みは**自分のファイルだけ**を見る（相手のファイルは触らない）。
+        """
+        self._side = other
+
+    def _all_chunks(self) -> list[dict]:
+        """思い出す時に見る全部（自分＋別ファイル）。"""
+        own = list(self._chunks)
+        return own + list(self._side._chunks) if self._side is not None else own
+
+    def records(self) -> list[dict]:
+        """自分のファイルの記憶（読み取り用の写し・別ファイルは含まない）。"""
+        return list(self._chunks)
 
     # --- ライフサイクル ---------------------------------------------------
 
@@ -173,6 +200,33 @@ class RagStore:
         rows.sort(key=lambda r: r["timestamp"])
         return [str(r["summary"]).strip() for r in rows[-max(0, int(k)):]] if k > 0 else []
 
+    def recent_summaries(self, since_iso: str, k: int) -> list[tuple[str, str]]:
+        """since 以降の（時刻, 要約）を古い順に、新しい方から k 件（自分のファイルだけ・中身の無い要約は除く）。"""
+        rows = [r for r in self._chunks
+                if isinstance(r.get("timestamp"), str) and r["timestamp"] >= since_iso
+                and (r.get("summary") or "").strip() and not _is_meta_summary(r.get("summary"))]
+        rows.sort(key=lambda r: r["timestamp"])
+        return [(r["timestamp"], str(r["summary"]).strip()) for r in rows[-max(0, int(k)):]] if k > 0 else []
+
+    def sample_summaries(self, k: int, *, before_iso: Optional[str] = None) -> list[tuple[str, str]]:
+        """before より前の記憶から無作為に k 件の（時刻, 要約）を古い順に（自分のファイルだけ・中身の無い要約は除く）。"""
+        rows = [r for r in self._chunks
+                if isinstance(r.get("timestamp"), str) and (before_iso is None or r["timestamp"] < before_iso)
+                and (r.get("summary") or "").strip() and not _is_meta_summary(r.get("summary"))]
+        picked = random.sample(rows, min(max(0, int(k)), len(rows)))
+        picked.sort(key=lambda r: r["timestamp"])
+        return [(r["timestamp"], str(r["summary"]).strip()) for r in picked]
+
+    def tag_counts(self, k: int = 12) -> list[tuple[str, int]]:
+        """自分のファイルの記憶で多いタグ（多い順に k 件）。X の情報収集に「今の記憶の偏り」を事実で渡す。"""
+        counts: dict[str, int] = {}
+        for r in self._chunks:
+            for t in r.get("topic_tags") or []:
+                t = str(t).strip()
+                if t:
+                    counts[t] = counts.get(t, 0) + 1
+        return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[: max(0, int(k))]
+
     # --- 書き込み ---------------------------------------------------------
 
     async def add_chunk(
@@ -188,6 +242,8 @@ class RagStore:
         topic_tags: Optional[list[str]] = None,
         search_text: Optional[str] = None,
         timestamp: Optional[str] = None,
+        kind: str = KIND_FEEDBACK,
+        extra: Optional[dict] = None,
     ) -> None:
         """1 記憶チャンクを追加（埋め込み→メモリ→永続化キュー）。
 
@@ -197,6 +253,9 @@ class RagStore:
         - 注入される表示文は `text`（選出時の「解凍」＝感情/予測等を含む完全版）。schema は全フィールドを保持。
         - feedback 実装時は `add_chunk(text=<完全版レンダリング>, summary=<要約>, topic_tags=<tags>,
           emotions=..., next_prediction=..., prediction_diff=..., reason=...)` を呼ぶだけ（新規機構は不要）。
+
+        kind はレコードの種類（`KIND_X`＝X で見たこと）。extra は種類ごとの項目（検索語・気になったこと等）で、
+        基本の項目を上書きしない。
         """
         text = (text or "").strip()
         if not text:
@@ -211,7 +270,8 @@ class RagStore:
             logger.warning("RAG 埋め込み取得できず（このチャンクをスキップ）: %.20s", text)
             return
         record = {
-            "type": "feedback_response",
+            **{k: v for k, v in (extra or {}).items() if k != "embedding"},
+            "type": kind,
             "text": text,
             "summary": summary,
             "emotions": emotions,
@@ -241,6 +301,8 @@ class RagStore:
             iso=record.get("timestamp", now_iso()),
             as_topic_seed=as_topic_seed,
             summary=record.get("summary", ""),  # 話題の種はこの1行だけを使う（decider）
+            # X で見たことは「Xで見た」と出す（会話の記憶と同じ見出しだと、ユーザと話したことと取り違える）
+            origin=ORIGIN_X if record.get("type") == KIND_X else "",
         )
 
     async def _retrieve(
@@ -253,15 +315,18 @@ class RagStore:
 
         exclude_after: この epoch 秒**以降**に書かれたチャンクを候補から外す（自律発話専用）。
         既定 None＝除外なし＝ユーザ発話への通常検索は一切影響を受けない（既定値で構造保証）。
+        **X で見たこと（`KIND_X`）には掛けない**: この除外は「今見えている会話の内省」を記憶として二重に出さないための物で、
+        X の記憶は会話の写しではない。掛けると、判定が X の記憶を話題に選んでも、話す時の応答に記憶の本文が届かなかった
+        （2026-10-17 実測: 見えている会話の最古が X の記憶より前だと関連枠に 0/20）。
         """
+        chunks = self._all_chunks()  # 別ファイルの記憶（X で見たこと）も同じ物差しで探す
         info: dict = {"floor_excluded": 0, "recent_excluded": 0,
-                      "total": len(self._chunks), "pool": []}
-        if k <= 0 or not self._chunks:
+                      "total": len(chunks), "pool": []}
+        if k <= 0 or not chunks:
             return [], info
         q = np.asarray(await self._embedder.embed_query(query), dtype=float)
         qn = q / (np.linalg.norm(q) or 1.0)
 
-        chunks = list(self._chunks)
         embs = np.asarray([c["embedding"] for c in chunks], dtype=float)
         norms = np.linalg.norm(embs, axis=1, keepdims=True)
         unit = embs / np.clip(norms, 1e-12, None)  # 行ごとに正規化
@@ -272,7 +337,7 @@ class RagStore:
         scored: list[dict] = []
         for i, c in enumerate(chunks):
             ts = _ts_epoch(c.get("timestamp", ""), now)
-            if exclude_after is not None and ts >= exclude_after:
+            if exclude_after is not None and ts >= exclude_after and c.get("type") != KIND_X:
                 # 「今まさに見えている会話」から生まれた記憶を、記憶として二重に想起しない。
                 # floor_excluded とは別カウント（無関係で落ちたのか新しすぎて落ちたのかを区別）。
                 info["recent_excluded"] += 1
@@ -350,8 +415,9 @@ class RagStore:
         (2026-07-26): コーパス189件中8件(4%)のメタ要約が、関連枠の**26/78回(33%)**を占拠して
         いた。ユーザ発話への通常検索(`search`)からは外さない（何が起きたかの記憶としては正しい）。
         """
-        pool = [c for c in self._chunks if not _is_meta_summary(c.get("summary") or c.get("text"))]
-        return pool or list(self._chunks)  # 全部メタなら諦めて全件（種ゼロにはしない）
+        chunks = self._all_chunks()  # X で見たことも話題の種になる（`attach_side`）
+        pool = [c for c in chunks if not _is_meta_summary(c.get("summary") or c.get("text"))]
+        return pool or chunks  # 全部メタなら諦めて全件（種ゼロにはしない）
 
     def random(self, k: int = 2) -> list[RagChunk]:
         """無言時の「話題の種」用ランダム取得（埋め込み不要・同期）。"""

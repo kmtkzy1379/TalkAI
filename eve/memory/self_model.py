@@ -25,11 +25,11 @@
 ## 無限に増えないための不変条件（**コードで強制**・プロンプトに委ねない）
 1. `MAX_TOPICS` を超えたら、**最も長く言及されていない項目を落とす**（LRU）。
    → 対象名が自由でも、注入ブロックの長さは有界。
-2. 1項目の値は最大 `MAX_PER_SLOT`(=2) 件。3件目で最も古い値が落ちる
-   （「好きな食べ物が5つ」を構造的に作れない＝ユーザ指示）。
-3. 2件並んだ状態が、そのまま「どちらも好きで迷う」という正直な表現になる
-   （＝矛盾を黙って上書きしない、の実装）。
-4. 対象名・値の長さにも上限。
+2. 1項目の値は最大 `MAX_PER_SLOT`(=3) 件で、**好きな順（苦手な物は苦手な順）の順位つき**。新しい値が入って4位に
+   なった値は落ちる（「好きな食べ物が5つ」を構造的に作れない）。
+   2026-10-17 ユーザ「好きなものや嫌いなものは1つに絞らず3位までランキングつけることでばらけそう」で、
+   2026-08-15 の「各項目1〜2ぐらい」（2件並び＝どちらも好きで迷う）から変えた。順位は自己形成係（LLM）がつける。
+3. 対象名・値の長さにも上限。
 
 **言い換えによる突破（好きな食べ物 / 好きな食材 / 好物）は完全には防げない**（上記の実測の
 とおり自動判別できない）。プロンプトで「既存項目に入るなら新設するな」と第一線を張るが、
@@ -62,7 +62,7 @@ POLARITIES: tuple[str, ...] = ("好き", "苦手")
 _POLARITY_SET = frozenset(POLARITIES)
 
 MAX_TOPICS = 12       # 台帳に載る項目数の上限（超えたら LRU で1つ落とす）
-MAX_PER_SLOT = 2      # 1項目の値の上限（ユーザ指示「各項目1〜2ぐらい」）
+MAX_PER_SLOT = 3      # 1項目の値の上限＝順位の数（ユーザ 2026-10-17「3位までランキング」・以前は「各項目1〜2ぐらい」）
 MAX_TOPIC_CHARS = 12  # 対象名の長さ上限
 MAX_VALUE_CHARS = 24  # 値の長さ上限（読み上げに載る長さ）
 
@@ -81,6 +81,12 @@ RECALL_TOP = 3
 # プリンの話 5/5・聞かれていない所のプリン 4/25 と 3/25＝`tools/prompt_eval/stream_variety.py` の gate / gate+note）ので、
 # 10-16 までの注記に戻した（ユーザ 2026-10-17「プロフィール注釈必要かは検証が必要そう」）
 PURPOSE_NOTE = False
+# 3位までの並びの見せ方（2026-10-17 ユーザ「好みは最大3点入ってるけど3点すべて使わなくてもいい、これをいい感じに伝えられない？」）。
+# 「1位 / 2位」と書くと、好きな物を聞かれるたびに「第1位は…第2位は…」と読み上げた。測った結果（好きな食べ物・動物を
+# 通常と配信で各2回・本番の組み立て）: 順位を読み上げた 今 8/8・「1位/2位」のまま「全部挙げなくてよい」を添える 6/8・
+# 「位」を書かずに好きな順に並べて同じ一言を添える 0/8（いちばん好きな物は 8/8 で言い、2つ目は言ったり言わなかったり）。測る口
+RANK_LABELS = False    # 並びに「1位」「2位」を付けるか
+ALL_OPTIONAL = True    # 「聞かれても全部を挙げなくてよい」を添えるか
 # 配信のコメントの印（`stream.manager.format_comment` の「（チャット）名前: 」「（スーパーチャット ￥500・緑）名前: 」）
 _COMMENT_HEAD = re.compile(r"^（[^）\n]{1,40}）[^\n]{0,80}?: ")
 
@@ -113,7 +119,7 @@ def normalize_topic(topic: str) -> str:
 
 @dataclass
 class SelfFact:
-    """1項目内の1つの値。`iso` は**その発話の時刻**（古い順に追い出すため）。"""
+    """1項目内の1つの値。`iso` は**最後に言った時刻**（記録用）。順位は並び順（`Slot.facts` の前ほど上）。"""
 
     value: str
     iso: str
@@ -121,7 +127,7 @@ class SelfFact:
 
 @dataclass
 class Slot:
-    """(極性, 対象) 1つ分。`last_iso` は LRU 追い出しの基準（最後に言及された時刻）。"""
+    """(極性, 対象) 1つ分。facts は順位の順（0番目が1位）。`last_iso` は LRU 追い出しの基準（最後に言及された時刻）。"""
 
     polarity: str
     topic: str
@@ -133,8 +139,33 @@ class Slot:
         return f"{self.polarity}な{self.topic}"
 
 
+def place(slot: Slot, value: str, iso: str, rank: Optional[int]) -> str:
+    """値を順位つきで置く（slot を書き換える）。押し出された値（4位になった値）を返す・無ければ ""。
+
+    rank（1〜MAX_PER_SLOT）があればその位置へ入れる（既にある値なら動かす・下の値は1つずつ下がる）。
+    rank が無ければ、既にある値はそのまま（時刻だけ）・新しい値はいちばん下（満杯ならいちばん下と入れ替わる）。
+    順位をつけるのは自己形成係（LLM）の役目で、無い時はこの逃げ方にする。
+    """
+    existing = next((f for f in slot.facts if f.value == value), None)
+    if existing is not None:
+        existing.iso = iso
+        if rank is None:
+            return ""
+        slot.facts.remove(existing)
+        fact = existing
+    else:
+        fact = SelfFact(value, iso)
+        if rank is None:
+            rank = min(len(slot.facts) + 1, MAX_PER_SLOT)
+    slot.facts.insert(max(0, min(int(rank), MAX_PER_SLOT) - 1), fact)
+    dropped = ""
+    while len(slot.facts) > MAX_PER_SLOT:
+        dropped = slot.facts.pop().value  # いちばん下（4位）
+    return dropped
+
+
 class SelfModelStore:
-    """(極性, 対象) → 値（最大2件）。loop 単一所有・ロックなし（他サイドカーと同じ前提）。"""
+    """(極性, 対象) → 順位つきの値（最大3件）。loop 単一所有・ロックなし（他サイドカーと同じ前提）。"""
 
     def __init__(self, path: Optional[str] = None) -> None:
         # 相対パスはリポジトリ基準で解決する（以前は起動した場所＝cwd 基準で、別のフォルダから起動すると
@@ -172,9 +203,18 @@ class SelfModelStore:
         return sorted(self._slots.values(), key=lambda s: (POLARITIES.index(s.polarity), s.topic))
 
     def entries(self) -> list[tuple[tuple[str, str], str]]:
-        """（キー, 1行）の一覧。1行は「好きな食べ物: プリン」の形（話しかけとの近さを測る文・`SelfRecall`）。"""
+        """（キー, 1行）の一覧。1行は「好きな食べ物: A / B」の形（項目ごとに1行・好きな順）。"""
         return [((s.polarity, s.topic), f"{s.label}: {' / '.join(f.value for f in s.facts)}")
                 for s in self._ordered() if s.facts]
+
+    def value_lines(self) -> list[tuple[tuple[str, str], str]]:
+        """（キー, 1行）の一覧を**値ごと**に。1行は「好きな食べ物: A」の形（話しかけとの近さを測る文・`SelfRecall`）。
+
+        項目ごとの1行（`entries`）で測ると、3位まで並べた時に行が長くなって近さが下がり、聞かれているのに入らなかった
+        （2026-10-17 実測: 配信のコメント「イブちゃんの好きな食べ物は？」と、値が1つの行 0.865／値を2つ並べた行 0.844
+        ＝しきい値 0.85 を割った）。しきい値は1つだけの行で測った物なので、その形で測る。
+        """
+        return [((s.polarity, s.topic), f"{s.label}: {f.value}") for s in self._ordered() for f in s.facts]
 
     def render(self, only=None) -> str:
         """system に入れる1ブロック。**何も無ければ空文字**（空の見出しを出さない）。only はキーの集まり（その項目だけ）。
@@ -192,24 +232,36 @@ class SelfModelStore:
         slots = [s for s in self._ordered() if s.facts and (only is None or (s.polarity, s.topic) in only)]
         if not slots:
             return ""
-        lines = [f"- {s.label}: {' / '.join(f.value for f in s.facts)}" for s in slots]
+
+        def ranked(s: Slot) -> str:
+            if len(s.facts) == 1 or not RANK_LABELS:
+                return " / ".join(f.value for f in s.facts)
+            return " / ".join(f"{i}位 {f.value}" for i, f in enumerate(s.facts, 1))
+
+        lines = [f"- {s.label}: {ranked(s)}" for s in slots]
         purpose = "聞かれた時に答えがぶれないように控えている。" if PURPOSE_NOTE else ""
         asked = "" if PURPOSE_NOTE else "ここにある事は聞かれたら同じように答える。"
+        # 2026-10-17: 「2つ並んでいるのは『どちらも好きで迷う』という意味」から順位の説明に変えた（3位までのランキング）。
+        # どれを言うかは書かない（イブが決める）
+        order = ("並んでいる時は、好きな順（苦手な物は苦手な順）の順位。" if RANK_LABELS
+                 else "並んでいる時は好きな順（苦手な物は苦手な順）。")
+        optional = "聞かれても全部を挙げなくてよい。" if ALL_OPTIONAL else ""
         return (
             "# イブ自身のこと（自分で言ったこと。理由なく変えない）\n"
             + "\n".join(lines)
-            + f"\n（{purpose}2つ並んでいるのは「どちらも好きで迷う」という意味。"
+            + f"\n（{purpose}{order}{optional}"
               "ここに無いことはまだ決まっていない＝聞かれたら決めつけず、"
               f"その場で思ったことを言ってよい。{asked}そのまま読み上げない。）"
         )
 
     # --- 書き込み ---------------------------------------------------------
 
-    def set(self, polarity: str, topic: str, value: str, iso: Optional[str] = None) -> bool:
+    def set(self, polarity: str, topic: str, value: str, iso: Optional[str] = None,
+            rank: Optional[int] = None) -> bool:
         """値を追加/更新する。受け付けたら True。
 
-        既にある値なら時刻だけ更新（言い直した＝現役）。`MAX_PER_SLOT` 超過で最も古い値を、
-        `MAX_TOPICS` 超過で最も長く言及されていない項目を落とす。
+        rank は好きな（苦手な）順の順位（1〜MAX_PER_SLOT・`place`）。4位になった値と、`MAX_TOPICS` 超過で
+        最も長く言及されていない項目を落とす。
         """
         polarity = (polarity or "").strip()
         topic = normalize_topic(topic)
@@ -229,22 +281,19 @@ class SelfModelStore:
             if key not in self._slots:      # 自分自身が落ちた（理論上は起きない）
                 return False
         slot.last_iso = max(slot.last_iso, iso)
-        for f in slot.facts:
-            if f.value == value:
-                f.iso = iso
-                self._append({"op": "set", "polarity": polarity, "topic": topic,
-                              "value": value, "iso": iso})
-                return True
-        slot.facts.append(SelfFact(value, iso))
-        slot.facts.sort(key=lambda f: f.iso)
-        dropped = ""
-        while len(slot.facts) > MAX_PER_SLOT:
-            dropped = slot.facts.pop(0).value  # 最も古い＝いちばん前
-        self._append({"op": "set", "polarity": polarity, "topic": topic,
-                      "value": value, "iso": iso})
+        if rank is not None:
+            try:
+                rank = max(1, min(MAX_PER_SLOT, int(rank)))
+            except (TypeError, ValueError):
+                rank = None
+        dropped = place(slot, value, iso, rank)
+        rec = {"op": "set", "polarity": polarity, "topic": topic, "value": value, "iso": iso}
+        if rank is not None:
+            rec["rank"] = rank
+        self._append(rec)
         if dropped:
-            logger.info("自己モデル: %s の上限で「%s」を押し出した（→ %s）",
-                        slot.label, dropped, " / ".join(f.value for f in slot.facts))
+            logger.info("自己モデル: %s は%d位までなので「%s」が外れた（→ %s）",
+                        slot.label, MAX_PER_SLOT, dropped, " / ".join(f.value for f in slot.facts))
         return True
 
     def _evict_topics_if_needed(self, *, protect: tuple[str, str]) -> None:
@@ -331,10 +380,9 @@ class SelfModelStore:
         slot = self._slots.setdefault((pol, top), Slot(pol, top))
         iso = rec.get("iso") or ""
         slot.last_iso = max(slot.last_iso, iso)
-        slot.facts = [f for f in slot.facts if f.value != value]
-        slot.facts.append(SelfFact(value, iso))
-        slot.facts.sort(key=lambda f: f.iso)
-        del slot.facts[:-MAX_PER_SLOT]
+        rank = rec.get("rank")
+        # 順位の無い昔の行（2026-10-17 より前）は、書かれた順にいちばん下へ足す（＝今の `set` の順位なしと同じ）
+        place(slot, value, iso, int(rank) if isinstance(rank, int) else None)
 
     def _load_remove(self, pol: str, top: str, rec: dict) -> None:
         slot = self._slots.get((pol, top))
@@ -361,21 +409,25 @@ class SelfRecall:
     async def block_for(self, text: str) -> str:
         if not RECALL or self._embedder is None:
             return self.store.render()
-        entries = self.store.entries()
+        lines = self.store.value_lines()  # 値ごとの行（項目の近さ＝その項目の値の行のうちいちばん近いもの）
         query = comment_body(text).strip()
-        if not entries or not query:
+        if not lines or not query:
             return ""
         try:
             q = await self._embedder.embed_query(query)
-            for _key, line in entries:
+            for _key, line in lines:
                 if line not in self._vecs:
                     self._vecs[line] = await self._embedder.embed_query(line)
         except Exception:
             logger.exception("自分のことの控えの近さを測れなかった（全部入れる）")
             return self.store.render()
-        scored = sorted(((_cos(q, self._vecs[line]), key) for key, line in entries), key=lambda x: -x[0])
+        by_key: dict = {}
+        for key, line in lines:
+            by_key[key] = max(by_key.get(key, -1.0), _cos(q, self._vecs[line]))
+        scored = sorted(((s, key) for key, s in by_key.items()), key=lambda x: -x[0])
         best = scored[0][0]
         keep = {key for s, key in scored[:RECALL_TOP] if s >= RECALL_MIN and s >= best - RECALL_MARGIN}
         if keep:
-            logger.info("🙋 自分のことの控えから入れた: %s（%.3f）", "・".join(ln for k, ln in entries if k in keep), best)
+            logger.info("🙋 自分のことの控えから入れた: %s（%.3f）",
+                        "・".join(ln for k, ln in self.store.entries() if k in keep), best)
         return self.store.render(only=keep) if keep else ""

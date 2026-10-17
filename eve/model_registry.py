@@ -48,6 +48,9 @@ ROLE_ENV: dict[str, tuple[str, str]] = {
     "emotion_judge": ("EMOTION_MODEL", "openai/gpt-6-luna"),
     # Alchemy（ユーザ作のゲーム）の手を決める判断役（`eve/alchemy/brain.py`）。1ラウンドに1〜3回・締切つき
     "game": ("GAME_MODEL", "openai/gpt-6-luna"),
+    # X で見に行く話題を選ぶ情報収集AI（`eve/xfeed/curate.py`）。6時間に1回。投稿の要約は search_summarize、
+    # イブの感想は response（応答と同じモデル＝イブの声）を使う
+    "x_curate": ("X_CURATE_MODEL", "openai/gpt-6-luna"),
 }
 
 CompletionFn = Callable[..., Awaitable[object]]
@@ -157,7 +160,12 @@ class ModelRegistry:
         return list(ROLE_ENV)
 
     async def complete(self, role: str, messages: list[dict], **kwargs):
-        """解決済みモデルへ完了要求。provider 差は litellm が吸収。"""
+        """解決済みモデルへ完了要求。provider 差は litellm が吸収。
+
+        usage_role: 使用量の記録に使う名前（既定は role）。同じモデルを別の用途で使う時に費用を分けて見るため
+        （X で見たことへのイブの感想は response 役＝応答と同じモデルだが、会話の応答の費用と混ぜない）。
+        """
+        label = kwargs.pop("usage_role", None) or role
         model = self.resolve(role)
         fn = self._completion_fn
         if fn is None:
@@ -165,7 +173,7 @@ class ModelRegistry:
 
             fn = acompletion
         resp = await fn(model=model, messages=messages, **kwargs)
-        _meter_record(lambda m: m.record_response(role=role, model=model, response=resp))
+        _meter_record(lambda m: m.record_response(role=label, model=model, response=resp))
         return resp
 
     async def stream(self, role: str, messages: list[dict], **kwargs) -> AsyncIterator[str]:

@@ -142,6 +142,12 @@ class VoiceLoop:
         # 埋め込みは RAG と自発発話の同内容抑制（意味の重複）で共有する（モデルの二重ロードを避ける）。
         self.embedder = make_embedder()
         self.rag = RagStore(self.embedder)  # 長期記憶（連想想起）
+        # X で見たこと（`eve/xfeed/`・既定 off）。会話の記憶とは別ファイル・別の上限で持ち、思い出す時だけ合わせる
+        # （同じファイルにすると、起動時の内省の位置・配信の区切りの要約・件数の上限が X の記憶で狂う＝`RagStore.attach_side`）
+        self.x_memory = None
+        if Config.X_ENABLED:
+            self.x_memory = RagStore(self.embedder, rag_file=Config.X_MEMORY_FILE, max_chunks=Config.X_MEMORY_MAX)
+            self.rag.attach_side(self.x_memory)
         # 話し方の実例（persona_examples.yaml・人が選ぶ）。無い・0 なら None＝性格の文だけで動く
         self.style_examples = self._build_style_examples()
         # 自己モデル（イブの好み・趣向）。**性格はここに入らない**（ペルソナ=persona.md の担当）。
@@ -156,6 +162,22 @@ class VoiceLoop:
             )
             # 応答には今の話しかけに近い項目だけを入れる（記憶の検索と同じ埋め込み・ユーザ 2026-10-17）
             self.self_recall = SelfRecall(self.self_model, self.embedder)
+        # X で話題を仕入れるサイドカー（6時間ごと・3件・起動時に前回からの分を1回取り戻す）。性格と好みの控えはイブの感想に使う
+        self.x_collector = None
+        if self.x_memory is not None:
+            from .xfeed import build_collector
+
+            self.x_collector = build_collector(
+                registry=self.registry, store=self.x_memory, memory=self.rag, persona=self.persona,
+                # 情報収集AI には好みの全部・感想には話題に近い項目だけ（応答と同じ選び方）。
+                # `is not None` で見る（空の台帳でも配線する・TaskAgent と同じ理由）
+                self_model_fn=(lambda: self.self_model.render()) if self.self_model is not None else None,
+                self_model_pick=self.self_recall.block_for if self.self_recall is not None else None,
+                # X で見た物への感想からも好みを育てる（ユーザ 2026-10-17「情報収集中でも更新はしていい」）
+                on_impression=(self.self_model_worker.note_text if self.self_model_worker is not None else None),
+                embedder=self.embedder)  # 1回の3件が似た話題なら次の候補にする（記憶と同じ埋め込み）
+            if self.x_collector is None:
+                logger.warning("X_ENABLED=1 だが X_BEARER_TOKEN が無いので X には取りに行かない（Xで見た記憶は思い出す）")
 
         # F4 内分泌系: 各応答後に非同期で内省 → RAG 書込 + surprise + 直近フィードバック注入。
         self.prediction = PredictionState()  # loop 所有・単一書込（feedback/VLM が書く）
@@ -1196,7 +1218,10 @@ class VoiceLoop:
         self._progress("memory", "記憶を読み込み中…")
         await self.cache.initialize()  # 既存ログ復元 + 書き込み worker 起動
         await self.rag.initialize()  # 既存 RAG 記憶を復元 + 書き込み worker 起動
-        self._progress("memory", f"記憶 OK（会話 {len(self.cache.recent())} / RAG {len(self.rag)}）")
+        if self.x_memory is not None:
+            await self.x_memory.initialize()  # X で見たこと（別ファイル）
+        x_note = f" / Xで見た {len(self.x_memory)}" if self.x_memory is not None else ""
+        self._progress("memory", f"記憶 OK（会話 {len(self.cache.recent())} / RAG {len(self.rag)}{x_note}）")
         # F4 起動時 catch-up: watermark を永続 RAG の最新 timestamp から復元し、
         # それより新しい復元会話（前回 feedback 途中で落ちた tail）を1回取り戻す。
         self.prediction.watermark = self.rag.latest_timestamp()
@@ -1236,6 +1261,14 @@ class VoiceLoop:
             self.self_model_worker.start()
             logger.info("自己形成 稼働（%s・%d項目）",
                         self.self_model.path, self.self_model.topics)
+        # X の仕入れ（既定 off）。起動直後は待ってから、前回から間が空いていれば1回取り戻す
+        if self.x_collector is not None:
+            self.x_collector.start()
+            wait = self.x_collector.seconds_until_due()
+            logger.info("🐦 X の仕入れ 稼働（%g時間ごと・%d件・タイムライン %s・次は%s）",
+                        Config.X_INTERVAL_HOURS, Config.X_PER_RUN,
+                        "あり" if self.x_collector.has_timeline else "なし",
+                        "起動の少し後" if wait <= 0 else f"約{wait / 3600:.1f}時間後")
         # J-1: タスク管理（既定 off）。store 復元 + executor/scheduler 起動。
         if self.task_store is not None:
             await self.task_store.initialize()
@@ -1345,6 +1378,12 @@ class VoiceLoop:
                 await self.self_model_worker.stop()
             except Exception:
                 pass
+        # X の仕入れ（途中なら打ち切る。記憶に入れた分と状態は1件ごとに保存済み）
+        if self.x_collector is not None:
+            try:
+                await self.x_collector.stop()
+            except Exception:
+                pass
         # J-1: タスク管理を停止（取消解決 drain→timer 停止→executor drain→store flush の順）。
         if self.cancel_resolver is not None:
             try:
@@ -1408,6 +1447,11 @@ class VoiceLoop:
             await self.rag.shutdown()
         except Exception:
             pass
+        if self.x_memory is not None:
+            try:
+                await self.x_memory.shutdown()  # X で見た記憶の書き込みキューを流しきる
+            except Exception:
+                pass
         try:
             await self.tts.close()
         except Exception:

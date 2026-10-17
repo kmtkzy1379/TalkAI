@@ -58,7 +58,8 @@ def load(path: Path, tag: str = "") -> list:
 
 
 def _cost_of(r: dict, recalc: bool):
-    if not recalc:
+    # 件数で課金される API（X API・accuracy=fixed）はトークンが無いので当て直さない
+    if not recalc or r.get("accuracy") == "fixed":
         return r.get("cost_usd")
     p = price_of(r.get("model", "?"))
     if p is None:
@@ -137,7 +138,7 @@ def main() -> int:
     for r in rows:
         model = r.get("model", "?")
         cost = r.get("cost_usd")
-        if recalc:
+        if recalc and r.get("accuracy") != "fixed":  # X API 等の件数課金は当て直さない（`_cost_of`）
             p = price_of(model)
             cost = None if p is None else (r.get("prompt_tokens", 0) * p[0]
                                            + r.get("completion_tokens", 0) * p[1])

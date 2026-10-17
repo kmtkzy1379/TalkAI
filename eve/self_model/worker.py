@@ -26,26 +26,31 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import unicodedata
 from typing import Optional
 
 from ..memory.self_model import MAX_PER_SLOT, MAX_TOPICS, POLARITIES, SelfModelStore
-from .trigger import SPEAKER_EVE, should_examine
+from .trigger import SPEAKER_EVE, is_trigger_text, should_examine
 
 logger = logging.getLogger(__name__)
 
 SELF_MODEL_SYSTEM = (
-    "あなたはAI VTuber「イブ」の自己形成係です。イブ**自身の発話**だけを読み、"
+    "あなたはAI VTuber「イブ」の自己形成係です。イブ**自身の言葉**（会話での発話と、Xで見た物への感想）だけを読み、"
     "イブの好み・趣向として台帳に残すべきものを決めます。\n"
-    "台帳の1行は「極性・対象・値」の3つです。\n"
+    "台帳の1行は「極性・対象・値・順位」です。\n"
     "- 極性は " + " / ".join(POLARITIES) + " のどちらか（これ以外は使えません）\n"
     "- 対象は自由に決めてよい（食べ物・ゲーム・ポケモン・色・音楽 など）\n"
-    f"- 1つの対象につき値は最大{MAX_PER_SLOT}件。2件あるのは「どちらも好きで迷っている」状態です\n"
+    # 2026-10-17 ユーザ「好きなものや嫌いなものは1つに絞らず3位までランキングつけることでばらけそう」
+    f"- 1つの対象につき値は最大{MAX_PER_SLOT}件で、好きな順（苦手の時は苦手な順）に1位〜{MAX_PER_SLOT}位をつける。"
+    f"新しい値が入って{MAX_PER_SLOT + 1}位になった値は自動で消えます\n"
     f"- 台帳全体で対象は最大{MAX_TOPICS}個。溢れると古いものが自動で消えます\n"
     "\n"
     "出力は次の行だけを必要な数だけ。**変更が要らなければ何も出力しないでください**。\n"
-    "set: 極性 / 対象 = 値\n"
+    "set: 極性 / 対象 = 値 / 順位\n"
     "remove: 極性 / 対象 = 値\n"
-    "例) set: 好き / 食べ物 = おかかおにぎり\n"
+    "例) set: 好き / 食べ物 = おかかおにぎり / 1\n"
+    "- 順位は、今の台帳の同じ対象の値と比べて決める（間に入るならその順位を書く。下の値は1つずつ下がる）。"
+    "順位だけを変える時も set を出す。\n"
     "\n"
     "規則:\n"
     "- 値は短い名詞句（例『おかかおにぎり』『藍色』）。文にしない。\n"
@@ -59,12 +64,15 @@ SELF_MODEL_SYSTEM = (
     "- 迷ったら何も出力しない。台帳は少ない方がよい。"
 )
 
-# `set: 好き / 食べ物 = おかかおにぎり` を拾う。全角の区切りも許す
+# `set: 好き / 食べ物 = おかかおにぎり / 1` を拾う。全角の区切りも許す
 # （feedback のパーサと同じ方針＝小さな表記ゆれで全損させない）。
 _OP = re.compile(
     r"^\s*(set|remove)\s*[:：]\s*(.+?)\s*[/／]\s*(.+?)\s*[=＝]\s*(.+?)\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
+# 値の後ろの順位（「/ 1」「/ 1位」「（1位）」）
+_RANK = re.compile(r"^(.*?)\s*(?:[/／]\s*([0-9０-９])\s*位?|[（(]\s*([0-9０-９])\s*位\s*[）)])\s*$")
+EXTRA_MAX = 20  # 会話以外から預かるイブの言葉（X の感想）の上限（溜まりすぎたら古い方から捨てる）
 
 
 def _g(o, k):
@@ -79,12 +87,22 @@ def _content(resp) -> str:
     return (_g(msg, "content") or "") if msg is not None else ""
 
 
-def parse_ops(text: str) -> list[tuple[str, str, str, str]]:
-    """LLM 出力 → [(op, 極性, 対象, 値)]。**raise しない**（解析できない行は捨てる）。"""
-    out: list[tuple[str, str, str, str]] = []
+def split_rank(value: str) -> tuple[str, Optional[int]]:
+    """「おかかおにぎり / 1」→（おかかおにぎり, 1）。順位が無ければ（値, None）。純関数。"""
+    m = _RANK.match(value or "")
+    if not m:
+        return (value or "").strip(), None
+    digit = unicodedata.normalize("NFKC", m.group(2) or m.group(3))
+    return m.group(1).strip(), int(digit)
+
+
+def parse_ops(text: str) -> list[tuple[str, str, str, str, Optional[int]]]:
+    """LLM 出力 → [(op, 極性, 対象, 値, 順位 or None)]。**raise しない**（解析できない行は捨てる）。"""
+    out: list[tuple[str, str, str, str, Optional[int]]] = []
     for m in _OP.finditer(text or ""):
-        out.append((m.group(1).lower(), m.group(2).strip(),
-                    m.group(3).strip(), m.group(4).strip()))
+        value, rank = split_rank(m.group(4).strip())
+        if value:
+            out.append((m.group(1).lower(), m.group(2).strip(), m.group(3).strip(), value, rank))
     return out
 
 
@@ -107,6 +125,8 @@ class SelfModelWorker:
         self._task: Optional[asyncio.Task] = None
         self._stopping = False
         self._watermark: str = ""
+        # 会話以外のイブ自身の言葉（X で見た物への感想・`note_text`）。次の1回でまとめて見る
+        self._extra: list[str] = []
 
     # --- ライフサイクル（FeedbackWorker と同形）---
 
@@ -134,6 +154,22 @@ class SelfModelWorker:
         """未処理ありを通知（O(1)・非ブロッキング＝応答の邪魔をしない）。"""
         self._event.set()
 
+    def note_text(self, text: str, *, source: str = "Xで見た物への感想") -> None:
+        """会話以外のイブ自身の言葉を預ける（X の仕入れの感想・ユーザ 2026-10-17「情報収集中でも更新はしていい」）。
+
+        会話と同じく、合図の語がある時だけ係に見せる。ユーザの言葉ではないので、ユーザの好みが写る道にはならない。
+        """
+        t = " ".join((text or "").split())
+        if not t:
+            return
+        self._extra.append(f"（{source}）{t}")
+        del self._extra[:-EXTRA_MAX]
+        self._event.set()
+
+    async def flush(self) -> None:
+        """溜まっている分を今すぐ1回見る（サイドカーを回していない道具＝最初の取り込みから使う）。"""
+        await self._process_once()
+
     # --- 本体 ---
 
     async def _run_forever(self) -> None:
@@ -151,22 +187,27 @@ class SelfModelWorker:
 
     async def _process_once(self) -> None:
         span = self._cache.turns_since(self._watermark) if self._cache is not None else []
-        if not span:
+        bodies: list[str] = []
+        if span:
+            # **watermark は先に進める**。合図が無いスパンを毎回読み直さないため。
+            # 取りこぼしても実害が無い（好みは繰り返し語られる）＝FeedbackWorker と違い
+            # ここは no-skip を要求しない。
+            self._watermark = span[-1].stamp.iso
+            if should_examine(span):
+                body = render_eve_turns(span)
+                if body:
+                    bodies.append(body)
+        # X の感想も同じふるい（合図の語）を通す。預かった分は見たら捨てる（同じ文を二度見ない）
+        extra, self._extra = self._extra, []
+        bodies += [f"- {t}" for t in extra if is_trigger_text(t)]
+        if not bodies:
             return
-        # **watermark は先に進める**。合図が無いスパンを毎回読み直さないため。
-        # 取りこぼしても実害が無い（好みは繰り返し語られる）＝FeedbackWorker と違い
-        # ここは no-skip を要求しない。
-        self._watermark = span[-1].stamp.iso
-        if not should_examine(span):
-            return
-        body = render_eve_turns(span)
-        if not body:
-            return
+        body = "\n".join(bodies)
         current = self._store.render() or "（まだ何も無い）"
         messages = [
             {"role": "system", "content": SELF_MODEL_SYSTEM},
             {"role": "user", "content": (
-                f"# 今の台帳\n{current}\n\n# イブ自身の発話\n{body}"
+                f"# 今の台帳\n{current}\n\n# イブ自身の言葉\n{body}"
             )},
         ]
         try:
@@ -178,13 +219,14 @@ class SelfModelWorker:
         if not ops:
             return
         applied = 0
-        for op, polarity, topic, value in ops:
-            # 極性の閉じ性・項目数の上限・件数上限・長さは**すべて store 側のコードが持つ**。
+        for op, polarity, topic, value, rank in ops:
+            # 極性の閉じ性・項目数の上限・件数上限・順位の幅・長さは**すべて store 側のコードが持つ**。
             # ここで弾かないのは、判定を1か所に集めるため（LLM 出力を信用しない）。
             ok = (self._store.remove(polarity, topic, value) if op == "remove"
-                  else self._store.set(polarity, topic, value))
+                  else self._store.set(polarity, topic, value, rank=rank))
             if ok:
                 applied += 1
-                logger.info("🪞 自己形成: %s %sな%s = %s", op, polarity, topic, value)
+                logger.info("🪞 自己形成: %s %sな%s = %s%s", op, polarity, topic, value,
+                            f"（{rank}位）" if rank else "")
         if applied:
             logger.info("🪞 台帳を更新（%d件） → %s", applied, self._store.as_dict())

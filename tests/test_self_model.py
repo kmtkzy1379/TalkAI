@@ -9,8 +9,9 @@
 - 極性は閉じた2値。対象は自由。→「好きな食べ物」と「苦手な食べ物」が混ざらない
   （埋め込みでは分離不能と実測済み: 好き/苦手=0.931 > 好き/食材=0.928）
 - 対象の総数に上限（LRU で追い出す）。→ **言い換えで突破されても注入ブロックは有界**
-- 1項目最大2件。3件目で最も古い値が落ちる
+- 1項目最大3件・順位つき（2026-10-17 ユーザ「3位までランキング」・以前は最大2件）。4位になった値が落ちる
 - 注入ブロックは `# 参照`(RAG) とは別枠で、「今の会話に絡める」指示を持たない
+- X で見た物への感想（イブ自身の言葉）からも育てる（2026-10-17 ユーザ「情報収集中でも更新はしていい」）
 
 実行: $env:PYTHONIOENCODING="utf-8"; python tests\test_self_model.py
 """
@@ -36,7 +37,7 @@ from eve.memory.self_model import (  # noqa: E402
     normalize_topic,
 )
 from eve.self_model.trigger import is_trigger_text, should_examine  # noqa: E402
-from eve.self_model.worker import SelfModelWorker, parse_ops, render_eve_turns  # noqa: E402
+from eve.self_model.worker import SELF_MODEL_SYSTEM, SelfModelWorker, parse_ops, render_eve_turns  # noqa: E402
 
 _passed = 0
 _failed = 0
@@ -85,17 +86,33 @@ s_n = SelfModelStore()
 s_n.set("好き", "好きな食べ物", "プリン")
 check("表記ゆれで別項目にならない", s_n.values("好き", "食べ物") == ["プリン"] and s_n.topics == 1)
 
-# ==== 1項目2件 ====
+# ==== 1項目3件・順位つき（2026-10-17 ユーザ「好きなものや嫌いなものは1つに絞らず3位までランキング」）====
+def _food(st):
+    return st.values("好き", "食べ物")
+
+
 s2 = SelfModelStore()
 s2.set("好き", "食べ物", "梅おにぎり", iso="2026-06-22T00:00:00+00:00")
 s2.set("好き", "食べ物", "鮭おにぎり", iso="2026-06-22T00:01:00+00:00")
-check("2件までは並ぶ", s2.values("好き", "食べ物") == ["梅おにぎり", "鮭おにぎり"])
-s2.set("好き", "食べ物", "おかかおにぎり", iso="2026-08-14T06:08:00+00:00")
-check("3件目で最も古いものが落ちる",
-      s2.values("好き", "食べ物") == ["鮭おにぎり", "おかかおにぎり"], f"{s2.values('好き', '食べ物')}")
-check("上限は MAX_PER_SLOT と一致", len(s2.values("好き", "食べ物")) == MAX_PER_SLOT)
+check("順位なしの新しい値はいちばん下に足す", _food(s2) == ["梅おにぎり", "鮭おにぎり"])
+s2.set("好き", "食べ物", "おかかおにぎり", iso="2026-08-14T06:08:00+00:00", rank=1)
+check("**順位つきはその位置に入り、下は1つずつ下がる**", _food(s2) == ["おかかおにぎり", "梅おにぎり", "鮭おにぎり"],
+      f"{_food(s2)}")
+check("上限は MAX_PER_SLOT（3）", len(_food(s2)) == MAX_PER_SLOT == 3)
+s2.set("好き", "食べ物", "ツナマヨおにぎり", rank=2)
+check("**4位になった値は外れる**", _food(s2) == ["おかかおにぎり", "ツナマヨおにぎり", "梅おにぎり"], f"{_food(s2)}")
+s2.set("好き", "食べ物", "梅おにぎり", rank=1)
+check("順位だけ変えられる", _food(s2) == ["梅おにぎり", "おかかおにぎり", "ツナマヨおにぎり"], f"{_food(s2)}")
 s2.set("好き", "食べ物", "おかかおにぎり", iso="2026-08-15T02:45:00+00:00")
-check("同じ値の再表明では増えない", len(s2.values("好き", "食べ物")) == 2)
+check("同じ値の言い直し（順位なし）では順位も件数も変わらない",
+      _food(s2) == ["梅おにぎり", "おかかおにぎり", "ツナマヨおにぎり"])
+s2.set("好き", "食べ物", "昆布おにぎり")
+check("満杯で順位なしの新しい値は、いちばん下と入れ替わる", _food(s2) == ["梅おにぎり", "おかかおにぎり", "昆布おにぎり"],
+      f"{_food(s2)}")
+check("順位は1〜3に収める（9位と言われても3位）", s2.set("好き", "食べ物", "高菜", rank=9) and _food(s2)[-1] == "高菜"
+      and len(_food(s2)) == 3)
+check("苦手も同じ（苦手な順）", s2.set("苦手", "食べ物", "セロリ", rank=1) and s2.set("苦手", "食べ物", "パクチー", rank=1)
+      and s2.values("苦手", "食べ物") == ["パクチー", "セロリ"])
 
 # ==== 対象の総数上限（言い換えで突破されても有界）====
 s3 = SelfModelStore()
@@ -129,7 +146,21 @@ s6.set("好き", "色", "藍色")
 block = s6.render()
 check("値が入る", "おかかおにぎり" in block and "ツナマヨおにぎり" in block and "藍色" in block)
 check("好きと苦手が別行で出る", "好きな食べ物" in block and "苦手な食べ物" in block)
-check("2件並びの意味を説明する", "どちらも好きで迷う" in block)
+check("**並ぶ時は好きな順に並べる（「1位」とは書かない）**", "- 好きな食べ物: おかかおにぎり / ツナマヨおにぎり" in block
+      and "1位" not in block, block)
+check("1つだけでもそのまま", "- 好きな色: 藍色" in block)
+check("**並びの意味と「全部挙げなくてよい」を伝える**（どれを言うかは書かない）",
+      "並んでいる時は好きな順（苦手な物は苦手な順）" in block and "聞かれても全部を挙げなくてよい" in block
+      and "迷う" not in block, block)
+import eve.memory.self_model as _sm_mod  # noqa: E402
+
+_sm_mod.RANK_LABELS, _sm_mod.ALL_OPTIONAL = True, False
+try:
+    _b = s6.render()
+    check("測る口: 「1位/2位」を付ける版", "- 好きな食べ物: 1位 おかかおにぎり / 2位 ツナマヨおにぎり" in _b
+          and "全部を挙げなくてよい" not in _b and "の順位" in _b, _b)
+finally:
+    _sm_mod.RANK_LABELS, _sm_mod.ALL_OPTIONAL = False, True
 check("無い項目は決めつけさせない", "まだ決まっていない" in block)
 check("そのまま読み上げさせない", "そのまま読み上げない" in block)
 # 近い時だけ入れる形では、置いている訳（聞かれた時に答えがぶれないため）を書いても違いが無かった＝10-16 までの注記のまま
@@ -138,12 +169,12 @@ check("聞かれたら同じように答える（10-16 までの注記）", "こ
 # **RAG と同じ引力を持たせない**のが要点（02:41 の格上げ事故の再発防止）
 check("「今の会話に絡める」指示を持たない", "絡める" not in block)
 
-# 最大まで埋めてもブロックが暴れない（注入量の上界を実測で固定）
+# 最大まで埋めてもブロックが暴れない（注入量の上界を実測で固定）。2026-10-17 に3件・順位つきになり 1000→1500字
 s7 = SelfModelStore()
 for i in range(MAX_TOPICS):
-    s7.set("好き", f"分野{i:02d}", "あ" * MAX_VALUE_CHARS, iso=f"2026-08-15T00:{i:02d}:00+00:00")
-    s7.set("好き", f"分野{i:02d}", "い" * MAX_VALUE_CHARS, iso=f"2026-08-15T01:{i:02d}:00+00:00")
-check("満杯でもブロックは有界（1000字未満）", len(s7.render()) < 1000, f"{len(s7.render())}字")
+    for j, ch in enumerate("あいう"):
+        s7.set("好き", f"分野{i:02d}", ch * MAX_VALUE_CHARS, iso=f"2026-08-15T0{j}:{i:02d}:00+00:00")
+check("満杯でもブロックは有界（1500字未満）", len(s7.render()) < 1500 and len(s7) == MAX_TOPICS * 3, f"{len(s7.render())}字")
 
 # ==== ContextAssembler への注入 ====
 ctx = ContextAssembler(system_prompt="スタイル")
@@ -169,7 +200,22 @@ p2 = _tmp()
 c = SelfModelStore(p2)
 for i, v in enumerate(["梅", "鮭", "おかか", "ツナマヨ"]):
     c.set("好き", "食べ物", v, iso=f"2026-06-2{i}T00:00:00+00:00")
-check("復元後も1項目2件", len(SelfModelStore(p2).values("好き", "食べ物")) == MAX_PER_SLOT)
+check("復元後も1項目3件まで", len(SelfModelStore(p2).values("好き", "食べ物")) == MAX_PER_SLOT)
+
+p_rank = _tmp()
+cr = SelfModelStore(p_rank)
+cr.set("好き", "食べ物", "梅", rank=1)
+cr.set("好き", "食べ物", "鮭", rank=1)
+cr.set("好き", "食べ物", "おかか", rank=2)
+cr.set("好き", "食べ物", "ツナマヨ", rank=1)
+check("**順位つきの記録を再生すると同じ順位に戻る**",
+      SelfModelStore(p_rank).values("好き", "食べ物") == cr.values("好き", "食べ物") == ["ツナマヨ", "鮭", "おかか"],
+      f"{SelfModelStore(p_rank).values('好き', '食べ物')}")
+p_old = _tmp()
+with open(p_old, "w", encoding="utf-8") as f:  # 2026-10-17 より前の形（順位なし）
+    f.write('{"op": "set", "polarity": "好き", "topic": "食べ物", "value": "プリン", "iso": "2026-10-14T15:42:59+00:00"}\n')
+    f.write('{"op": "set", "polarity": "好き", "topic": "SNS", "value": "X", "iso": "2026-10-09T14:33:53+00:00"}\n')
+check("昔の順位なしの記録も読める", SelfModelStore(p_old).as_dict() == {"好きなSNS": ["X"], "好きな食べ物": ["プリン"]})
 
 p3 = _tmp()
 c3 = SelfModelStore(p3)
@@ -203,11 +249,14 @@ check("LLM にはイブの発話だけを渡す（ユーザ発話は渡さない
       and "イブは梅が好きかな" in render_eve_turns(_eve_too))
 
 # ==== 出力パーサ ====
-_ops = parse_ops("set: 好き / 食べ物 = おかかおにぎり\nremove: 好き / 色 = 藍色\nよくわからない行\n")
-check("set/remove を拾う", _ops == [("set", "好き", "食べ物", "おかかおにぎり"),
-                                    ("remove", "好き", "色", "藍色")], f"{_ops}")
+_ops = parse_ops("set: 好き / 食べ物 = おかかおにぎり / 1\nremove: 好き / 色 = 藍色\nよくわからない行\n")
+check("set/remove を拾う（順位つき）", _ops == [("set", "好き", "食べ物", "おかかおにぎり", 1),
+                                              ("remove", "好き", "色", "藍色", None)], f"{_ops}")
 check("全角の区切りも許す",
-      parse_ops("set：好き／色＝藍色") == [("set", "好き", "色", "藍色")])
+      parse_ops("set：好き／色＝藍色／２") == [("set", "好き", "色", "藍色", 2)])
+check("順位の書き方の揺れ（1位・（2位））", parse_ops("set: 好き / 色 = 藍色 / 1位\nset: 好き / 色 = 朱色（2位）")
+      == [("set", "好き", "色", "藍色", 1), ("set", "好き", "色", "朱色", 2)])
+check("順位が無ければ None", parse_ops("set: 好き / 色 = 藍色") == [("set", "好き", "色", "藍色", None)])
 check("変更なし（空出力）は空リスト", parse_ops("") == [] and parse_ops(None) == [])
 
 
@@ -263,13 +312,14 @@ check("ユーザ発話だけでは LLM を呼ばない", _m3.calls == 0 and _st3
 # **LLM が規則を破っても store が止める**（不変条件はコード側）
 _m4 = _FakeModel(
     "set: 大好き / 食べ物 = プリン\n"                      # 極性が閉じた2値の外
-    "set: 好き / 食べ物 = A\nset: 好き / 食べ物 = B\nset: 好き / 食べ物 = C\n"  # 3件
+    "set: 好き / 食べ物 = A / 1\nset: 好き / 食べ物 = B / 1\nset: 好き / 食べ物 = C / 1\n"
+    "set: 好き / 食べ物 = D / 1\n"  # 4件
 )
 _st4 = SelfModelStore()
 _async(_run(_m4, [_turn("eve", "イブは好きなものが多いよ。", "2026-08-15T00:00:01+00:00")], _st4))
 check("閉じていない極性は入らない（LLM が出しても）", "大好きな食べ物" not in _st4.as_dict())
-check("1項目2件は LLM の出力に依らず守られる",
-      _st4.values("好き", "食べ物") == ["B", "C"], f"{_st4.values('好き', '食べ物')}")
+check("1項目3件は LLM の出力に依らず守られる（順位どおりに並ぶ）",
+      _st4.values("好き", "食べ物") == ["D", "C", "B"], f"{_st4.values('好き', '食べ物')}")
 
 # LLM が言い換えで枠を量産しても、総数上限は破れない
 _m5 = _FakeModel("\n".join(
@@ -295,6 +345,25 @@ _st8 = SelfModelStore()
 _st8.set("好き", "色", "藍色")
 _async(_run(_m8, [_turn("eve", "藍色はもう好きじゃないかも。", "2026-08-15T00:00:01+00:00")], _st8))
 check("remove で消える", _st8.values("好き", "色") == [])
+
+# X で見た物への感想からも育てる（ユーザ 2026-10-17「情報収集中でも更新はしていい」）
+_m9 = _FakeModel("set: 好き / お笑い = キングオブコント / 1")
+_st9 = SelfModelStore()
+_w9 = SelfModelWorker(model_registry=_m9, store=_st9, cache=None)
+_w9.note_text("キングオブコント: 決勝が楽しみで仕方ない。好きな番組だと思う")
+_async(_w9.flush())
+check("**X の感想（イブ自身の言葉）も係に見せる**",
+      _m9.calls == 1 and "（Xで見た物への感想）キングオブコント" in _m9.seen[1]["content"], f"{_m9.seen}")
+check("感想から好みが入る（順位つき）", _st9.values("好き", "お笑い") == ["キングオブコント"])
+_async(_w9.flush())
+check("預かった感想は一度きり（同じ文を二度見ない）", _m9.calls == 1)
+_m10 = _FakeModel("set: 好き / 食べ物 = 何か")
+_w10 = SelfModelWorker(model_registry=_m10, store=SelfModelStore(), cache=None)
+_w10.note_text("画面にログが流れてるね。")
+_async(_w10.flush())
+check("合図の語が無い感想は係に見せない（会話と同じふるい）", _m10.calls == 0)
+check("係への指示に順位と X の感想の説明がある", "1位〜3位" in SELF_MODEL_SYSTEM and "Xで見た物への感想" in SELF_MODEL_SYSTEM
+      and "迷っている" not in SELF_MODEL_SYSTEM)
 
 # 保存先は起動した場所に依らずリポジトリ基準（会話・記憶・タスクと同じ）。以前は cwd 基準で、
 # 別のフォルダから起動すると好みの台帳だけ別の場所に新しく作られ、前回の好みを忘れたように見えた
@@ -385,6 +454,17 @@ async def _recall_cases():
         check("RECALL=False なら従来どおり毎回全部（測る口）", await rc.block_for("やあ") == r8.render())
     finally:
         _sm.RECALL = True
+    # 3位まで並べた項目は、値ごとの行で近さを測る（項目の1行だと長くなって近さが下がり、聞かれても入らなかった・2026-10-17）
+    r9 = SelfModelStore()
+    r9.set("好き", "食べ物", "おにぎり", rank=1)
+    r9.set("好き", "食べ物", "プリン", rank=2)
+    r9.set("好き", "SNS", "X")
+    check("値ごとの行", [ln for _k, ln in r9.value_lines()] == ["好きなSNS: X", "好きな食べ物: おにぎり", "好きな食べ物: プリン"])
+    emb9 = _FakeEmb(_table)  # 「好きな食べ物: おにぎり / プリン」（項目の1行）は表に無い＝遠い
+    food9 = await SelfRecall(r9, emb9).block_for("好きな食べ物なに？")
+    check("**並んだ項目も、値のどれかが近ければ入れる**（好きな順で出す）",
+          "好きな食べ物: おにぎり / プリン" in food9 and "SNS" not in food9, food9)
+    check("項目の1行では測らない", "好きな食べ物: おにぎり / プリン" not in emb9.calls)
 
 
 asyncio.run(_recall_cases())

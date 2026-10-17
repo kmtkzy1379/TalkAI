@@ -151,6 +151,37 @@ class UsageMeter:
             logger.exception("使用量の記録に失敗（本体は継続）")
             return None
 
+    def record_cost(self, *, role: str, model: str, cost_usd: float,
+                    extra: Optional[dict] = None) -> Optional[float]:
+        """トークンでなく**件数で課金される API**（X API の投稿1件 $0.005 等・`eve/xfeed/`）の1回ぶん。
+
+        accuracy は `fixed`（単価×件数で決まる額）。`tools/usage_report.py --recalc` はこの行の額を当て直さない
+        （トークンが 0 なので、価格表で計算し直すと 0 か「価格なし」になってしまう）。
+        """
+        if not self.enabled:
+            return None
+        try:
+            cost = float(cost_usd)
+            with self._lock:
+                self.by_role.setdefault(role, Totals()).add(0, 0, cost)
+                self.by_model.setdefault(model, Totals()).add(0, 0, cost)
+                self.total.add(0, 0, cost)
+                self._append({
+                    "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    "tag": self.tag,
+                    "role": role,
+                    "model": model,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "cost_usd": cost,
+                    "accuracy": "fixed",
+                    **(extra or {}),
+                })
+            return cost
+        except Exception:
+            logger.exception("使用量の記録に失敗（本体は継続）")
+            return None
+
     def record_response(self, *, role: str, model: str, response) -> Optional[float]:
         """provider が返した usage をそのまま使う（非ストリーミング＝`exact`）。"""
         usage = getattr(response, "usage", None) or {}

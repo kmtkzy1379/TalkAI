@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
 
 from ..clock import elapsed_wall, humanize, now_iso
-from ..context_assembler import OMITTED_SPEAKER, silence_facts
+from ..context_assembler import OMITTED_SPEAKER, ORIGIN_X, silence_facts
 
 logger = logging.getLogger(__name__)
 
@@ -297,7 +297,11 @@ def _render_seeds(seeds, now: Optional[str] = None) -> str:
     for c in seeds or []:
         body = c.seed_text() if hasattr(c, "seed_text") else getattr(c, "text", "")
         iso = getattr(c, "iso", "")
-        when = f"[{humanize(elapsed_wall(iso, n))}] " if iso else ""
+        bits = [humanize(elapsed_wall(iso, n))] if iso else []
+        if getattr(c, "origin", "") == ORIGIN_X:
+            # X で見たこと（`eve/xfeed/`）は出どころを添える（会話の記憶と取り違えて「前に話したよね」と振らない）
+            bits.append("Xで見た")
+        when = f"[{'・'.join(bits)}] " if bits else ""
         lines.append(f"・{when}{body}")
     return "\n".join(lines) or "（なし）"
 

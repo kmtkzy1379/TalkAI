@@ -252,6 +252,39 @@ try:
               _vl4.stream.turns_fn == _vl4.cache.since_boundary)
     finally:
         _C2.STREAM_ENABLED = _st_saved
+
+    # X で話題を仕入れる（2026-10-17）: X の記憶は別ファイルで、会話の記憶に「思い出す時だけ」つなぐ。
+    # 仕入れ係には会話の記憶（読むだけ）・性格・好みの控えを渡す。フラグは明示的に作る（.env に依らない）
+    _x_saved = (_C2.X_ENABLED, _C2.X_BEARER_TOKEN, _C2.X_MEMORY_FILE, _C2.X_STATE_FILE, _C2.X_LOG_FILE,
+                _C2.X_TIMELINE_POSTS)
+    try:
+        _C2.X_ENABLED = False
+        _vx0 = VoiceLoop()
+        check("X: OFF なら X の記憶も仕入れ係も作らない（会話の記憶に何もつながない）",
+              _vx0.x_memory is None and _vx0.x_collector is None and _vx0.rag._side is None)
+        _xd = _tf.mkdtemp(prefix="eve_x_")
+        _C2.X_ENABLED = True
+        _C2.X_BEARER_TOKEN = ""
+        _C2.X_MEMORY_FILE = os.path.join(_xd, "x_memory.jsonl")
+        _C2.X_STATE_FILE = os.path.join(_xd, "x_state.json")
+        _C2.X_LOG_FILE = os.path.join(_xd, "x_log.jsonl")
+        _C2.X_TIMELINE_POSTS = 0
+        _vx1 = VoiceLoop()
+        check("X: 鍵が無ければ取りに行かないが、X の記憶は思い出す",
+              _vx1.x_memory is not None and _vx1.rag._side is _vx1.x_memory and _vx1.x_collector is None)
+        _C2.X_BEARER_TOKEN = "test-token"
+        _vx2 = VoiceLoop()
+        _xc = _vx2.x_collector
+        check("X: 仕入れ係に X の記憶・会話の記憶（読むだけ）・性格・好みの控えを配線",
+              _xc is not None and _xc._store is _vx2.x_memory and _xc._memory is _vx2.rag
+              and _xc._persona == _vx2.persona and _vx2.rag._side is _vx2.x_memory
+              and (_xc._self_model_fn is not None) == (_vx2.self_model is not None))
+        check("X: X の記憶は別ファイル・別の上限", _vx2.x_memory.rag_path != _vx2.rag.rag_path
+              and _vx2.x_memory.max_chunks == _C2.X_MEMORY_MAX)
+        check("X: 構築しただけではファイルを作らない", not os.listdir(_xd))
+    finally:
+        (_C2.X_ENABLED, _C2.X_BEARER_TOKEN, _C2.X_MEMORY_FILE, _C2.X_STATE_FILE, _C2.X_LOG_FILE,
+         _C2.X_TIMELINE_POSTS) = _x_saved
 except Exception as e:  # 構築自体が落ちたら配線ドリフト＝即失敗
     check(f"VoiceLoop 構築で例外: {e!r}", False)
 

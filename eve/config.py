@@ -465,6 +465,34 @@ class Config:
     # 視聴者の覚え書き（名前・何回目の配信に来たか。手元だけ・.gitignore 済み）
     STREAM_VIEWERS_FILE = os.getenv("STREAM_VIEWERS_FILE", "stream_viewers.json")
 
+    # X（旧 Twitter）で話題を仕入れる（`eve/xfeed/`・ユーザ指定 2026-10-17）。**機能フラグ**（既定 off）。
+    # 起動中は X_INTERVAL_HOURS ごとに、情報収集AI（X_CURATE_MODEL）が選んだ X_PER_RUN 件を X で読み、イブが感想を持って
+    # 「Xで見た」記憶として X_MEMORY_FILE に残す（会話の記憶とは別ファイル・思い出す時だけ合わせる）。起動した時に前回から
+    # X_INTERVAL_HOURS 以上たっていれば1回取り戻す（ユーザ決定「まずPCだけ」＝止まっている間は取らない）。
+    # OFF にすると、取らないだけでなく X で見た記憶も思い出さない。公式 X API（従量課金）の Bearer Token が要る
+    X_ENABLED = os.getenv("X_ENABLED", "0") == "1"
+    X_BEARER_TOKEN = os.getenv("X_BEARER_TOKEN", "")
+    # 本人のタイムライン（何を調べるかの材料にだけ使う・本文は記憶に入れない）。X のアプリの Client ID（機密クライアントなら
+    # Client Secret も）を入れて `tools/x_login.py` で1回ログインする。ログインしていなければタイムラインは使わない
+    X_CLIENT_ID = os.getenv("X_CLIENT_ID", "")
+    X_CLIENT_SECRET = os.getenv("X_CLIENT_SECRET", "")
+    X_TOKEN_FILE = os.getenv("X_TOKEN_FILE", "x_token.json")
+    X_REDIRECT_PORT = int(os.getenv("X_REDIRECT_PORT", "8723"))
+    # 保存先（手元だけ）。X で見た記憶・前回いつ取ったか・1回ごとの記録（選んだ候補・読んだ投稿・費用）
+    X_MEMORY_FILE = os.getenv("X_MEMORY_FILE", "x_memory.jsonl")
+    X_MEMORY_MAX = int(os.getenv("X_MEMORY_MAX", "300"))  # X で見た記憶の上限（超えたら古い順・会話の記憶は押し出さない）
+    X_STATE_FILE = os.getenv("X_STATE_FILE", "x_state.json")
+    X_LOG_FILE = os.getenv("X_LOG_FILE", "x_log.jsonl")
+    X_INTERVAL_HOURS = float(os.getenv("X_INTERVAL_HOURS", "6"))  # 0 なら定期には取らない（最初の取り込みの道具だけ）
+    X_PER_RUN = int(os.getenv("X_PER_RUN", "3"))
+    # 1話題に読む投稿の数（X の検索は1回10件から・1件 $0.005）とタイムラインの件数（0 で使わない・1件 $0.005）
+    X_POSTS_PER_TOPIC = int(os.getenv("X_POSTS_PER_TOPIC", "10"))
+    X_TIMELINE_POSTS = int(os.getenv("X_TIMELINE_POSTS", "20"))
+    X_TRENDS_MAX = int(os.getenv("X_TRENDS_MAX", "30"))  # トレンドを何位まで見るか（1回 $0.01・最大50）
+    X_WOEID = int(os.getenv("X_WOEID", "23424856"))  # トレンドの地域（日本）
+    X_START_DELAY_SEC = float(os.getenv("X_START_DELAY_SEC", "120"))  # 起動してから最初に取りに行くまで
+    X_DAILY_BUDGET_USD = float(os.getenv("X_DAILY_BUDGET_USD", "1.5"))  # X API の1日（UTC）の上限・0 で上限なし
+
     @classmethod
     def validate(cls) -> list[str]:
         """不足している必須設定を列挙。空リストなら起動可（Start ゲートで使う）。"""

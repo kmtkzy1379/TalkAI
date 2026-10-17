@@ -40,6 +40,17 @@ STREAM_AUTONOMOUS_ONE_LINE = False
 STREAM_MEMORY_SLIM = True
 MEMORY_INTERNAL_LINES = ("予測差:", "理由:")
 
+# 記憶の出どころ（`RagChunk.origin`）。X で見たこと（`eve/xfeed/`）
+ORIGIN_X = "x"
+# `# 参照` に X で見たことがある時だけ添える出どころの事実（2026-10-17・コミット前の確かめ・ユーザ「修正したい」）。
+# 見出し（[Xで見た]）だけだと、X で見ただけの話題を前に話したことにされると乗り（6/6）、番組を「見た？」と聞かれると見たように
+# 答えた（2/2）。弱い版（「その出来事を自分で見たわけでも」）で乗るのは 0/6 になったが「見た？」は 2/2 のままで、この版で 0/3
+# （本番の組み立て・本物の記憶）。本当に話したことは覚えている（2/2 → 弱い版 2/2・この版 1/1）・面白いことを聞かれて X で見た話を
+# する（2/2 → 2/2・1/1）。X_NOTE は測る口
+X_SOURCE_NOTE = ("（[Xで見た] は、あなたがXで人の投稿を読んで知ったこと。その番組や出来事をあなたが直接見たのではなく、"
+                 "ユーザと話したことでもない）")
+X_NOTE = True
+
 
 def memory_for_stream(text: str) -> str:
     """記憶の本文から内省の内部の行（予測差・理由）を外す（要約・感情・次の予測は残す）。純関数。"""
@@ -89,6 +100,15 @@ class RagChunk:
     # のは先頭1行(平均40字)だけ＝残りがノイズになる（実測 2026-07-26）。応答文脈は従来どおり
     # text 全文（感情の色が応答の質に効く）。
     summary: str = ""
+    # 出どころ。""＝会話の記憶 / ORIGIN_X＝X で見たこと（`eve/xfeed/`）。見出しを分ける
+    origin: str = ""
+
+    def label(self) -> str:
+        """`# 参照` の見出し。X で見たことは「Xで見た」（会話の記憶と同じ見出しだと、X で見たことをユーザと
+        話したことと取り違える＝配信で開発者との会話を視聴者との会話と取り違えたのと同じ形）。"""
+        if self.origin == ORIGIN_X:
+            return "Xで見た"
+        return "話題の種" if self.as_topic_seed else "過去の記憶"
 
     def seed_text(self) -> str:
         """話題の種としての1行表現（summary が無い古い記録は text の1行目で代替）。"""
@@ -192,10 +212,12 @@ class ContextAssembler:
         if rag_chunks:
             slim = bool(stream) and STREAM_MEMORY_SLIM
             lines = [
-                f"[{'話題の種' if c.as_topic_seed else '過去の記憶'}/"
+                f"[{c.label()}/"
                 f"{humanize(elapsed_wall(c.iso, now.iso))}] {memory_for_stream(c.text) if slim else c.text}"
                 for c in rag_chunks
             ]
+            if X_NOTE and any(c.origin == ORIGIN_X for c in rag_chunks):
+                lines.append(X_SOURCE_NOTE)
             parts.append("# 参照（今の会話に絡める。思い出話に逸れない）\n" + "\n".join(lines))
         if vision and vision_stale:
             # 「画面が変わったが実況がまだ追いついていない」区間。ここを不在明示にすると、

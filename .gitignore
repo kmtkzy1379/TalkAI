@@ -72,6 +72,13 @@ docs/FILLER_DESIGN.md
 stream_viewers.json
 stream_viewers.json.tmp
 .stream/
+# X で話題を仕入れる（2026-10-17）: 本人のログイン（トークン）と、前回いつ取ったか・最近仕入れた話題。
+# X で見た記憶（x_memory.jsonl）と1回ごとの記録（x_log.jsonl）は *.jsonl で除外済み
+x_token.json
+x_token.json.tmp
+x_state.json
+x_state.json.tmp
+x_preview/
 # エディタ / OS メタファイル
 .idea/
 .vscode/
